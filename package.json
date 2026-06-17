@@ -1,6 +1,6 @@
 {
   "name": "openpass",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "> 开源、本地、安全的两步验证管理器",
   "main": "auth.js",
   "directories": {
@@ -23,7 +23,15 @@
     "type": "git",
     "url": "git+https://github.com/kovawx/openpass.git"
   },
-  "keywords": ["2fa", "totp", "authenticator", "password manager", "open source", "local storage", "secure"],
+  "keywords": [
+    "2fa",
+    "totp",
+    "authenticator",
+    "password manager",
+    "open source",
+    "local storage",
+    "secure"
+  ],
   "author": "kovawx",
   "license": "MIT",
   "bugs": {
