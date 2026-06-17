@@ -61,9 +61,10 @@ export const useSecretStore = defineStore('secrets', () => {
 
       if (!Array.isArray(result.secrets) && secrets.value.length > 0) {
         console.warn('[SecretStore] storage 中 secrets 格式异常，正在修复...');
+        const plainSecrets = secrets.value.map((secret) => ({ ...secret }));
         await chrome.storage.local.set({
-          secrets: secrets.value,
-          sitesList: secrets.value.map((secret) => ({ site: secret.site }))
+          secrets: plainSecrets,
+          sitesList: plainSecrets.map((secret) => ({ site: secret.site }))
         });
       }
     } catch (error) {
@@ -83,20 +84,24 @@ export const useSecretStore = defineStore('secrets', () => {
       secrets.value = [];
     }
 
-    const sitesList = secrets.value.map((secret) => ({ site: secret.site }));
+    // 脱离 Vue 响应式代理，转为纯数组再写入 storage。
+    // 直接写入 reactive 代理对象会被 chrome.storage 序列化破坏数组结构（变对象），
+    // 进而在 popup / store 间触发"格式异常"自愈循环。
+    const plainSecrets = secrets.value.map((secret) => ({ ...secret }));
+    const sitesList = plainSecrets.map((secret) => ({ site: secret.site }));
     const data: {
       secrets: Secret[];
       sitesList: Array<{ site: string }>;
       encryptedSecrets?: string;
       encryptedSecretsForBackup?: string;
     } = {
-      secrets: secrets.value,
+      secrets: plainSecrets,
       sitesList
     };
 
     if (authStore.sessionKey) {
       data.encryptedSecrets = await CryptoUtils.encrypt(
-        JSON.stringify(secrets.value),
+        JSON.stringify(plainSecrets),
         authStore.sessionKey
       );
 
@@ -112,7 +117,7 @@ export const useSecretStore = defineStore('secrets', () => {
             authStore.sessionKey
           );
           data.encryptedSecretsForBackup = await CryptoUtils.encrypt(
-            JSON.stringify(secrets.value),
+            JSON.stringify(plainSecrets),
             backupPassword
           );
         } catch {
@@ -126,7 +131,7 @@ export const useSecretStore = defineStore('secrets', () => {
     if (options.triggerSnapshot) {
       const encryptionSettings = await getBackupEncryptionSettings();
       const password = await resolveStoredBackupPassword(authStore.sessionKey, encryptionSettings);
-      void triggerChangeBackup(secrets.value, password).catch((error) => {
+      void triggerChangeBackup(plainSecrets, password).catch((error) => {
         console.error('触发本地快照失败:', error);
       });
     }
