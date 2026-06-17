@@ -34,70 +34,9 @@ export function showConfirm(message: string): Promise<boolean> {
 }
 
 /**
- * 解析 URL 获取域名信息
+ * 站点域名解析与匹配统一在 domainMatch 模块，请直接从 '@/utils/domainMatch' 导入。
+ * （曾经的 re-export 会触发 WXT 自动导入的 duplicated imports 警告，已移除。）
  */
-export function parseUrl(url: string) {
-  try {
-    const urlObj = new URL(url);
-    const hostname = urlObj.hostname;
-
-    const parts = hostname.split('.');
-    let mainDomain = hostname;
-    if (parts.length >= 2) {
-      const tldPatterns = ['co.uk', 'com.au', 'co.jp', 'com.cn'];
-      const lastTwo = parts.slice(-2).join('.');
-      if (tldPatterns.includes(lastTwo)) {
-        mainDomain = parts.slice(-3).join('.');
-      } else {
-        mainDomain = parts.slice(-2).join('.');
-      }
-    }
-
-    return {
-      fullUrl: url,
-      fullDomain: hostname,
-      mainDomain,
-      origin: urlObj.origin
-    };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * 匹配密钥与当前页面
- */
-export function matchSecrets(url: string, secrets: Array<{ site: string }>) {
-  const urlInfo = parseUrl(url);
-  if (!urlInfo) return [];
-
-  const matches = [];
-
-  for (const secret of secrets) {
-    const site = secret.site.toLowerCase();
-    const fullUrl = urlInfo.fullUrl.toLowerCase();
-    const fullDomain = urlInfo.fullDomain.toLowerCase();
-    const mainDomain = urlInfo.mainDomain.toLowerCase();
-
-    let matchType = null;
-
-    if (fullUrl.includes(site) || site.includes(fullUrl)) {
-      matchType = 'fullUrl';
-    } else if (fullDomain === site || site === fullDomain) {
-      matchType = 'fullDomain';
-    } else if (mainDomain === site || site === mainDomain) {
-      matchType = 'mainDomain';
-    } else if (fullDomain.includes(site) || site.includes(fullDomain)) {
-      matchType = 'contains';
-    }
-
-    if (matchType) {
-      matches.push(secret);
-    }
-  }
-
-  return matches;
-}
 
 /**
  * 安全发送消息到扩展
