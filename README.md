@@ -2,7 +2,7 @@
 
 > 开源、本地、安全的两步验证管理器
 
-[![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=google-chrome&logoColor=white)](https://github.com/kovawx/openpass)
+[![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=google-chrome&logoColor=white)](https://chromewebstore.google.com/detail/ejokhmkfamhdcopmfockefjfgdiginpp?utm_source=item-share-cb)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## 简介
@@ -17,13 +17,12 @@ OpenPass 是一款 Chrome 浏览器扩展，专注于 TOTP 验证码管理。所
 - 💾 **自动备份** - 数据变化时自动备份，支持加密导出
 - 🔒 **主密码保护** - 可选主密码加密敏感操作
 - 🖥️ **管理后台** - 完整的密钥管理界面
-- ⚡ **无需解锁** - 自动备份采用快速路径，会话过期后仍可正常备份
 
 ## 快速开始
 
 ### 安装
 
-1. 前往 Chrome 网上应用店搜索 "OpenPass" 安装
+1. 前往 [Chrome 网上应用店](https://chromewebstore.google.com)搜索 ["OpenPass"](https://chromewebstore.google.com/search/OpenPass) 安装
 2. 或前往 [Releases](https://github.com/kovawx/openpass/releases) 下载最新版本手动安装
 
 **手动安装步骤：**
@@ -62,35 +61,6 @@ pnpm dev
 # 构建生产版本
 pnpm build
 ```
-
-## 版本信息
-
-**当前版本：v0.2.1**
-
-> 🚀 2026年4月30日发布 | **完整重构版本**
->
-> - 全新的自动备份快速路径机制
-> - 无需解锁即可自动备份
-> - 完整的隐私政策文档
-
-## 功能清单
-
-### ✅ 已实现 (v0.2.0)
-- 🔐 密钥导入/导出功能
-- 🔒 全程加密存储
-- 🛡️ 主密码保护
-- 💾 自动备份功能（快速路径机制）
-- 🔑 备份加密（主密码/自定义密码双模式）
-- ⏰ 4 种备份频率（每 5 分钟/每天/每周/每月）
-- 📸 本地快照备份（保留最近 5 个版本）
-- 📂 自定义目录备份
-- 🖥️ 完整管理后台
-- 🚪 退出登录功能
-- 📝 完整的项目文档
-
-### 🚧 开发中
-- [ ] 暗色主题
-- [ ] Firefox 支持
 
 ## 致谢
 
