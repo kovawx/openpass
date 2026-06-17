@@ -3,7 +3,11 @@
 # - ignoredBuiltDependencies：明确不运行其脚本的包（无需构建的）。
 #   两类合起来覆盖所有被 pnpm 标记的包，install 才会正常退出。
 onlyBuiltDependencies:
-  - esbuild      # 需 postinstall 下载/解压平台二进制，不批准则构建失败
-  - vue-demi     # 需 postinstall 切换到对应 Vue 版本，不批准会导致 shim 失效
+  - esbuild # 需 postinstall 下载/解压平台二进制，不批准则构建失败
+  - vue-demi # 需 postinstall 切换到对应 Vue 版本，不批准会导致 shim 失效
 ignoredBuiltDependencies:
-  - spawn-sync   # node <0.12 的遗留 fallback，现代 node 无需构建
+  - spawn-sync # node <0.12 的遗留 fallback，现代 node 无需构建
+allowBuilds:
+  esbuild: true
+  spawn-sync: true
+  vue-demi: true
