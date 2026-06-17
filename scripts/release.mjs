@@ -18,7 +18,7 @@
  *
  * 约定：
  * - 需在干净的工作区运行（无未提交改动），避免把无关改动混入发版提交。
- * - CHANGELOG.md 由人工维护，脚本结束后会提醒。
+ * - 发版说明（changelog）由 GitHub Action 从 commit 自动生成于 Releases 页面，无需手动维护。
  * - 按 CONTRIBUTING.md：develop 分支用 vX.Y.Z-beta，main 分支用 vX.Y.Z。
  */
 import { execSync } from 'node:child_process';
@@ -54,7 +54,7 @@ function printUsage() {
 
 流程: 更新版本号 → 提交 → 打 tag → 推送所有远端
 更新: package.json / wxt.config.ts / README.md
-注意: 需干净工作区；CHANGELOG.md 需手动更新`
+注意: 需干净工作区（发版说明由 GitHub Action 自动生成于 Releases 页面）`
   );
 }
 
@@ -175,7 +175,7 @@ async function main() {
   }
 
   console.log(`\n✓ 完成：${tagName} 已推送到 ${remotes.length} 个远端。`);
-  console.log('提示：请手动更新 CHANGELOG.md。');
+  console.log('发版说明将由 GitHub Action 从 commit 自动生成于 Releases 页面，无需手动维护。');
 }
 
 main().catch((err) => {
