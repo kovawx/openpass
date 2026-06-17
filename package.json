@@ -16,19 +16,20 @@
     "compile": "vue-tsc --noEmit",
     "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --fix",
     "format": "prettier --write src/",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "release": "node scripts/release.mjs"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cyber-mule/openpass.git"
+    "url": "git+https://github.com/kovawx/openpass.git"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": ["2fa", "totp", "authenticator", "password manager", "open source", "local storage", "secure"],
+  "author": "kovawx",
+  "license": "MIT",
   "bugs": {
-    "url": "https://github.com/cyber-mule/openpass/issues"
+    "url": "https://github.com/kovawx/openpass/issues"
   },
-  "homepage": "https://github.com/cyber-mule/openpass#readme",
+  "homepage": "https://github.com/kovawx/openpass#readme",
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/chrome": "^0.1.40",

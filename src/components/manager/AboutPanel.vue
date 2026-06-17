@@ -33,7 +33,7 @@ onMounted(() => {
       <!-- 链接 -->
       <div class="flex justify-center space-x-6 mt-6">
         <a
-          href="https://github.com/cyber-mule/openpass"
+          href="https://github.com/kovawx/openpass"
           target="_blank"
           class="inline-flex items-center text-sm text-primary-600 hover:text-primary-700"
         >
@@ -43,7 +43,7 @@ onMounted(() => {
           GitHub
         </a>
         <a
-          href="https://github.com/cyber-mule/openpass/issues"
+          href="https://github.com/kovawx/openpass/issues"
           target="_blank"
           class="inline-flex items-center text-sm text-primary-600 hover:text-primary-700"
         >
@@ -55,7 +55,7 @@ onMounted(() => {
           问题反馈
         </a>
         <a
-          href="https://github.com/cyber-mule/openpass/blob/main/PRIVACY.md"
+          href="https://github.com/kovawx/openpass/blob/main/PRIVACY.md"
           target="_blank"
           class="inline-flex items-center text-sm text-primary-600 hover:text-primary-700"
         >
@@ -82,7 +82,7 @@ onMounted(() => {
         </div>
         <div class="flex justify-between text-sm">
           <span class="text-gray-600">作者</span>
-          <span class="text-gray-900">cyber-mule</span>
+          <span class="text-gray-900">kovawx</span>
         </div>
         <div class="flex justify-between text-sm">
           <span class="text-gray-600">协议</span>
