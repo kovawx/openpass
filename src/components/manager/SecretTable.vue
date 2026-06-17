@@ -117,6 +117,14 @@ function getProgressClass(remaining: number): string {
   if (remaining <= 10) return 'text-yellow-600';
   return 'text-green-600';
 }
+
+// 点击名称/站点：在新标签页打开目标站点（无协议时补 https://）
+function openSite(site: string) {
+  const trimmed = (site || '').trim();
+  if (!trimmed) return;
+  const url = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  chrome.tabs.create({ url });
+}
 </script>
 
 <template>
@@ -143,8 +151,14 @@ function getProgressClass(remaining: number): string {
     </div>
 
     <!-- Table -->
-    <div class="bg-white rounded-lg shadow overflow-hidden">
-      <table class="min-w-full divide-y divide-gray-200">
+    <div class="bg-white rounded-lg shadow overflow-x-auto">
+      <table class="min-w-full table-fixed divide-y divide-gray-200">
+        <colgroup>
+          <col class="w-1/4" />
+          <col class="w-2/5" />
+          <col class="w-32" />
+          <col class="w-28" />
+        </colgroup>
         <thead class="bg-gray-50">
           <tr>
             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">名称</th>
@@ -172,11 +186,19 @@ function getProgressClass(remaining: number): string {
             class="cursor-pointer transition-colors"
             :class="index === selectedIndex ? 'bg-primary-50 ring-1 ring-inset ring-primary-200' : 'hover:bg-gray-50'"
           >
-            <td class="px-6 py-4">
-              <div class="text-sm font-medium text-gray-900">{{ secret.name || '未命名' }}</div>
+            <td class="px-6 py-4 max-w-0">
+              <div
+                class="text-sm font-medium text-gray-900 truncate cursor-pointer hover:text-primary-600 transition-colors"
+                :title="secret.name || '未命名'"
+                @click="openSite(secret.site)"
+              >{{ secret.name || '未命名' }}</div>
             </td>
-            <td class="px-6 py-4">
-              <div class="text-sm text-gray-500">{{ secret.site }}</div>
+            <td class="px-6 py-4 max-w-0">
+              <div
+                class="text-sm text-gray-500 truncate cursor-pointer hover:text-primary-600 transition-colors"
+                :title="secret.site"
+                @click="openSite(secret.site)"
+              >{{ secret.site }}</div>
             </td>
             <td class="px-6 py-4">
               <div v-if="codeData[secret.id]" class="flex items-center space-x-2">

@@ -291,7 +291,7 @@ watch(
     <Sidebar :current-page="currentPage" @navigate="currentPage = $event" @logout="handleLogout" />
 
     <!-- 主内容 -->
-    <main class="flex-1 p-8 overflow-y-auto">
+    <main class="flex-1 min-w-0 p-8 overflow-y-auto">
       <!-- 密钥管理页 -->
       <SecretTable
         v-if="currentPage === 'secrets'"
