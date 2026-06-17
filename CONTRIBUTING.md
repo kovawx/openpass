@@ -6,6 +6,7 @@
 
 - [行为准则](#行为准则)
 - [如何贡献](#如何贡献)
+- [分支管理](#分支管理)
 - [开发指南](#开发指南)
 - [提交规范](#提交规范)
 - [代码规范](#代码规范)
@@ -19,7 +20,7 @@
 
 ### 报告 Bug
 
-如果你发现了 Bug，请通过 [Issues](https://github.com/cyber-mule/openpass/issues) 提交报告。
+如果你发现了 Bug，请通过 [Issues](https://github.com/kovawx/openpass/issues) 提交报告。
 
 提交 Bug 报告前，请：
 
@@ -29,7 +30,7 @@
 
 ### 提出新功能
 
-如果你有新功能建议，欢迎通过 [Issues](https://github.com/cyber-mule/openpass/issues) 提交。
+如果你有新功能建议，欢迎通过 [Issues](https://github.com/kovawx/openpass/issues) 提交。
 
 提交功能请求时，请：
 
@@ -40,10 +41,40 @@
 ### 提交代码
 
 1. Fork 本仓库
-2. 创建功能分支 (`git checkout -b feature/amazing-feature`)
-3. 提交变更 (`git commit -m 'feat: add amazing feature'`)
-4. 推送到分支 (`git push origin feature/amazing-feature`)
-5. 创建 Pull Request
+2. 从 `develop` 分支创建功能分支
+3. 提交变更（遵循 [提交规范](#提交规范)）
+4. 推送到你的分支
+5. 创建 Pull Request 到 **`develop` 分支**
+
+## 分支管理
+
+### 分支结构
+
+```
+main                 # 稳定发布分支（只读，仅通过 PR 合并）
+└── develop          # 开发集成分支（默认 PR 目标）
+    ├── feature/xxx  # 新功能分支
+    └── fix/xxx      # Bug 修复分支
+```
+
+### 分支说明
+
+| 分支 | 说明 | 命名规范 |
+|------|------|---------|
+| `main` | 稳定发布分支，只读 | - |
+| `develop` | 开发集成分支，所有 PR 先合并到这里 | - |
+| `feature/功能描述` | 新功能开发分支 | `feature/dark-theme` |
+| `fix/问题描述` | Bug 修复分支 | `fix/backup-import-error` |
+
+### PR 流程
+
+```
+feature/fix 分支  →  PR 到 develop  →  测试  →  PR 到 main  →  发布
+```
+
+1. 所有 PR 目标分支是 `develop`，不是 `main`
+2. develop 测试稳定后，统一 PR 到 main 发布
+3. PR 合并到 develop 后，可以打 `-beta` tag 进行测试验证
 
 ## 开发指南
 
@@ -51,44 +82,59 @@
 
 1. 克隆仓库
    ```bash
-   git clone https://github.com/cyber-mule/openpass.git
+   git clone https://github.com/kovawx/openpass.git
    cd openpass
    ```
 
-2. 在 Chrome 中加载扩展
+2. 安装依赖
+   ```bash
+   pnpm install
+   ```
+
+3. 开发模式
+   ```bash
+   pnpm dev
+   ```
+
+4. 在 Chrome 中加载扩展
    - 打开 `chrome://extensions/`
    - 开启「开发者模式」
    - 点击「加载已解压的扩展程序」
-   - 选择项目目录
+   - 选择项目下的 `.output/chrome-mv3` 目录
 
 ### 项目结构
 
 ```
 openpass/
-├── .github/              # GitHub 配置
-│   ├── ISSUE_TEMPLATE/   # Issue 模板
-│   └── workflows/        # GitHub Actions
-├── icons/                # 扩展图标
-├── background.js         # Service Worker
-├── content.js            # 内容脚本
-├── content.css           # 内容脚本样式
-├── manifest.json         # 扩展配置
-├── manager.html          # 管理页面
-├── manager.css           # 管理页面样式
-├── manager.js            # 管理页面逻辑
-├── popup.html            # 弹窗页面
-├── popup.css             # 弹窗样式
-├── popup.js              # 弹窗逻辑
-└── totp.js               # TOTP 算法实现
+├── .github/                    # GitHub 配置
+│   ├── ISSUE_TEMPLATE/         # Issue 模板
+│   └── workflows/              # GitHub Actions
+├── src/
+│   ├── components/             # Vue 组件
+│   │   ├── manager/            # 管理页面组件
+│   │   └── ui/                 # UI 基础组件
+│   ├── composables/            # Vue composables
+│   ├── entrypoints/            # 扩展入口
+│   │   ├── background.ts       # Service Worker
+│   │   ├── content/            # 内容脚本
+│   │   ├── popup/              # 弹窗页面
+│   │   └── options/            # 管理后台页面
+│   ├── stores/                 # Pinia 状态管理
+│   └── utils/                  # 工具函数
+├── public/                     # 静态资源
+│   └── icons/                  # 扩展图标
+├── wxt.config.ts               # WXT 配置
+├── uno.config.ts               # UnoCSS 配置
+└── package.json
 ```
 
-### 开发流程
+### 常用命令
 
-1. 创建功能分支进行开发
-2. 确保代码风格一致
-3. 测试所有变更
-4. 更新相关文档
-5. 提交 Pull Request
+| 命令 | 说明 |
+|------|------|
+| `pnpm dev` | 开发模式，自动热重载 |
+| `pnpm build` | 生产构建，输出到 `.output/` |
+| `pnpm lint` | 代码检查 |
 
 ### 测试
 
@@ -101,9 +147,9 @@ openpass/
 - [ ] 验证码倒计时
 - [ ] 搜索功能
 - [ ] 导出/导入备份
+- [ ] 自动备份功能
 - [ ] 右键菜单解析 QR 码
-- [ ] 自动检测 2FA 输入框
-- [ ] 浮动按钮填充验证码
+- [ ] 主密码保护功能
 
 ## 提交规范
 
@@ -140,40 +186,35 @@ openpass/
 - `manager` - 管理页面相关
 - `content` - 内容脚本相关
 - `background` - Service Worker 相关
-- `totp` - TOTP 算法相关
+- `backup` - 备份相关
+- `crypto` - 加密相关
 - `ci` - CI/CD 相关
 
 ### 示例
 
 ```
 feat(popup): 添加暗色主题支持
-fix(totp): 修复 8 位验证码生成错误
-docs: 更新安装说明
+fix(backup): 修复导入备份后无法自动备份的问题
+docs: 更新安装说明和分支管理流程
 chore(ci): 添加自动发布工作流
 ```
 
 ## 代码规范
 
-### JavaScript
+### TypeScript / Vue
 
 - 使用 2 空格缩进
-- 使用单引号或双引号保持一致
+- 使用单引号
 - 函数和变量使用驼峰命名
-- 类使用帕斯卡命名
-- 添加必要的注释
+- 组件使用帕斯卡命名
+- 添加必要的 JSDoc 注释
+- 优先使用 TypeScript 类型声明
 
-### CSS
+### CSS / UnoCSS
 
-- 使用 2 空格缩进
-- 使用 CSS 变量管理颜色和间距
-- 类名使用 kebab-case
+- 使用 UnoCSS 原子化 CSS
+- 必要时使用语义化类名
 - 避免使用 `!important`
-
-### HTML
-
-- 使用 2 空格缩进
-- 属性使用双引号
-- 添加必要的语义化标签
 
 ## 发布流程
 
@@ -186,13 +227,20 @@ chore(ci): 添加自动发布工作流
 - `MAJOR.MINOR.PATCH`
 - 例如：`1.0.0` → `1.0.1`（修复）→ `1.1.0`（新功能）→ `2.0.0`（重大变更）
 
+### Tag 类型
+
+| Tag 格式 | 说明 | 分支 |
+|----------|------|------|
+| `v0.x.y-beta` | 测试版，用于内部验证 | `develop` |
+| `v0.x.y` | 正式发布版 | `main` |
+
 ### 发布步骤
 
-1. 更新 `manifest.json` 中的版本号
-2. 更新 `manager.html` 和 `popup.html` 中的版本显示
-3. 提交变更并推送到 main 分支
-4. 创建 GitHub Release
-5. GitHub Actions 自动构建并上传 zip 文件
+1. **PR 合并到 develop** - 所有功能和修复 PR 合并到 develop 分支
+2. **测试验证** - 在 develop 上打 `-beta` tag，CI 自动构建测试包
+3. **测试通过** - 确认功能正常，无回归问题
+4. **PR 到 main** - 提交从 develop 到 main 的 PR
+5. **发布正式版** - 在 main 上打正式 tag，CI 自动构建发布
 
 ---
 

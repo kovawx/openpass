@@ -224,7 +224,7 @@ A: 目前没有。建议配合手机上的验证器 App 使用。
 
 ### Q: 如何反馈问题或建议？
 
-A: 请前往 [GitHub Issues](https://github.com/cyber-mule/openpass/issues) 提交反馈。
+A: 请前往 [GitHub Issues](https://github.com/kovawx/openpass/issues) 提交反馈。
 
 ### Q: 如何贡献代码？
 

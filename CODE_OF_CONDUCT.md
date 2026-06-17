@@ -34,7 +34,7 @@
 
 ## 执行
 
-可以通过 [GitHub Issues](https://github.com/cyber-mule/openpass/issues) 报告辱骂、骚扰或其他不可接受的行为。所有投诉都将被审查和调查，并将做出被认为必要和适当的回应。项目团队有义务对事件报告者保密。
+可以通过 [GitHub Issues](https://github.com/kovawx/openpass/issues) 报告辱骂、骚扰或其他不可接受的行为。所有投诉都将被审查和调查，并将做出被认为必要和适当的回应。项目团队有义务对事件报告者保密。
 
 ## 归属
 

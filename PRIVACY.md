@@ -43,7 +43,7 @@ OpenPass 是一个开源的离线 TOTP（基于时间的一次性密码）密码
 ## 开源透明
 
 本项目完全开源，您可以查看源代码验证我们的隐私承诺：
-- 仓库地址：https://github.com/cyber-mule/openpass
+- 仓库地址：https://github.com/kovawx/openpass
 
 ## 联系我们
 

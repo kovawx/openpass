@@ -2,7 +2,7 @@
 
 > 开源、本地、安全的两步验证管理器
 
-[![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=google-chrome&logoColor=white)](https://github.com/cyber-mule/openpass)
+[![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=google-chrome&logoColor=white)](https://github.com/kovawx/openpass)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## 简介
@@ -24,7 +24,7 @@ OpenPass 是一款 Chrome 浏览器扩展，专注于 TOTP 验证码管理。所
 ### 安装
 
 1. 前往 Chrome 网上应用店搜索 "OpenPass" 安装
-2. 或前往 [Releases](https://github.com/cyber-mule/openpass/releases) 下载最新版本手动安装
+2. 或前往 [Releases](https://github.com/kovawx/openpass/releases) 下载最新版本手动安装
 
 **手动安装步骤：**
 1. 下载 zip 包并解压到本地目录
@@ -50,7 +50,7 @@ OpenPass 是一款 Chrome 浏览器扩展，专注于 TOTP 验证码管理。所
 
 ```bash
 # 克隆仓库
-git clone git@github.com:cyber-mule/openpass.git
+git clone git@github.com:kovawx/openpass.git
 cd openpass
 
 # 安装依赖
