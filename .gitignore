@@ -5,6 +5,11 @@
 # Node modules
 node_modules/
 
+# 包管理器 lockfile（项目规范为 pnpm，只跟踪 pnpm-lock.yaml；
+# npm/yarn 的 lockfile 是误用其它包管理器时产生的，忽略）
+package-lock.json
+yarn.lock
+
 # 公共静态资源（由 public/ 管理）
 icons/
 logo.png
