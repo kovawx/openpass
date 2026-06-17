@@ -14,6 +14,7 @@ import {
   type BackupDirectoryWriteResult
 } from '@/utils/backupDestination';
 import { installGlobalRuntimeErrorListeners } from '@/utils/runtimeErrors';
+import { isSiteMatched, parseUrl } from '@/utils/domainMatch';
 
 type BackupFrequency = 'every5min' | 'daily' | 'weekly' | 'monthly';
 
@@ -71,10 +72,13 @@ export default defineBackground(() => {
 
   // 创建右键菜单
   chrome.runtime.onInstalled.addListener((details) => {
+        // 创建右键菜单（常驻：任何上下文都可见——二维码可能被包裹成 link/img/canvas
+    // 等各种元素，用 all 避免漏掉某种上下文；点击走 captureVisibleTab 截屏，与右键
+    // 的具体元素无关）
     chrome.contextMenus.create({
       id: 'parseQRCode',
       title: '识别并添加',
-      contexts: ['image']
+      contexts: ['all']
     });
 
     // 创建自动备份定时器
@@ -91,27 +95,79 @@ export default defineBackground(() => {
 
   // 监听右键菜单点击
   chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-    if (info.menuItemId === 'parseQRCode' && info.srcUrl) {
-      const setupComplete = await checkSetupComplete();
-      if (!setupComplete) {
-        showNotification('请先设置主密码', '点击扩展图标开始设置');
-        return;
-      }
+    if (info.menuItemId !== 'parseQRCode') {
+      return;
+    }
 
-      try {
-        const secret = await parseQRFromImageUrl(info.srcUrl);
-      if (secret) {
-          await storePendingSecret(secret, tab);
-          chrome.action.openPopup();
-        } else {
-          showNotification('识别失败', '未能识别有效的 TOTP 密钥');
+    const setupComplete = await checkSetupComplete();
+    if (!setupComplete) {
+      showNotification('请先设置主密码', '点击扩展图标开始设置');
+      return;
+    }
+
+    // 解析二维码来源（混合策略，全部复用 parseQRFromImageUrl）：
+    // 1) <img> 有 srcUrl：优先取原始图——原始资源是高清干净的，比截屏的屏幕渲染
+    //    分辨率可靠（截屏可能被缩放/压低 DPI 导致 QR 模块糊掉而解码失败）。
+    //    支持 http(s) / data: / blob: 等。
+    // 2) canvas / 无 srcUrl / srcUrl 解码失败：用 captureVisibleTab 截取当前可见页面。
+    const sources: Array<() => Promise<string | null>> = [];
+    if (info.srcUrl) {
+      const srcUrl = info.srcUrl;
+      sources.push(async () => srcUrl);
+    }
+    if (tab && typeof tab.windowId === 'number') {
+      const windowId = tab.windowId;
+      sources.push(async () => {
+        try {
+          return await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+        } catch (error) {
+          console.error('OpenPass: 截取页面失败', error);
+          return null;
         }
+      });
+    }
+
+    let secret: PendingSecret | null = null;
+    for (const getSource of sources) {
+      const source = await getSource();
+      if (!source) continue;
+      try {
+        secret = await parseQRFromImageUrl(source);
       } catch (error) {
-        console.error('解析 QR 码失败', error);
-        showNotification('识别失败', '无法读取图片中的 QR 码');
+        // 单个来源解码抛错（如跨域 fetch 被拦），尝试下一个来源
+        console.warn('OpenPass: 该来源解码失败，尝试下一个', error);
+        continue;
       }
+      if (secret) break;
+    }
+
+    if (secret) {
+      // 提取到的站点不是域名（如 issuer 是 "GitHub" 之类的名字或为空）时，
+      // 用当前页面主域名替换，保证后续站点匹配生效。
+      resolveSiteFromPage(secret, tab);
+      await storePendingSecret(secret, tab);
+      chrome.action.openPopup();
+    } else if (sources.length === 0) {
+      showNotification('识别失败', '无法确定当前窗口');
+    } else {
+      showNotification('识别失败', '未检测到有效的 TOTP 二维码');
     }
   });
+
+  /** 若 secret.site 不是域名（含点+TLD），则替换为页面主域名。 */
+  function resolveSiteFromPage(secret: PendingSecret, tab?: chrome.tabs.Tab) {
+    const site = (secret.site || '').trim();
+    if (/^[a-z0-9.-]+\.[a-z]{2,}/i.test(site)) {
+      return;
+    }
+    if (!tab?.url) {
+      return;
+    }
+    const info = parseUrl(tab.url);
+    if (info) {
+      secret.site = info.mainDomain;
+    }
+  }
 
   async function checkSetupComplete(): Promise<boolean> {
     const result = await chrome.storage.local.get<{ isSetupComplete?: boolean }>(['isSetupComplete']);
@@ -747,27 +803,6 @@ export default defineBackground(() => {
     await syncAutoBackupAlarm();
   });
 
-  function parseUrl(url: string) {
-    try {
-      const urlObj = new URL(url);
-      const hostname = urlObj.hostname;
-      const parts = hostname.split('.');
-      let mainDomain = hostname;
-      if (parts.length >= 2) {
-        const tldPatterns = ['co.uk', 'com.au', 'co.jp', 'com.cn'];
-        const lastTwo = parts.slice(-2).join('.');
-        if (tldPatterns.includes(lastTwo)) {
-          mainDomain = parts.slice(-3).join('.');
-        } else {
-          mainDomain = parts.slice(-2).join('.');
-        }
-      }
-      return { fullUrl: url, fullDomain: hostname, mainDomain, origin: urlObj.origin };
-    } catch {
-      return null;
-    }
-  }
-
   function safeSetBadge(tabId: number, text: string, color: string | null = null) {
     chrome.action.setBadgeText({ tabId, text }, () => {
       if (chrome.runtime.lastError) {
@@ -806,12 +841,7 @@ export default defineBackground(() => {
 
     let matchCount = 0;
     for (const item of sites) {
-      const site = item.site.toLowerCase();
-      const fullDomain = urlInfo.fullDomain.toLowerCase();
-      const mainDomain = urlInfo.mainDomain.toLowerCase();
-
-      if (fullDomain.includes(site) || site.includes(fullDomain) ||
-          mainDomain.includes(site) || site.includes(mainDomain)) {
+      if (isSiteMatched(urlInfo, item.site)) {
         matchCount++;
       }
     }
