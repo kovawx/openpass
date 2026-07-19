@@ -278,7 +278,7 @@ async function testAutoBackup() {
   // 触发 background 中的自动备份检查
   try {
     await chrome.runtime.sendMessage({ action: 'testAutoBackup' });
-    showToast('已触发自动备份测试，请查看控制台', 'info');
+    showToast('已触发自动备份测试，请查看控制台', 'default');
   } catch (error) {
     showToast('触发失败: ' + (error as Error).message, 'error');
   }

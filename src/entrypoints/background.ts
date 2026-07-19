@@ -15,6 +15,8 @@ import {
 } from '@/utils/backupDestination';
 import { installGlobalRuntimeErrorListeners } from '@/utils/runtimeErrors';
 import { isSiteMatched, parseUrl } from '@/utils/domainMatch';
+import { parseOtpAuth } from '@/utils/otpAuth';
+import { createScanRegions, normalizeQrBounds, type NormalizedRect } from '@/utils/qrScan';
 
 type BackupFrequency = 'every5min' | 'daily' | 'weekly' | 'monthly';
 
@@ -26,6 +28,11 @@ interface StoredSecret {
 }
 
 type PendingSecret = StoredSecret;
+
+interface QrCandidate {
+  secret: PendingSecret;
+  rect: NormalizedRect;
+}
 
 interface SiteListItem {
   site: string;
@@ -72,12 +79,9 @@ export default defineBackground(() => {
 
   // 创建右键菜单
   chrome.runtime.onInstalled.addListener((details) => {
-        // 创建右键菜单（常驻：任何上下文都可见——二维码可能被包裹成 link/img/canvas
-    // 等各种元素，用 all 避免漏掉某种上下文；点击走 captureVisibleTab 截屏，与右键
-    // 的具体元素无关）
     chrome.contextMenus.create({
       id: 'parseQRCode',
-      title: '识别并添加',
+      title: '扫描页面二维码',
       contexts: ['all']
     });
 
@@ -94,64 +98,11 @@ export default defineBackground(() => {
   });
 
   // 监听右键菜单点击
-  chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  chrome.contextMenus.onClicked.addListener((info, tab) => {
     if (info.menuItemId !== 'parseQRCode') {
       return;
     }
-
-    const setupComplete = await checkSetupComplete();
-    if (!setupComplete) {
-      showNotification('请先设置主密码', '点击扩展图标开始设置');
-      return;
-    }
-
-    // 解析二维码来源（混合策略，全部复用 parseQRFromImageUrl）：
-    // 1) <img> 有 srcUrl：优先取原始图——原始资源是高清干净的，比截屏的屏幕渲染
-    //    分辨率可靠（截屏可能被缩放/压低 DPI 导致 QR 模块糊掉而解码失败）。
-    //    支持 http(s) / data: / blob: 等。
-    // 2) canvas / 无 srcUrl / srcUrl 解码失败：用 captureVisibleTab 截取当前可见页面。
-    const sources: Array<() => Promise<string | null>> = [];
-    if (info.srcUrl) {
-      const srcUrl = info.srcUrl;
-      sources.push(async () => srcUrl);
-    }
-    if (tab && typeof tab.windowId === 'number') {
-      const windowId = tab.windowId;
-      sources.push(async () => {
-        try {
-          return await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
-        } catch (error) {
-          console.error('OpenPass: 截取页面失败', error);
-          return null;
-        }
-      });
-    }
-
-    let secret: PendingSecret | null = null;
-    for (const getSource of sources) {
-      const source = await getSource();
-      if (!source) continue;
-      try {
-        secret = await parseQRFromImageUrl(source);
-      } catch (error) {
-        // 单个来源解码抛错（如跨域 fetch 被拦），尝试下一个来源
-        console.warn('OpenPass: 该来源解码失败，尝试下一个', error);
-        continue;
-      }
-      if (secret) break;
-    }
-
-    if (secret) {
-      // 提取到的站点不是域名（如 issuer 是 "GitHub" 之类的名字或为空）时，
-      // 用当前页面主域名替换，保证后续站点匹配生效。
-      resolveSiteFromPage(secret, tab);
-      await storePendingSecret(secret, tab);
-      chrome.action.openPopup();
-    } else if (sources.length === 0) {
-      showNotification('识别失败', '无法确定当前窗口');
-    } else {
-      showNotification('识别失败', '未检测到有效的 TOTP 二维码');
-    }
+    void startQrScan(tab);
   });
 
   /** 若 secret.site 不是域名（含点+TLD），则替换为页面主域名。 */
@@ -245,75 +196,90 @@ export default defineBackground(() => {
     }
   }
 
-  async function parseQRFromImageUrl(url: string) {
+  async function scanQrImage(imageUrl: string, crop?: NormalizedRect): Promise<QrCandidate[]> {
+    const response = await fetch(imageUrl);
+    if (!response.ok) throw new Error(`Screenshot decode failed: ${response.status}`);
+    const imageBitmap = await createImageBitmap(await response.blob());
+
     try {
-      let blob;
-
-      if (url.startsWith('data:')) {
-        const response = await fetch(url);
-        blob = await response.blob();
-      } else {
-        const response = await fetch(url, { mode: 'cors' });
-        blob = await response.blob();
-      }
-
-      const imageBitmap = await createImageBitmap(blob);
       const canvas = new OffscreenCanvas(imageBitmap.width, imageBitmap.height);
       const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        throw new Error('2D canvas context unavailable');
-      }
+      if (!ctx) throw new Error('2D canvas context unavailable');
       ctx.drawImage(imageBitmap, 0, 0);
 
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const code = jsQR(imageData.data, imageData.width, imageData.height, {
-        inversionAttempts: 'dontInvert'
-      });
+      const candidates = new Map<string, QrCandidate>();
+      for (const [x, y, width, height] of createScanRegions(canvas.width, canvas.height, crop)) {
+        const safeWidth = Math.min(width, canvas.width - x);
+        const safeHeight = Math.min(height, canvas.height - y);
+        if (safeWidth <= 0 || safeHeight <= 0) continue;
 
-      if (code && code.data) {
-        return parseOTPAuthUrl(code.data);
+        const imageData = ctx.getImageData(x, y, safeWidth, safeHeight);
+        const code = jsQR(imageData.data, imageData.width, imageData.height, {
+          inversionAttempts: 'attemptBoth'
+        });
+        const secret = code?.data ? parseOtpAuth(code.data) : null;
+        if (!code || !secret || candidates.has(secret.secret)) continue;
+
+        const points = Object.values(code.location);
+        candidates.set(secret.secret, {
+          secret,
+          rect: normalizeQrBounds(points, x, y, canvas.width, canvas.height)
+        });
       }
-      return null;
-    } catch (error) {
-      console.error('解析 QR 码失败', error);
-      throw error;
+      return [...candidates.values()];
+    } finally {
+      imageBitmap.close();
     }
   }
 
-  function parseOTPAuthUrl(data: string) {
-    if (/^[A-Z2-7]+=*$/i.test(data.trim())) {
-      return {
-        secret: data.trim().toUpperCase().replace(/\s/g, ''),
-        site: '',
-        name: ''
-      };
-    }
+  async function captureTab(tab: chrome.tabs.Tab) {
+    if (typeof tab.windowId !== 'number') throw new Error('无法确定当前窗口');
+    return chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+  }
 
-    if (data.startsWith('otpauth://')) {
-      try {
-        const url = new URL(data);
-        const params = new URLSearchParams(url.search);
-        const secret = params.get('secret');
-        if (!secret) return null;
+  async function sendToTab(tab: chrome.tabs.Tab, message: Record<string, unknown>) {
+    if (typeof tab.id !== 'number') throw new Error('无法确定当前标签页');
+    return chrome.tabs.sendMessage(tab.id, message);
+  }
 
-        const issuer = params.get('issuer') || '';
-        const account = decodeURIComponent(url.pathname.split('/').pop() || '');
+  async function acceptQrSecret(secret: PendingSecret, tab: chrome.tabs.Tab) {
+    resolveSiteFromPage(secret, tab);
+    await storePendingSecret(secret, tab);
+    await chrome.action.openPopup();
+  }
 
-        let site = issuer;
-        if (!site && account.includes(':')) {
-          site = account.split(':')[0];
-        }
-
-        return {
-          secret: secret.toUpperCase(),
-          site: site.toLowerCase(),
-          name: issuer || account.replace(/.*:/, '')
-        };
-      } catch {
-        return null;
+  async function startQrScan(tab?: chrome.tabs.Tab, crop?: NormalizedRect) {
+    try {
+      const setupComplete = await checkSetupComplete();
+      if (!setupComplete) {
+        showNotification('请先设置主密码', '点击扩展图标开始设置');
+        return;
       }
+
+      if (!tab) {
+        [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      }
+      if (!tab) throw new Error('无法确定当前标签页');
+
+      const candidates = await scanQrImage(await captureTab(tab), crop);
+      if (candidates.length === 1) {
+        await acceptQrSecret(candidates[0].secret, tab);
+        return;
+      }
+
+      if (candidates.length > 1) {
+        await sendToTab(tab, { action: 'showQrCandidates', candidates });
+        return;
+      }
+
+      await sendToTab(tab, {
+        action: 'startQrSelection',
+        message: crop ? '选区内未识别到 TOTP 二维码，请重新框选' : '未自动识别到二维码，请框选二维码区域'
+      });
+    } catch (error) {
+      console.error('OpenPass: 页面二维码扫描失败', error);
+      showNotification('二维码扫描失败', error instanceof Error ? error.message : '无法扫描当前页面');
     }
-    return null;
   }
 
   async function storePendingSecret(secret: PendingSecret, tab?: chrome.tabs.Tab) {
@@ -340,6 +306,30 @@ export default defineBackground(() => {
 
   // 消息监听
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === 'startQrScan') {
+      void startQrScan(sender.tab).then(
+        () => sendResponse({ success: true }),
+        (error) => sendResponse({ error: (error as Error).message })
+      );
+      return true;
+    }
+
+    if (request.action === 'scanQrSelection' && sender.tab) {
+      void startQrScan(sender.tab, request.rect as NormalizedRect).then(
+        () => sendResponse({ success: true }),
+        (error) => sendResponse({ error: (error as Error).message })
+      );
+      return true;
+    }
+
+    if (request.action === 'selectQrCandidate' && sender.tab) {
+      void acceptQrSecret(request.secret as PendingSecret, sender.tab).then(
+        () => sendResponse({ success: true }),
+        (error) => sendResponse({ error: (error as Error).message })
+      );
+      return true;
+    }
+
     if (request.action === 'generateCode') {
       (async () => {
         try {
@@ -669,14 +659,14 @@ export default defineBackground(() => {
           console.log('[AutoBackup] 使用主密码快速路径');
           backupCount = getStoredSecretCount(settings);
           backupData = createMasterPasswordEncryptedBackup(
-            settings.encryptedSecrets,
+            settings.encryptedSecrets!,
             backupCount
           );
         } else if (isCustomPasswordFastPath) {
           console.log('[AutoBackup] 使用自定义密码快速路径');
           backupCount = getStoredSecretCount(settings);
           backupData = createCustomPasswordEncryptedBackup(
-            settings.encryptedSecretsForBackup,
+            settings.encryptedSecretsForBackup!,
             backupCount
           );
         } else {

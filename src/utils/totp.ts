@@ -1,3 +1,5 @@
+import { parseOtpAuth } from './otpAuth';
+
 /**
  * TOTP (Time-based One-Time Password) 生成工具
  * 基于 RFC 6238 实现
@@ -77,44 +79,7 @@ class TOTPUtils {
     site: string;
     name: string;
   } | null {
-    // 直接是密钥（纯文本）
-    if (/^[A-Z2-7]+=*$/i.test(data.trim())) {
-      return {
-        secret: data.trim().toUpperCase().replace(/\s/g, ''),
-        site: '',
-        name: ''
-      };
-    }
-
-    // otpauth:// URL 格式
-    if (data.startsWith('otpauth://')) {
-      try {
-        const url = new URL(data);
-        const params = new URLSearchParams(url.search);
-
-        const secret = params.get('secret');
-        if (!secret) return null;
-
-        const issuer = params.get('issuer') || '';
-        const account = decodeURIComponent(url.pathname.split('/').pop() || '');
-        const label = params.get('label') || '';
-
-        let site = issuer;
-        if (!site && account.includes(':')) {
-          site = account.split(':')[0];
-        }
-
-        return {
-          secret: secret.toUpperCase(),
-          site: site.toLowerCase(),
-          name: issuer || label || account.replace(/.*:/, '')
-        };
-      } catch {
-        return null;
-      }
-    }
-
-    return null;
+    return parseOtpAuth(data);
   }
 }
 

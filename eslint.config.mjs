@@ -45,7 +45,7 @@ export default typescriptEslint.config(
     }
   },
   {
-    files: ['scripts/**/*.js'],
+    files: ['scripts/**/*.{js,mjs,cjs}'],
     languageOptions: {
       ecmaVersion: 'latest',
       sourceType: 'commonjs',

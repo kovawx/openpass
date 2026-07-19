@@ -17,6 +17,7 @@ interface PendingSecret {
   secret: string;
   site: string;
   name: string;
+  digits?: number;
 }
 
 interface CodeEntry {
@@ -320,6 +321,17 @@ function openCreatePage() {
   currentPage.value = 'create';
 }
 
+async function scanCurrentPage() {
+  try {
+    await chrome.runtime.sendMessage({ action: 'startQrScan' });
+  } catch (error) {
+    showToast('无法扫描当前页面', 'error');
+    console.error('OpenPass: 启动二维码扫描失败', error);
+    return;
+  }
+  window.close();
+}
+
 function showEditPage(secret: Secret) {
   editingSecret.value = { ...secret };
   currentPage.value = 'edit';
@@ -332,7 +344,7 @@ const createInitial = computed<FormPayload>(() => {
       secret: pendingSecret.value.secret,
       site: pendingSecret.value.site,
       name: pendingSecret.value.name,
-      digits: 6
+      digits: pendingSecret.value.digits === 8 ? 8 : 6
     };
   }
   return { secret: '', site: getDefaultSite(), name: '', digits: 6 };
@@ -453,6 +465,7 @@ function openSetupPage() {
     <template v-else>
       <PopupHeader
         @add="openCreatePage"
+        @scan="scanCurrentPage"
         @about="showAboutModal = true"
         @manage="openOptionsPage"
       />

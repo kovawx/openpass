@@ -55,8 +55,8 @@ export function parseUrl(value: string): UrlInfo | null {
  * 2 = origin 精确匹配
  * 3 = fullDomain 精确匹配
  * 4 = mainDomain 精确匹配
- * 5 = fullUrl 双向包含
- * 6 = fullDomain / mainDomain 双向包含
+ * 5 = 同源 URL 路径前缀匹配
+ * 6 = 域名标签边界匹配（父域名或子域名）
  */
 export function getSiteMatchPriority(urlInfo: UrlInfo, rawSite: string): number {
   const site = (rawSite || '').trim().toLowerCase();
@@ -71,13 +71,21 @@ export function getSiteMatchPriority(urlInfo: UrlInfo, rawSite: string): number 
   if (origin === site) return 2;
   if (fullDomain === site) return 3;
   if (mainDomain === site) return 4;
-  if (fullUrl.includes(site) || site.includes(fullUrl)) return 5;
+  const parsedSite = parseUrl(site);
   if (
-    fullDomain.includes(site) ||
-    site.includes(fullDomain) ||
-    mainDomain.includes(site) ||
-    site.includes(mainDomain)
+    parsedSite &&
+    parsedSite.origin.toLowerCase() === origin &&
+    (fullUrl.startsWith(parsedSite.fullUrl.toLowerCase()) ||
+      parsedSite.fullUrl.toLowerCase().startsWith(fullUrl))
   ) {
+    return 5;
+  }
+
+  const siteDomain = parsedSite?.fullDomain.toLowerCase() ?? site;
+  const hasDomainBoundary = (left: string, right: string) =>
+    left === right || left.endsWith(`.${right}`) || right.endsWith(`.${left}`);
+
+  if (hasDomainBoundary(fullDomain, siteDomain) || hasDomainBoundary(mainDomain, siteDomain)) {
     return 6;
   }
 
