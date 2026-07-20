@@ -1,6 +1,6 @@
 import { installGlobalRuntimeErrorListeners } from '@/utils/runtimeErrors';
 import { isSiteMatched, parseUrl } from '@/utils/domainMatch';
-import { isOtpInput } from '@/utils/otpInput';
+import { isOtpInput, isOtpSplitGroup, isPotentialSplitOtpInput } from '@/utils/otpInput';
 
 interface ContentSecret {
   secret: string;
@@ -160,8 +160,8 @@ export default defineContentScript({
       }
     }
 
-    function is2FAInput(input: HTMLInputElement): boolean {
-      return isOtpInput({
+    function getOtpInputSignals(input: HTMLInputElement) {
+      return {
         type: input.type,
         name: input.name,
         id: input.id,
@@ -171,7 +171,11 @@ export default defineContentScript({
         inputMode: input.getAttribute('inputmode') || '',
         maxLength: effectiveMaxLength(input),
         contextText: getInputContext(input)
-      });
+      };
+    }
+
+    function is2FAInput(input: HTMLInputElement): boolean {
+      return isOtpInput(getOtpInputSignals(input));
     }
 
     function closeQrOverlay() {
@@ -309,15 +313,7 @@ export default defineContentScript({
     }
 
     function isPotentialSplitInput(input: HTMLInputElement): boolean {
-      if (!isSplitInput(input)) return false;
-      const inputmode = (input.getAttribute('inputmode') || '').toLowerCase();
-      return (
-        inputmode === 'numeric' ||
-        inputmode === 'decimal' ||
-        input.type === 'tel' ||
-        input.type === 'number' ||
-        /\d/.test(input.getAttribute('pattern') || '')
-      );
+      return isPotentialSplitOtpInput(getOtpInputSignals(input));
     }
 
     function ancestorChainWithin(el: Element, depth: number): Set<Element> {
@@ -392,7 +388,7 @@ export default defineContentScript({
       flush();
       return groups.filter((group) =>
         group.isMulti
-          ? (CONFIG.targetLengths as readonly number[]).includes(group.inputs.length)
+          ? isOtpSplitGroup(group.inputs.map(getOtpInputSignals))
           : is2FAInput(group.anchor)
       );
     }

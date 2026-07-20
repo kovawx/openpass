@@ -43,6 +43,7 @@ const STRONG_KEYWORDS = [
 
 const EXCLUDE_KEYWORDS = ['password', 'passwd', 'pwd', '密码'] as const;
 const TARGET_LENGTHS = [6, 8] as const;
+const SPLIT_MAX_LENGTH = 2;
 
 function normalize(value?: string): string {
   return (value || '').toLowerCase();
@@ -101,4 +102,26 @@ export function isOtpInput(signals: OtpInputSignals): boolean {
   }
 
   return KEYWORDS.some((keyword) => allText.includes(keyword)) && lengthMatch;
+}
+
+/**
+ * 分位验证码经常只声明 maxlength=1，没有 inputmode 或 pattern。
+ * 单个短输入框只作为分组候选，不会单独被认定为 OTP。
+ */
+export function isPotentialSplitOtpInput(signals: OtpInputSignals): boolean {
+  const type = normalize(signals.type);
+  const maxLength = signals.maxLength || 0;
+  return (
+    ['text', 'tel', 'number', 'password'].includes(type) &&
+    maxLength >= 1 &&
+    maxLength <= SPLIT_MAX_LENGTH
+  );
+}
+
+/** 只有正好 6/8 个短输入框才能组成一组分位 OTP。 */
+export function isOtpSplitGroup(inputs: OtpInputSignals[]): boolean {
+  return (
+    TARGET_LENGTHS.some((length) => length === inputs.length) &&
+    inputs.every(isPotentialSplitOtpInput)
+  );
 }
