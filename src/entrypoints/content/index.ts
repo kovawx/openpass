@@ -1,5 +1,6 @@
 import { installGlobalRuntimeErrorListeners } from '@/utils/runtimeErrors';
 import { isSiteMatched, parseUrl } from '@/utils/domainMatch';
+import { isOtpInput } from '@/utils/otpInput';
 
 interface ContentSecret {
   secret: string;
@@ -33,26 +34,6 @@ interface QrScanCandidate {
 }
 
 const CONFIG = {
-  keywords: [
-    'otp',
-    'totp',
-    '2fa',
-    'mfa',
-    'auth',
-    'verification',
-    'verify',
-    'code',
-    'pin',
-    'token',
-    'one-time',
-    'onetime',
-    '验证码',
-    '动态码',
-    '安全码',
-    '一次性密码'
-  ],
-  excludeKeywords: ['password', 'passwd', 'pwd', '密码'],
-  strongKeywords: ['otp', 'totp', '2fa', 'mfa', 'one-time', 'onetime', '验证码', '动态码', '一次性密码'],
   targetLengths: [6, 8],
   checkInterval: 1000,
   /** 分位输入框的 maxlength 上限（<= 视为逐位输入） */
@@ -67,6 +48,8 @@ installGlobalRuntimeErrorListeners('content', window, {
 
 export default defineContentScript({
   matches: ['<all_urls>'],
+  allFrames: true,
+  matchAboutBlank: true,
   runAt: 'document_idle',
   main() {
     const groupButtons = new Map<HTMLInputElement, GroupButtonEntry>();
@@ -178,52 +161,17 @@ export default defineContentScript({
     }
 
     function is2FAInput(input: HTMLInputElement): boolean {
-      const typeValid = ['text', 'tel', 'number', 'password'].includes(input.type);
-      if (!typeValid) return false;
-
-      const name = (input.name || '').toLowerCase();
-      const id = (input.id || '').toLowerCase();
-      const placeholder = (input.placeholder || '').toLowerCase();
-      const autocomplete = (input.autocomplete || '').toLowerCase();
-      const ariaLabel = (input.getAttribute('aria-label') || '').toLowerCase();
-      const inputmode = (input.getAttribute('inputmode') || '').toLowerCase();
-      const directText = `${name} ${id} ${placeholder} ${autocomplete} ${ariaLabel}`;
-      const contextText = getInputContext(input);
-      const allText = `${directText} ${contextText}`;
-
-      const maxLength = effectiveMaxLength(input);
-      const lengthMatch = (CONFIG.targetLengths as readonly number[]).includes(maxLength);
-      const numericMode =
-        inputmode === 'numeric' ||
-        inputmode === 'tel' ||
-        input.type === 'tel' ||
-        input.type === 'number';
-
-      // 1) 强信号：W3C 标准 2FA autocomplete，直接认定（优先级最高，不参与排除词过滤）
-      if (autocomplete.includes('one-time-code') || autocomplete.includes('otp')) {
-        return true;
-      }
-
-      // 2) 排除明显的密码 / 非 2FA 输入框
-      if (CONFIG.excludeKeywords.some((keyword) => allText.includes(keyword))) {
-        return false;
-      }
-
-      // 3) 中信号：numeric/tel 输入 + 长度 6/8（主流 2FA 输入框形态）
-      if (numericMode && lengthMatch) {
-        return true;
-      }
-
-      // 4) 明确的 OTP 语义不要求页面正确声明 maxlength。
-      const directStrongMatch = CONFIG.strongKeywords.some((keyword) => directText.includes(keyword));
-      const contextStrongMatch = CONFIG.strongKeywords.some((keyword) => contextText.includes(keyword));
-      if (directStrongMatch || (contextStrongMatch && (numericMode || lengthMatch))) {
-        return true;
-      }
-
-      // 5) 弱信号：关键词命中需配合长度约束，避免凭单个泛词（auth/code/token 等）误报
-      const keywordMatch = CONFIG.keywords.some((keyword) => allText.includes(keyword));
-      return keywordMatch && lengthMatch;
+      return isOtpInput({
+        type: input.type,
+        name: input.name,
+        id: input.id,
+        placeholder: input.placeholder,
+        autocomplete: input.autocomplete,
+        ariaLabel: input.getAttribute('aria-label') || '',
+        inputMode: input.getAttribute('inputmode') || '',
+        maxLength: effectiveMaxLength(input),
+        contextText: getInputContext(input)
+      });
     }
 
     function closeQrOverlay() {
