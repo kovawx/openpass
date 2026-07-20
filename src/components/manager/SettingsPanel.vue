@@ -28,8 +28,7 @@ const directoryInfo = ref<DirectoryInfo>({
   hasHandle: false,
   name: null,
   permission: 'no-handle',
-  usesDefaultPath: true,
-  locationLabel: 'Downloads/.openpass'
+  locationLabel: '尚未选择（建议 Downloads/OpenPass）'
 });
 
 const showPasswordModal = ref(false);
@@ -251,6 +250,9 @@ async function handleBackupNow() {
     if (results.snapshot) messages.push('本地快照已保存');
     if (results.directory?.success) messages.push('目录备份成功');
     if (messages.length > 0) showToast(messages.join('，'), 'success');
+    if (results.directory && !results.directory.success) {
+      showToast(`目录备份失败：${results.directory.error || '未生成备份文件'}`, 'error');
+    }
   } finally {
     backingUp.value = false;
   }
@@ -277,8 +279,12 @@ async function testAutoBackup() {
 
   // 触发 background 中的自动备份检查
   try {
-    await chrome.runtime.sendMessage({ action: 'testAutoBackup' });
-    showToast('已触发自动备份测试，请查看控制台', 'default');
+    const result = await chrome.runtime.sendMessage({ action: 'testAutoBackup' });
+    if (result?.success) {
+      showToast(result.message || '自动备份测试完成', 'success');
+    } else {
+      showToast(result?.error || '自动备份测试未执行', 'error');
+    }
   } catch (error) {
     showToast('触发失败: ' + (error as Error).message, 'error');
   }
@@ -518,7 +524,7 @@ async function resetAllData() {
           <div class="settings-item">
             <div class="settings-item-info">
               <span class="settings-item-label">自动保存到本地目录</span>
-              <span class="settings-item-desc">未选择自定义目录时，默认写入 Downloads/.openpass</span>
+              <span class="settings-item-desc">选择一个明确的目录并授权后，自动备份才会写入文件</span>
             </div>
             <label class="toggle">
               <input v-model="enableDirectoryBackup" type="checkbox" @change="saveBackupSettings">
@@ -533,10 +539,10 @@ async function resetAllData() {
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M22 19a2 2 0 0 0-2 2H4a2 2 0 0 0-2-2V5a2 2 0 0 0 2-2h5l2 3h9a2 2 0 0 0 2 2z"></path>
                 </svg>
-                <span>{{ directoryInfo.hasHandle ? `已选择: ${directoryInfo.locationLabel}` : `默认写入: ${directoryInfo.locationLabel}` }}</span>
+                <span>{{ directoryInfo.hasHandle ? `已选择: ${directoryInfo.locationLabel}` : directoryInfo.locationLabel }}</span>
               </div>
               <button class="btn-secondary btn-sm" @click="handleSelectDirectory">
-                {{ directoryInfo.hasHandle ? '更换目录' : '选择自定义目录' }}
+                {{ directoryInfo.hasHandle ? '更换目录' : '选择备份目录并授权' }}
               </button>
             </div>
 
@@ -565,6 +571,9 @@ async function resetAllData() {
                 </svg>
                 <span class="text-red-600">权限被拒绝，请重新选择</span>
               </template>
+            </div>
+            <div v-else class="permission-status">
+              <span class="text-yellow-600">尚未授权目录，自动备份不会生成文件</span>
             </div>
           </div>
 

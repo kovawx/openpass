@@ -9,6 +9,17 @@ export type PixelRegion = [x: number, y: number, width: number, height: number];
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
+export function getQrScanErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error || '');
+  if (/Could not find an active browser window|No current window/i.test(message)) {
+    return '未找到可扫描的浏览器窗口，请先切换到要扫描的普通网页后重试';
+  }
+  if (/Cannot access contents of url|Cannot access a chrome:\/\//i.test(message)) {
+    return '当前页面受浏览器保护，无法扫描；请在普通网页中重试';
+  }
+  return message || '无法扫描当前页面';
+}
+
 export function createScanRegions(
   imageWidth: number,
   imageHeight: number,

@@ -8,15 +8,21 @@ import {
   saveBackupSnapshot
 } from '@/utils/backup';
 import {
+  UNSELECTED_BACKUP_LOCATION_LABEL,
   createBackupFilename,
+  getBackupDirectoryAccessError,
   getCustomBackupLocationLabel,
-  writeBackupToDefaultDownloads,
   type BackupDirectoryWriteResult
 } from '@/utils/backupDestination';
 import { installGlobalRuntimeErrorListeners } from '@/utils/runtimeErrors';
 import { isSiteMatched, parseUrl } from '@/utils/domainMatch';
 import { parseOtpAuth } from '@/utils/otpAuth';
-import { createScanRegions, normalizeQrBounds, type NormalizedRect } from '@/utils/qrScan';
+import {
+  createScanRegions,
+  getQrScanErrorMessage,
+  normalizeQrBounds,
+  type NormalizedRect
+} from '@/utils/qrScan';
 
 type BackupFrequency = 'every5min' | 'daily' | 'weekly' | 'monthly';
 
@@ -156,18 +162,20 @@ export default defineBackground(() => {
     try {
       const handle = await getStoredBackupHandle();
       if (!handle) {
-        return writeBackupToDefaultDownloads(backupData);
+        return {
+          success: false,
+          error: getBackupDirectoryAccessError('no-handle')!,
+          needAuth: true,
+          locationLabel: UNSELECTED_BACKUP_LOCATION_LABEL
+        };
       }
 
-      let permission = (await handle.queryPermission?.({ mode: 'readwrite' })) ?? 'prompt';
-      if (permission === 'prompt') {
-        permission = (await handle.requestPermission?.({ mode: 'readwrite' })) ?? 'denied';
-      }
+      const permission = (await handle.queryPermission?.({ mode: 'readwrite' })) ?? 'prompt';
 
       if (permission !== 'granted') {
         return {
           success: false,
-          error: permission === 'denied' ? '权限被拒绝，请重新授权备份目录' : '需要授权写入权限',
+          error: getBackupDirectoryAccessError(permission)!,
           needAuth: true
         };
       }
@@ -185,8 +193,7 @@ export default defineBackground(() => {
       return {
         success: true,
         filename,
-        locationLabel: getCustomBackupLocationLabel(handle.name, filename),
-        usesDefaultPath: false
+        locationLabel: getCustomBackupLocationLabel(handle.name, filename)
       };
     } catch (error) {
       return {
@@ -257,9 +264,11 @@ export default defineBackground(() => {
       }
 
       if (!tab) {
-        [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       }
-      if (!tab) throw new Error('无法确定当前标签页');
+      if (!tab) {
+        throw new Error('未找到可扫描的浏览器窗口，请先切换到要扫描的普通网页后重试');
+      }
 
       const candidates = await scanQrImage(await captureTab(tab), crop);
       if (candidates.length === 1) {
@@ -278,7 +287,7 @@ export default defineBackground(() => {
       });
     } catch (error) {
       console.error('OpenPass: 页面二维码扫描失败', error);
-      showNotification('二维码扫描失败', error instanceof Error ? error.message : '无法扫描当前页面');
+      showNotification('二维码扫描失败', getQrScanErrorMessage(error));
     }
   }
 
@@ -367,8 +376,7 @@ export default defineBackground(() => {
     if (request.action === 'testAutoBackup') {
       (async () => {
         console.log('[AutoBackup] 手动触发自动备份测试');
-        await handleAutoBackup();
-        sendResponse({ success: true });
+        sendResponse(await handleAutoBackup(true));
       })();
       return true;
     }
@@ -603,10 +611,18 @@ export default defineBackground(() => {
      return typeof settings.encryptedSecrets === 'string' || typeof settings.encryptedSecretsForBackup === 'string' ? 1 : 0;
    }
 
-  async function handleAutoBackup() {
+  async function handleAutoBackup(force = false): Promise<{
+    success: boolean;
+    message?: string;
+    error?: string;
+  }> {
     try {
-      const checkResult = await checkBackupNeeded();
-      if (!checkResult.needed) return;
+      if (!force) {
+        const checkResult = await checkBackupNeeded();
+        if (!checkResult.needed) {
+          return { success: false, error: '尚未到下一次自动备份时间' };
+        }
+      }
 
       const settings = await chrome.storage.local.get<{
         enableAutoBackup?: boolean;
@@ -628,7 +644,9 @@ export default defineBackground(() => {
         'sitesList'
       ]);
 
-      if (settings.enableAutoBackup !== true) return;
+      if (settings.enableAutoBackup !== true) {
+        return { success: false, error: '自动备份未启用' };
+      }
 
        const sessionKey = await getValidSessionKey();
        const encryptionSettings = await getBackupEncryptionSettings();
@@ -671,7 +689,9 @@ export default defineBackground(() => {
           );
         } else {
           const secrets = await resolveAutoBackupSecrets(settings, sessionKey);
-          if (secrets.length === 0) return;
+          if (secrets.length === 0) {
+            return { success: false, error: '没有可备份的密钥' };
+          }
 
           const backupPassword = await resolveStoredBackupPassword(
             sessionKey,
@@ -681,7 +701,7 @@ export default defineBackground(() => {
           if (encryptionSettings.enableBackupEncryption && !backupPassword) {
             console.warn('[AutoBackup] 缺少备份密码，跳过');
             showNotification('自动备份跳过', '请先解锁 OpenPass 或检查备份加密设置');
-            return;
+            return { success: false, error: '请先解锁 OpenPass 或检查备份加密设置' };
           }
 
           backupCount = secrets.length;
@@ -709,7 +729,16 @@ export default defineBackground(() => {
          if (directoryResult?.error) {
            showNotification('自动备份失败', directoryResult.error);
          }
-         return;
+         return { success: false, error: directoryResult?.error || '没有可用的备份目标' };
+       }
+
+       if (settings.enableDirectoryBackup && directoryResult?.success !== true) {
+         const error = directoryResult?.error || '未生成目录备份文件';
+         showNotification(
+           savedSnapshot ? '自动备份部分完成' : '自动备份失败',
+           savedSnapshot ? `本地快照已保存；目录备份失败：${error}` : error
+         );
+         return { success: false, error: `目录备份失败：${error}` };
        }
 
        const interval = getBackupInterval(settings.backupFrequency);
@@ -734,9 +763,11 @@ export default defineBackground(() => {
       if (messages.length > 0) {
         showNotification('自动备份完成', messages.join('；'));
       }
+      return { success: true, message: messages.join('；') || '自动备份完成' };
     } catch (error) {
       console.error('OpenPass: 自动备份失败', error);
       showNotification('自动备份失败', (error as Error).message);
+      return { success: false, error: (error as Error).message };
     }
   }
 

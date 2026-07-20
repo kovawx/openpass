@@ -14,7 +14,6 @@ export default defineConfig({
     homepage_url: 'https://github.com/kovawx/openpass',
     permissions: [
       'storage',
-      'downloads',
       'activeTab',
       'tabs',
       'contextMenus',

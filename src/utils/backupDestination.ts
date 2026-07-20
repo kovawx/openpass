@@ -1,5 +1,4 @@
-export const DEFAULT_BACKUP_DOWNLOAD_DIR = '.openpass';
-export const DEFAULT_BACKUP_LOCATION_LABEL = 'Downloads/.openpass';
+export const UNSELECTED_BACKUP_LOCATION_LABEL = '尚未选择（建议 Downloads/OpenPass）';
 
 export interface BackupDirectoryWriteResult {
   success: boolean;
@@ -7,7 +6,17 @@ export interface BackupDirectoryWriteResult {
   error?: string;
   needAuth?: boolean;
   locationLabel?: string;
-  usesDefaultPath?: boolean;
+}
+
+export type BackupDirectoryPermission = PermissionState | 'no-handle';
+
+export function getBackupDirectoryAccessError(
+  permission: BackupDirectoryPermission
+): string | null {
+  if (permission === 'granted') return null;
+  if (permission === 'no-handle') return '请先在设置中选择并授权备份目录';
+  if (permission === 'denied') return '备份目录权限已被拒绝，请在设置中重新选择目录';
+  return '备份目录需要重新授权，请打开设置完成授权';
 }
 
 export function createBackupFilename(encrypted: boolean): string {
@@ -18,55 +27,4 @@ export function createBackupFilename(encrypted: boolean): string {
 
 export function getCustomBackupLocationLabel(directoryName: string, filename?: string): string {
   return filename ? `${directoryName}/${filename}` : directoryName;
-}
-
-export function getDefaultBackupLocationLabel(filename?: string): string {
-  return filename ? `${DEFAULT_BACKUP_LOCATION_LABEL}/${filename}` : DEFAULT_BACKUP_LOCATION_LABEL;
-}
-
-function isEncryptedBackup(backupData: unknown): boolean {
-  return typeof backupData === 'object' && backupData !== null && 'encrypted' in backupData &&
-    (backupData as { encrypted?: boolean }).encrypted === true;
-}
-
-export async function writeBackupToDefaultDownloads(
-  backupData: unknown
-): Promise<BackupDirectoryWriteResult> {
-  if (!chrome.downloads?.download) {
-    return {
-      success: false,
-      error: '当前浏览器不支持默认目录备份，请选择自定义目录',
-      needAuth: false,
-      locationLabel: DEFAULT_BACKUP_LOCATION_LABEL,
-      usesDefaultPath: true
-    };
-  }
-
-  try {
-    const filename = createBackupFilename(isEncryptedBackup(backupData));
-    const content = JSON.stringify(backupData, null, 2);
-    const url = `data:application/json;charset=utf-8,${encodeURIComponent(content)}`;
-
-    await chrome.downloads.download({
-      url,
-      filename: `${DEFAULT_BACKUP_DOWNLOAD_DIR}/${filename}`,
-      saveAs: false,
-      conflictAction: 'uniquify'
-    });
-
-    return {
-      success: true,
-      filename,
-      locationLabel: getDefaultBackupLocationLabel(filename),
-      usesDefaultPath: true
-    };
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : '写入默认备份目录失败',
-      needAuth: false,
-      locationLabel: DEFAULT_BACKUP_LOCATION_LABEL,
-      usesDefaultPath: true
-    };
-  }
 }

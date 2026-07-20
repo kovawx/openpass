@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createScanRegions, normalizeQrBounds } from './qrScan';
+import { createScanRegions, getQrScanErrorMessage, normalizeQrBounds } from './qrScan';
 
 describe('QR scan geometry', () => {
   it('scans the full screenshot plus overlapping tiles', () => {
@@ -28,5 +28,11 @@ describe('QR scan geometry', () => {
         500
       )
     ).toEqual({ x: 0.21, y: 0.24, width: 0.1, height: 0.2 });
+  });
+
+  it('把没有活动浏览器窗口的底层错误转换为可操作提示', () => {
+    expect(getQrScanErrorMessage(new Error('Could not find an active browser window.'))).toBe(
+      '未找到可扫描的浏览器窗口，请先切换到要扫描的普通网页后重试'
+    );
   });
 });
