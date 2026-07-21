@@ -20,6 +20,7 @@ export default defineConfig({
       'notifications',
       'alarms'
     ],
+    optional_host_permissions: ['https://*/*', 'http://localhost/*', 'http://127.0.0.1/*'],
     icons: {
       '16': 'icons/icon16.png',
       '48': 'icons/icon48.png',

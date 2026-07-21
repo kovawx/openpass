@@ -9,6 +9,15 @@ export interface BackupDirectoryWriteResult {
 }
 
 export type BackupDirectoryPermission = PermissionState | 'no-handle';
+export type BackupDirectoryAuthorizationAction = 'ready' | 'select-directory';
+
+export function getBackupDirectoryAuthorizationAction(
+  hasHandle: boolean,
+  permission: BackupDirectoryPermission
+): BackupDirectoryAuthorizationAction {
+  if (hasHandle && permission === 'granted') return 'ready';
+  return 'select-directory';
+}
 
 export function getBackupDirectoryAccessError(
   permission: BackupDirectoryPermission

@@ -100,3 +100,20 @@ S3 官方规定 `If-Match` 会在 ETag 不匹配时拒绝写入，因此可用�
 - 412：并发更新，禁止覆盖，保留两份备份。
 - 解密/GCM 认证失败：停止恢复，不返回部分数据，不上传本地对象覆盖远端。
 - 云端上传完成后才记录 remote snapshot ID 和 ETag。
+
+## 8. 客户端实现
+
+OpenPass 使用 AWS SDK for JavaScript v3 的 S3 客户端执行 Signature V4 请求，并支持自定义 Endpoint、Region 和 Path-style 地址。
+
+设置页保存以下非敏感字段：Endpoint、Bucket、Region、对象前缀和 Path-style 开关。Access Key ID、Secret Access Key、可选 Session Token 与云端加密密码组成一个整体，使用当前主密码加密后写入 `chrome.storage.local`。修改主密码时必须同步重加密这组凭据。
+
+启用云端备份时会动态请求对应 Endpoint 的扩展访问权限。远程 HTTP Endpoint 会被拒绝；仅 `localhost` 与 `127.0.0.1` 允许 HTTP，方便本地 MinIO 测试。
+
+后台监听本地 `backupSnapshots` 变化并上传最新快照：
+
+- OpenPass 已解锁：立即上传。
+- OpenPass 已锁定：状态记为 pending，下次解锁自动重试。
+- 网络或服务错误：按 5、15、60、180 分钟退避重试。
+- 412 并发冲突：保留不可变对象并停止自动覆盖，等待用户处理。
+
+设置页提供连接检查、立即同步和从 `latest.opb` 恢复。恢复沿用现有导入语义：不会删除本地密钥，重复项会跳过。

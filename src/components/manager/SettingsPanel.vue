@@ -10,6 +10,17 @@ import {
   getBackupEncryptionSettings,
   resolveStoredBackupPassword
 } from '@/utils/backup';
+import { getBackupDirectoryAuthorizationAction } from '@/utils/backupDestination';
+import {
+  DEFAULT_CLOUD_BACKUP_SETTINGS,
+  DEFAULT_CLOUD_BACKUP_STATUS,
+  getCloudEndpointOriginPattern,
+  loadCloudBackupSettings,
+  loadCloudBackupStatus,
+  saveCloudBackupConfiguration,
+  type CloudBackupSettings,
+  type CloudBackupStatus
+} from '@/utils/cloudBackupSettings';
 
 const secretStore = useSecretStore();
 const authStore = useAuthStore();
@@ -44,6 +55,18 @@ const backupPasswordConfirm = ref('');
 const backupPasswordError = ref('');
 
 const backingUp = ref(false);
+const authorizingDirectory = ref(false);
+const cloudSettings = ref<CloudBackupSettings>({ ...DEFAULT_CLOUD_BACKUP_SETTINGS });
+const cloudStatus = ref<CloudBackupStatus>({ ...DEFAULT_CLOUD_BACKUP_STATUS });
+const cloudAccessKeyId = ref('');
+const cloudSecretAccessKey = ref('');
+const cloudSessionToken = ref('');
+const cloudPassword = ref('');
+const cloudPasswordConfirm = ref('');
+const savingCloud = ref(false);
+const testingCloud = ref(false);
+const syncingCloud = ref(false);
+const restoringCloud = ref(false);
 
 onMounted(async () => {
   await loadAllSettings();
@@ -59,10 +82,16 @@ async function loadAllSettings() {
   nextBackupTime.value = autoBackup.settings.value.nextBackupTime;
 
   directoryInfo.value = await autoBackup.getDirectoryInfo();
+  if (enableDirectoryBackup.value && directoryInfo.value.permission !== 'granted') {
+    enableDirectoryBackup.value = false;
+    await autoBackup.saveSettings({ enableDirectoryBackup: false });
+  }
 
   const encryptionResult = await getBackupEncryptionSettings();
   enableBackupEncryption.value = encryptionResult.enableBackupEncryption;
   useMasterPasswordForBackup.value = encryptionResult.useMasterPasswordForBackup;
+  cloudSettings.value = await loadCloudBackupSettings();
+  cloudStatus.value = await loadCloudBackupStatus();
 
   isInitialized.value = true;
 }
@@ -119,6 +148,61 @@ async function saveBackupSettings() {
   nextBackupTime.value = next.toISOString();
   await autoBackup.saveSettings({ nextBackupTime: nextBackupTime.value });
   await autoBackup.setupAlarm();
+}
+
+const formattedCloudStatus = computed(() => {
+  const labels: Record<CloudBackupStatus['state'], string> = {
+    disabled: '未启用',
+    idle: '等待首次同步',
+    pending: '等待解锁后上传',
+    syncing: '同步中',
+    success: '同步成功',
+    conflict: '存在并发冲突',
+    error: '同步失败'
+  };
+  return labels[cloudStatus.value.state];
+});
+
+async function handleDirectoryBackupToggle() {
+  if (!enableDirectoryBackup.value) {
+    await saveBackupSettings();
+    return;
+  }
+
+  authorizingDirectory.value = true;
+
+  try {
+    const action = getBackupDirectoryAuthorizationAction(
+      directoryInfo.value.hasHandle,
+      directoryInfo.value.permission
+    );
+
+    if (action !== 'ready') {
+      const result = await autoBackup.selectDirectory();
+
+      directoryInfo.value = await autoBackup.getDirectoryInfo();
+
+      if (!result.success || directoryInfo.value.permission !== 'granted') {
+        enableDirectoryBackup.value = false;
+        await saveBackupSettings();
+        const reason = result.error || '请完成目录写入授权';
+        showToast(
+          `目录备份未启用：${reason}`,
+          result.error === '已取消选择' ? 'warning' : 'error'
+        );
+        return;
+      }
+    }
+
+    await saveBackupSettings();
+    showToast(`已授权 ${directoryInfo.value.locationLabel}，目录备份已启用`, 'success');
+  } catch (error) {
+    enableDirectoryBackup.value = false;
+    await saveBackupSettings();
+    showToast(`目录备份未启用：${getErrorMessage(error, '授权失败')}`, 'error');
+  } finally {
+    authorizingDirectory.value = false;
+  }
 }
 
 async function saveEncryptionSettings() {
@@ -290,6 +374,127 @@ async function testAutoBackup() {
   }
 }
 
+async function refreshCloudStatus() {
+  cloudStatus.value = await loadCloudBackupStatus();
+}
+
+async function saveCloudSettings() {
+  if (!authStore.sessionKey) {
+    showToast('请先解锁 OpenPass', 'error');
+    return;
+  }
+  if (cloudPassword.value !== cloudPasswordConfirm.value) {
+    showToast('两次输入的云端加密密码不一致', 'error');
+    return;
+  }
+
+  savingCloud.value = true;
+  try {
+    const origin = getCloudEndpointOriginPattern(cloudSettings.value.endpoint);
+    const granted = await chrome.permissions.request({ origins: [origin] });
+    if (!granted) throw new Error('未获得 S3 Endpoint 访问权限');
+
+    cloudSettings.value = await saveCloudBackupConfiguration(
+      cloudSettings.value,
+      {
+        accessKeyId: cloudAccessKeyId.value.trim(),
+        secretAccessKey: cloudSecretAccessKey.value,
+        sessionToken: cloudSessionToken.value.trim() || undefined,
+        cloudPassword: cloudPassword.value
+      },
+      authStore.sessionKey
+    );
+    if (cloudSettings.value.enabled && !enableLocalSnapshot.value) {
+      enableLocalSnapshot.value = true;
+      await autoBackup.saveSettings({ enableLocalSnapshot: true });
+    }
+    cloudSecretAccessKey.value = '';
+    cloudSessionToken.value = '';
+    cloudPassword.value = '';
+    cloudPasswordConfirm.value = '';
+    await refreshCloudStatus();
+    showToast('云端备份配置已加密保存', 'success');
+  } catch (error) {
+    showToast(getErrorMessage(error, '保存云端备份配置失败'), 'error');
+  } finally {
+    savingCloud.value = false;
+  }
+}
+
+async function disableCloudBackup() {
+  cloudSettings.value.enabled = false;
+  await chrome.storage.local.set({
+    cloudBackupSettings: cloudSettings.value,
+    cloudBackupStatus: { ...cloudStatus.value, state: 'disabled', message: null }
+  });
+  await refreshCloudStatus();
+  showToast('云端备份已停用，远端对象未删除', 'success');
+}
+
+async function testCloudConnection() {
+  testingCloud.value = true;
+  try {
+    const result = await chrome.runtime.sendMessage({ action: 'testCloudBackupConnection' });
+    if (result?.error) throw new Error(result.error);
+    showToast(result?.exists ? '连接成功，已找到云端备份' : '连接成功，尚无云端备份', 'success');
+  } catch (error) {
+    showToast(getErrorMessage(error, '云端连接失败'), 'error');
+  } finally {
+    testingCloud.value = false;
+  }
+}
+
+async function syncCloudNow() {
+  syncingCloud.value = true;
+  try {
+    const result = await chrome.runtime.sendMessage({ action: 'syncLatestCloudBackup' });
+    if (result?.error) throw new Error(result.error);
+    await refreshCloudStatus();
+    showToast('最新本地快照已同步到云端', 'success');
+  } catch (error) {
+    await refreshCloudStatus();
+    showToast(getErrorMessage(error, '云端同步失败'), 'error');
+  } finally {
+    syncingCloud.value = false;
+  }
+}
+
+async function restoreCloudLatest() {
+  if (!confirm('从云端最新备份导入密钥？现有密钥不会被删除，重复项会跳过。')) return;
+  restoringCloud.value = true;
+  try {
+    const result = await chrome.runtime.sendMessage({ action: 'restoreLatestCloudBackup' });
+    if (result?.error || !result?.backupData) {
+      throw new Error(result?.error || '云端未返回有效备份');
+    }
+
+    let password: string | undefined;
+    if (result.backupData.encrypted) {
+      const encryptionSettings = await getBackupEncryptionSettings();
+      password = await resolveStoredBackupPassword(authStore.sessionKey, encryptionSettings);
+      if (!password) throw new Error('当前备份密码不可用，请先检查备份加密设置');
+    }
+
+    const file = new File([JSON.stringify(result.backupData)], 'openpass-cloud-restore.json', {
+      type: 'application/json'
+    });
+    let count: number;
+    try {
+      count = await secretStore.importSecrets(file, password);
+    } catch (error) {
+      if (!result.backupData.encrypted) throw error;
+      const manualPassword = prompt('当前备份密码无法解密，请输入创建这份备份时使用的密码');
+      if (!manualPassword) throw error;
+      count = await secretStore.importSecrets(file, manualPassword);
+    }
+    showToast(count > 0 ? `已从云端导入 ${count} 个密钥` : '云端备份没有新的密钥', 'success');
+  } catch (error) {
+    showToast(getErrorMessage(error, '云端恢复失败'), 'error');
+  } finally {
+    restoringCloud.value = false;
+  }
+}
+
 function openPasswordModal() {
   currentPassword.value = '';
   newPassword.value = '';
@@ -340,11 +545,16 @@ async function changePassword() {
     const secretsResult = await chrome.storage.local.get<{
       encryptedSecrets?: string;
       encryptedBackupPassword?: string;
-    }>(['encryptedSecrets', 'encryptedBackupPassword']);
+      encryptedCloudBackupSecrets?: string;
+    }>(['encryptedSecrets', 'encryptedBackupPassword', 'encryptedCloudBackupSecrets']);
 
     let nextEncryptedBackupPassword =
       typeof secretsResult.encryptedBackupPassword === 'string'
         ? secretsResult.encryptedBackupPassword
+        : null;
+    let nextEncryptedCloudBackupSecrets =
+      typeof secretsResult.encryptedCloudBackupSecrets === 'string'
+        ? secretsResult.encryptedCloudBackupSecrets
         : null;
 
     if (nextEncryptedBackupPassword) {
@@ -354,6 +564,17 @@ async function changePassword() {
       );
       nextEncryptedBackupPassword = await CryptoUtils.encrypt(
         decryptedBackupPassword,
+        newPassword.value
+      );
+    }
+
+    if (nextEncryptedCloudBackupSecrets) {
+      const decryptedCloudSecrets = await CryptoUtils.decrypt(
+        nextEncryptedCloudBackupSecrets,
+        currentPassword.value
+      );
+      nextEncryptedCloudBackupSecrets = await CryptoUtils.encrypt(
+        decryptedCloudSecrets,
         newPassword.value
       );
     }
@@ -368,13 +589,15 @@ async function changePassword() {
         masterPasswordHash: newHash.hash,
         masterPasswordSalt: newHash.salt,
         encryptedSecrets: newEncrypted,
-        encryptedBackupPassword: nextEncryptedBackupPassword
+        encryptedBackupPassword: nextEncryptedBackupPassword,
+        encryptedCloudBackupSecrets: nextEncryptedCloudBackupSecrets
       });
     } else {
       await chrome.storage.local.set({
         masterPasswordHash: newHash.hash,
         masterPasswordSalt: newHash.salt,
-        encryptedBackupPassword: nextEncryptedBackupPassword
+        encryptedBackupPassword: nextEncryptedBackupPassword,
+        encryptedCloudBackupSecrets: nextEncryptedCloudBackupSecrets
       });
     }
 
@@ -524,10 +747,15 @@ async function resetAllData() {
           <div class="settings-item">
             <div class="settings-item-info">
               <span class="settings-item-label">自动保存到本地目录</span>
-              <span class="settings-item-desc">选择一个明确的目录并授权后，自动备份才会写入文件</span>
+              <span class="settings-item-desc">开启时会立即要求选择目录并授权，授权成功后才会启用</span>
             </div>
             <label class="toggle">
-              <input v-model="enableDirectoryBackup" type="checkbox" @change="saveBackupSettings">
+              <input
+                v-model="enableDirectoryBackup"
+                type="checkbox"
+                :disabled="authorizingDirectory"
+                @change="handleDirectoryBackupToggle"
+              >
               <span class="toggle-slider"></span>
             </label>
           </div>
@@ -611,6 +839,95 @@ async function resetAllData() {
               测试自动备份
             </button>
           </div>
+        </div>
+      </div>
+
+      <!-- S3 云端备份 -->
+      <div class="settings-section">
+        <h3>S3 / OSS 云端备份</h3>
+        <p class="settings-desc">
+          本地快照成功后自动上传。凭据由主密码加密保存，备份内容使用独立密码整体加密。
+        </p>
+
+        <div class="settings-item">
+          <div class="settings-item-info">
+            <span class="settings-item-label">启用云端备份</span>
+            <span class="settings-item-desc">停用不会删除任何远端对象</span>
+          </div>
+          <label class="toggle">
+            <input v-model="cloudSettings.enabled" type="checkbox">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="cloud-grid">
+          <div class="form-group cloud-wide">
+            <label>S3 Endpoint</label>
+            <input v-model="cloudSettings.endpoint" type="url" class="form-input" placeholder="https://s3.example.com">
+          </div>
+          <div class="form-group">
+            <label>Bucket</label>
+            <input v-model="cloudSettings.bucket" type="text" class="form-input" placeholder="openpass-backup">
+          </div>
+          <div class="form-group">
+            <label>Region</label>
+            <input v-model="cloudSettings.region" type="text" class="form-input" placeholder="us-east-1">
+          </div>
+          <div class="form-group">
+            <label>对象前缀</label>
+            <input v-model="cloudSettings.prefix" type="text" class="form-input" placeholder="openpass">
+          </div>
+          <div class="form-group">
+            <label>Access Key ID</label>
+            <input v-model="cloudAccessKeyId" type="text" class="form-input" autocomplete="off">
+          </div>
+          <div class="form-group">
+            <label>Secret Access Key</label>
+            <input v-model="cloudSecretAccessKey" type="password" class="form-input" autocomplete="new-password">
+          </div>
+          <div class="form-group">
+            <label>Session Token（可选）</label>
+            <input v-model="cloudSessionToken" type="password" class="form-input" autocomplete="new-password">
+          </div>
+          <div class="form-group">
+            <label>云端加密密码</label>
+            <input v-model="cloudPassword" type="password" class="form-input" autocomplete="new-password">
+          </div>
+          <div class="form-group">
+            <label>确认云端加密密码</label>
+            <input v-model="cloudPasswordConfirm" type="password" class="form-input" autocomplete="new-password">
+          </div>
+        </div>
+
+        <label class="cloud-checkbox">
+          <input v-model="cloudSettings.forcePathStyle" type="checkbox">
+          使用 Path-style 地址（MinIO 与多数兼容 OSS 推荐）
+        </label>
+
+        <div class="cloud-status">
+          <strong>{{ formattedCloudStatus }}</strong>
+          <span v-if="cloudStatus.message">{{ cloudStatus.message }}</span>
+          <span v-if="cloudStatus.lastSuccessAt">
+            上次成功：{{ new Date(cloudStatus.lastSuccessAt).toLocaleString('zh-CN') }}
+          </span>
+        </div>
+
+        <div class="button-group cloud-actions">
+          <button class="btn-primary" :disabled="savingCloud" @click="saveCloudSettings">
+            {{ savingCloud ? '保存中...' : '加密保存配置' }}
+          </button>
+          <button class="btn-secondary" :disabled="testingCloud" @click="testCloudConnection">
+            {{ testingCloud ? '测试中...' : '测试连接' }}
+          </button>
+          <button class="btn-secondary" :disabled="syncingCloud" @click="syncCloudNow">
+            {{ syncingCloud ? '同步中...' : '同步最新快照' }}
+          </button>
+          <button class="btn-secondary" :disabled="restoringCloud" @click="restoreCloudLatest">
+            {{ restoringCloud ? '恢复中...' : '从云端恢复' }}
+          </button>
+          <button v-if="cloudSettings.enabled" class="btn-secondary" @click="disableCloudBackup">
+            停用
+          </button>
         </div>
       </div>
 
@@ -859,6 +1176,11 @@ async function resetAllData() {
   transform: translateX(20px);
 }
 
+.toggle input:disabled + .toggle-slider {
+  cursor: wait;
+  opacity: 0.65;
+}
+
 /* Directory Section */
 .directory-section {
   margin-top: 12px;
@@ -950,6 +1272,51 @@ async function resetAllData() {
 .button-group .btn-secondary {
   flex: 1;
   justify-content: center;
+}
+
+.cloud-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.cloud-wide {
+  grid-column: 1 / -1;
+}
+
+.cloud-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  color: #475569;
+  font-size: 13px;
+}
+
+.cloud-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-top: 16px;
+  padding: 12px;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #475569;
+  font-size: 13px;
+}
+
+.cloud-status strong {
+  color: #0f172a;
+}
+
+.cloud-actions {
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+
+.cloud-actions button {
+  min-width: 132px;
 }
 
 .btn-secondary {
@@ -1089,6 +1456,16 @@ async function resetAllData() {
   justify-content: flex-end;
   gap: 12px;
   margin-top: 20px;
+}
+
+@media (max-width: 720px) {
+  .cloud-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .cloud-wide {
+    grid-column: auto;
+  }
 }
 
 /* Utility */

@@ -15,6 +15,12 @@ import {
   type BackupDirectoryWriteResult
 } from '@/utils/backupDestination';
 import { installGlobalRuntimeErrorListeners } from '@/utils/runtimeErrors';
+import {
+  downloadLatestBackupFromS3,
+  isCloudBackupConflict,
+  testS3CloudBackupConnection,
+  uploadBackupToS3
+} from '@/utils/s3CloudBackup';
 import { isSiteMatched, parseUrl } from '@/utils/domainMatch';
 import { parseOtpAuth } from '@/utils/otpAuth';
 import {
@@ -48,6 +54,8 @@ const BACKUP_DB_NAME = 'OpenPassBackupDB';
 const BACKUP_DB_VERSION = 1;
 const BACKUP_HANDLE_STORE = 'handles';
 const AUTO_BACKUP_ALARM_NAME = 'openpass-auto-backup';
+const CLOUD_BACKUP_RETRY_ALARM_NAME = 'openpass-cloud-backup-retry';
+const CLOUD_BACKUP_RETRY_MINUTES = [5, 15, 60, 180];
 
 const BACKUP_INTERVALS: Record<BackupFrequency, number> = {
   every5min: 5 * 60 * 1000,
@@ -66,6 +74,7 @@ export default defineBackground(() => {
 
   // SessionKey 内存缓存，供自动备份解密使用
   let cachedSessionKey: string | null = null;
+  let cloudBackupInFlight: Promise<unknown> | null = null;
 
   // 启动时自动修复 secrets 结构
   (async () => {
@@ -362,6 +371,11 @@ export default defineBackground(() => {
     // 缓存 sessionKey，供用户解锁时写入
     if (request.action === 'cacheSessionKey') {
       cachedSessionKey = request.sessionKey || null;
+      if (cachedSessionKey) {
+        void syncLatestLocalSnapshot().catch((error) => {
+          console.error('OpenPass: 解锁后重试云端备份失败', error);
+        });
+      }
       sendResponse({ success: true });
       return true;
     }
@@ -377,6 +391,41 @@ export default defineBackground(() => {
       (async () => {
         console.log('[AutoBackup] 手动触发自动备份测试');
         sendResponse(await handleAutoBackup(true));
+      })();
+      return true;
+    }
+
+    if (request.action === 'testCloudBackupConnection') {
+      void (async () => {
+        try {
+          const sessionKey = await getValidSessionKey();
+          if (!sessionKey) throw new Error('请先解锁 OpenPass');
+          sendResponse(await testS3CloudBackupConnection(sessionKey));
+        } catch (error) {
+          sendResponse({ error: error instanceof Error ? error.message : '云端连接测试失败' });
+        }
+      })();
+      return true;
+    }
+
+    if (request.action === 'syncLatestCloudBackup') {
+      void syncLatestLocalSnapshot(true).then(
+        (result) => sendResponse({ success: true, result }),
+        (error) => sendResponse({ error: error instanceof Error ? error.message : '云端同步失败' })
+      );
+      return true;
+    }
+
+    if (request.action === 'restoreLatestCloudBackup') {
+      void (async () => {
+        try {
+          const sessionKey = await getValidSessionKey();
+          if (!sessionKey) throw new Error('请先解锁 OpenPass');
+          const backupData = await downloadLatestBackupFromS3<StoredSecret>(sessionKey);
+          sendResponse({ success: true, backupData });
+        } catch (error) {
+          sendResponse({ error: error instanceof Error ? error.message : '云端恢复失败' });
+        }
       })();
       return true;
     }
@@ -461,12 +510,23 @@ export default defineBackground(() => {
         console.error('OpenPass: 同步自动备份定时器失败', error);
       });
     }
+
+    if (namespace === 'local' && changes.backupSnapshots) {
+      void syncLatestLocalSnapshot().catch((error) => {
+        console.error('OpenPass: 本地快照自动同步到云端失败', error);
+      });
+    }
   });
 
   // 自动备份定时器
   chrome.alarms.onAlarm.addListener(async (alarm) => {
     if (alarm.name === AUTO_BACKUP_ALARM_NAME) {
       await handleAutoBackup();
+    }
+    if (alarm.name === CLOUD_BACKUP_RETRY_ALARM_NAME) {
+      await syncLatestLocalSnapshot(true).catch((error) => {
+        console.error('OpenPass: 云端备份重试失败', error);
+      });
     }
   });
 
@@ -531,6 +591,79 @@ export default defineBackground(() => {
     }
 
     return null;
+  }
+
+  async function syncLatestLocalSnapshot(force = false) {
+    if (cloudBackupInFlight) return cloudBackupInFlight;
+
+    cloudBackupInFlight = (async () => {
+      const result = await chrome.storage.local.get<{
+        cloudBackupSettings?: { enabled?: boolean };
+        cloudBackupStatus?: Record<string, unknown>;
+        cloudBackupLastLocalTimestamp?: string;
+        backupSnapshots?: Array<{
+          data: BackupData<StoredSecret>;
+          timestamp: string;
+        }>;
+      }>([
+        'cloudBackupSettings',
+        'cloudBackupStatus',
+        'cloudBackupLastLocalTimestamp',
+        'backupSnapshots'
+      ]);
+
+      if (result.cloudBackupSettings?.enabled !== true) return { skipped: 'disabled' };
+      const latest = Array.isArray(result.backupSnapshots) ? result.backupSnapshots[0] : undefined;
+      if (!latest?.data) throw new Error('没有可同步的本地快照，请先执行一次备份');
+      if (!force && result.cloudBackupLastLocalTimestamp === latest.timestamp) {
+        return { skipped: 'already-synced' };
+      }
+
+      const sessionKey = await getValidSessionKey();
+      if (!sessionKey) {
+        await chrome.storage.local.set({
+          cloudBackupStatus: {
+            ...(result.cloudBackupStatus || {}),
+            state: 'pending',
+            message: '本地快照已保存，解锁 OpenPass 后将自动上传'
+          }
+        });
+        return { skipped: 'locked' };
+      }
+
+      try {
+        const uploaded = await uploadBackupToS3(latest.data, sessionKey);
+        await chrome.alarms.clear(CLOUD_BACKUP_RETRY_ALARM_NAME);
+        await chrome.storage.local.set({
+          cloudBackupLastLocalTimestamp: latest.timestamp,
+          cloudBackupRetryCount: 0
+        });
+        return uploaded;
+      } catch (error) {
+        if (!isCloudBackupConflict(error)) {
+          const retryState = await chrome.storage.local.get<{ cloudBackupRetryCount?: number }>([
+            'cloudBackupRetryCount'
+          ]);
+          const retryCount = Math.min(
+            typeof retryState.cloudBackupRetryCount === 'number'
+              ? retryState.cloudBackupRetryCount + 1
+              : 1,
+            CLOUD_BACKUP_RETRY_MINUTES.length
+          );
+          await chrome.storage.local.set({ cloudBackupRetryCount: retryCount });
+          chrome.alarms.create(CLOUD_BACKUP_RETRY_ALARM_NAME, {
+            delayInMinutes: CLOUD_BACKUP_RETRY_MINUTES[retryCount - 1]
+          });
+        }
+        throw error;
+      }
+    })();
+
+    try {
+      return await cloudBackupInFlight;
+    } finally {
+      cloudBackupInFlight = null;
+    }
   }
 
   async function decryptStoredSecrets(encryptedSecrets: string, sessionKey: string) {

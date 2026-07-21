@@ -259,7 +259,8 @@ export function useAutoBackup() {
 
     try {
       const permission = await handle.requestPermission?.({ mode: 'readwrite' });
-      return { success: permission === 'granted' };
+      if (permission === 'granted') return { success: true };
+      return { success: false, error: '未获得目录写入权限，请重新选择目录并允许写入' };
     } catch (error) {
       return { success: false, error: getErrorMessage(error) };
     }
