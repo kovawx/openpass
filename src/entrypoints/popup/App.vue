@@ -5,6 +5,7 @@ import CryptoUtils from '@/utils/crypto';
 import { parseUrl } from '@/utils/domainMatch';
 import { showToast } from '@/utils/ui';
 import type { Secret } from '@/stores/secrets';
+import { recordSecretDeletion } from '@/utils/syncMerge';
 
 import PopupHeader from '@/components/popup/PopupHeader.vue';
 import PopupHomePage from '@/components/popup/PopupHomePage.vue';
@@ -305,6 +306,11 @@ function restartCodeUpdater() {
 async function saveSecrets() {
   if (!Array.isArray(secrets.value)) return;
   await persistSecrets(secrets.value);
+  const result = await chrome.runtime.sendMessage({
+    action: 'createChangeBackup',
+    secrets: secrets.value
+  });
+  if (result?.error) throw new Error(result.error);
 }
 
 // 导航
@@ -365,7 +371,8 @@ async function handleCreateSubmit(data: FormPayload) {
     digits: data.digits,
     site: data.site,
     name: data.name,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
   };
 
   secrets.value.push(newSecret);
@@ -403,6 +410,7 @@ async function handleDeleteFromEdit() {
   }
 
   const id = editingSecret.value.id;
+  await recordSecretDeletion(id);
   secrets.value = Array.isArray(secrets.value) ? secrets.value.filter(s => s.id !== id) : [];
   await saveSecrets();
   showToast('密钥已删除', 'success');
@@ -418,6 +426,7 @@ async function deleteSecretFromList(secret: Secret) {
   secrets.value = Array.isArray(secrets.value)
     ? secrets.value.filter(item => item.id !== secret.id)
     : [];
+  await recordSecretDeletion(secret.id);
   await saveSecrets();
   showToast('密钥已删除', 'success');
   restartCodeUpdater();

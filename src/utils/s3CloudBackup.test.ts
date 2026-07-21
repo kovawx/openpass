@@ -21,7 +21,9 @@ vi.mock('@aws-sdk/client-s3', () => {
 });
 
 import type { BackupData } from './backup';
+import { unwrapCloudBackup } from './cloudBackup';
 import { saveCloudBackupConfiguration } from './cloudBackupSettings';
+import CryptoUtils from './crypto';
 import {
   getCloudBackupObjectKeys,
   isCloudBackupConflict,
@@ -103,11 +105,65 @@ describe('S3 cloud backup transport', () => {
     });
   });
 
+  it('conditions latest on the ETag observed during pull without a new HEAD', async () => {
+    sdk.send
+      .mockResolvedValueOnce({ ETag: 'history-etag' })
+      .mockResolvedValueOnce({ ETag: 'latest-etag' });
+    const backup: BackupData<{ site: string; secret: string }> = {
+      format: 'openpass-backup',
+      formatVersion: 1,
+      appVersion: '0.2.1',
+      exportTime: '2026-07-21T00:00:00.000Z',
+      count: 1,
+      encrypted: false,
+      secrets: [{ site: 'example.com', secret: 'TOPSECRET' }]
+    };
+
+    await uploadBackupToS3(backup, 'master-password', 'observed-etag');
+
+    expect(sdk.send).toHaveBeenCalledTimes(2);
+    const latestInput = sdk.send.mock.calls[1][0].input as Record<string, unknown>;
+    expect(latestInput.IfMatch).toBe('observed-etag');
+  });
+
   it('recognizes S3 precondition failures as conflicts', () => {
     expect(isCloudBackupConflict({ $metadata: { httpStatusCode: 412 } })).toBe(true);
     const error = new Error('conflict');
     error.name = 'CloudBackupConflict';
     expect(isCloudBackupConflict(error)).toBe(true);
+  });
+
+  it('removes device-local backup encryption before applying the cloud envelope', async () => {
+    storage.set('enableBackupEncryption', true);
+    storage.set('useMasterPasswordForBackup', true);
+    sdk.send
+      .mockResolvedValueOnce({ ETag: 'history-etag' })
+      .mockResolvedValueOnce({ $metadata: { httpStatusCode: 404 } })
+      .mockResolvedValueOnce({ ETag: 'latest-etag' });
+    const encryptedData = await CryptoUtils.encrypt(
+      JSON.stringify([{ id: 'one', site: 'example.com', secret: 'TOPSECRET' }]),
+      'master-password'
+    );
+    const backup: BackupData<{ id: string; site: string; secret: string }> = {
+      format: 'openpass-backup',
+      formatVersion: 1,
+      appVersion: '0.2.1',
+      exportTime: '2026-07-21T00:00:00.000Z',
+      count: 1,
+      encrypted: true,
+      encryptedData
+    };
+
+    await uploadBackupToS3(backup, 'master-password');
+    const historyInput = sdk.send.mock.calls[0][0].input as Record<string, unknown>;
+    const cloudBackup = await unwrapCloudBackup(
+      JSON.parse(String(historyInput.Body)),
+      'cloud-password'
+    );
+    expect(cloudBackup.encrypted).toBe(false);
+    expect(cloudBackup.secrets).toEqual([
+      { id: 'one', site: 'example.com', secret: 'TOPSECRET' }
+    ]);
   });
 
   it('keeps the immutable backup and exposes latest conflicts', async () => {

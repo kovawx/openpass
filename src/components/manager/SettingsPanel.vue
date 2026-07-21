@@ -21,6 +21,7 @@ import {
   type CloudBackupSettings,
   type CloudBackupStatus
 } from '@/utils/cloudBackupSettings';
+import { recordSecretDeletions } from '@/utils/syncMerge';
 
 const secretStore = useSecretStore();
 const authStore = useAuthStore();
@@ -450,7 +451,7 @@ async function syncCloudNow() {
     const result = await chrome.runtime.sendMessage({ action: 'syncLatestCloudBackup' });
     if (result?.error) throw new Error(result.error);
     await refreshCloudStatus();
-    showToast('最新本地快照已同步到云端', 'success');
+    showToast('多设备双向同步完成', 'success');
   } catch (error) {
     await refreshCloudStatus();
     showToast(getErrorMessage(error, '云端同步失败'), 'error');
@@ -614,9 +615,10 @@ async function clearAllSecrets() {
   if (confirmation !== 'DELETE') return;
 
   try {
-    secretStore.secrets = [];
-    await secretStore.saveSecrets();
+    await recordSecretDeletions(secretStore.secrets.map((secret) => secret.id));
     await chrome.storage.local.remove(['backupSnapshots']);
+    secretStore.secrets = [];
+    await secretStore.saveSecrets({ triggerSnapshot: true });
     showToast('所有密钥已清空', 'success');
   } catch (error) {
     showToast(`清空失败: ${getErrorMessage(error)}`, 'error');
@@ -844,9 +846,9 @@ async function resetAllData() {
 
       <!-- S3 云端备份 -->
       <div class="settings-section">
-        <h3>S3 / OSS 云端备份</h3>
+        <h3>S3 / OSS 多设备同步</h3>
         <p class="settings-desc">
-          本地快照成功后自动上传。凭据由主密码加密保存，备份内容使用独立密码整体加密。
+          自动拉取、合并并上传最新快照。凭据由主密码加密保存，云端始终只有密文。
         </p>
 
         <div class="settings-item">
@@ -908,7 +910,10 @@ async function resetAllData() {
           <strong>{{ formattedCloudStatus }}</strong>
           <span v-if="cloudStatus.message">{{ cloudStatus.message }}</span>
           <span v-if="cloudStatus.lastSuccessAt">
-            上次成功：{{ new Date(cloudStatus.lastSuccessAt).toLocaleString('zh-CN') }}
+            上次上传：{{ new Date(cloudStatus.lastSuccessAt).toLocaleString('zh-CN') }}
+          </span>
+          <span v-if="cloudStatus.lastPullAt">
+            上次拉取：{{ new Date(cloudStatus.lastPullAt).toLocaleString('zh-CN') }}
           </span>
         </div>
 
@@ -920,7 +925,7 @@ async function resetAllData() {
             {{ testingCloud ? '测试中...' : '测试连接' }}
           </button>
           <button class="btn-secondary" :disabled="syncingCloud" @click="syncCloudNow">
-            {{ syncingCloud ? '同步中...' : '同步最新快照' }}
+            {{ syncingCloud ? '同步中...' : '立即双向同步' }}
           </button>
           <button class="btn-secondary" :disabled="restoringCloud" @click="restoreCloudLatest">
             {{ restoringCloud ? '恢复中...' : '从云端恢复' }}

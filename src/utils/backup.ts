@@ -1,4 +1,5 @@
 import CryptoUtils from './crypto';
+import { getBackupSyncMetadata, type BackupSyncMetadata } from './syncMerge';
 
 export interface BackupSecretLike {
   site?: string;
@@ -23,6 +24,7 @@ export interface BackupData<T = BackupSecretLike> {
   kdfIterations?: number;
   migratedFrom?: string;
   migratedAt?: string;
+  sync?: BackupSyncMetadata;
 }
 
 export interface BackupEncryptionSettings {
@@ -96,6 +98,21 @@ function parseVersion(version: string) {
   };
 }
 
+function normalizeBackupSyncMetadata(value: unknown): BackupSyncMetadata | undefined {
+  if (!isRecord(value) || value.version !== 1 || typeof value.deviceId !== 'string') {
+    return undefined;
+  }
+  const tombstones = Array.isArray(value.tombstones)
+    ? value.tombstones.filter((entry): entry is BackupSyncMetadata['tombstones'][number] =>
+        isRecord(entry) &&
+        typeof entry.id === 'string' &&
+        typeof entry.deletedAt === 'string' &&
+        typeof entry.deviceId === 'string'
+      )
+    : [];
+  return { version: 1, deviceId: value.deviceId, tombstones };
+}
+
 function normalizeBackupData<T extends BackupSecretLike>(data: unknown): BackupData<T> | null {
   if (Array.isArray(data)) {
     return {
@@ -136,7 +153,8 @@ function normalizeBackupData<T extends BackupSecretLike>(data: unknown): BackupD
       kdf: typeof data.kdf === 'string' ? data.kdf : undefined,
       kdfIterations: typeof data.kdfIterations === 'number' ? data.kdfIterations : undefined,
       migratedFrom: typeof data.migratedFrom === 'string' ? data.migratedFrom : undefined,
-      migratedAt: typeof data.migratedAt === 'string' ? data.migratedAt : undefined
+      migratedAt: typeof data.migratedAt === 'string' ? data.migratedAt : undefined,
+      sync: normalizeBackupSyncMetadata(data.sync)
     };
   }
 
@@ -358,7 +376,8 @@ export async function createBackupData<T>(
     exportPlatform: typeof navigator !== 'undefined' ? navigator.platform : undefined,
     count: secrets.length,
     encrypted: !!password,
-    secrets: password ? undefined : secrets
+    secrets: password ? undefined : secrets,
+    sync: await getBackupSyncMetadata()
   };
 
   if (password) {

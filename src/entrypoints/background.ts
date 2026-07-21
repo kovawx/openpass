@@ -3,6 +3,7 @@ import { TOTP } from 'otpauth';
 import {
   type BackupData,
   createBackupData,
+  decryptBackupData,
   getBackupEncryptionSettings,
   resolveStoredBackupPassword,
   saveBackupSnapshot
@@ -16,7 +17,14 @@ import {
 } from '@/utils/backupDestination';
 import { installGlobalRuntimeErrorListeners } from '@/utils/runtimeErrors';
 import {
+  getBackupSyncMetadata,
+  loadSecretTombstones,
+  mergeSyncState,
+  type SyncSecretLike
+} from '@/utils/syncMerge';
+import {
   downloadLatestBackupFromS3,
+  downloadLatestBackupStateFromS3,
   isCloudBackupConflict,
   testS3CloudBackupConnection,
   uploadBackupToS3
@@ -33,10 +41,16 @@ import {
 type BackupFrequency = 'every5min' | 'daily' | 'weekly' | 'monthly';
 
 interface StoredSecret {
+  id?: string;
   secret: string;
   site: string;
   name?: string;
   digits?: number;
+  period?: number;
+  algorithm?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  importedAt?: string;
 }
 
 type PendingSecret = StoredSecret;
@@ -55,6 +69,7 @@ const BACKUP_DB_VERSION = 1;
 const BACKUP_HANDLE_STORE = 'handles';
 const AUTO_BACKUP_ALARM_NAME = 'openpass-auto-backup';
 const CLOUD_BACKUP_RETRY_ALARM_NAME = 'openpass-cloud-backup-retry';
+const CLOUD_BACKUP_PULL_ALARM_NAME = 'openpass-cloud-backup-pull';
 const CLOUD_BACKUP_RETRY_MINUTES = [5, 15, 60, 180];
 
 const BACKUP_INTERVALS: Record<BackupFrequency, number> = {
@@ -75,6 +90,7 @@ export default defineBackground(() => {
   // SessionKey 内存缓存，供自动备份解密使用
   let cachedSessionKey: string | null = null;
   let cloudBackupInFlight: Promise<unknown> | null = null;
+  let cloudPullInFlight: Promise<unknown> | null = null;
 
   // 启动时自动修复 secrets 结构
   (async () => {
@@ -103,6 +119,9 @@ export default defineBackground(() => {
     // 创建自动备份定时器
     void syncAutoBackupAlarm().catch((error) => {
       console.error('OpenPass: 初始化自动备份定时器失败', error);
+    });
+    void syncCloudPullAlarm().catch((error) => {
+      console.error('OpenPass: 初始化云端同步定时器失败', error);
     });
 
     // 首次安装时自动打开管理页面
@@ -372,8 +391,8 @@ export default defineBackground(() => {
     if (request.action === 'cacheSessionKey') {
       cachedSessionKey = request.sessionKey || null;
       if (cachedSessionKey) {
-        void syncLatestLocalSnapshot().catch((error) => {
-          console.error('OpenPass: 解锁后重试云端备份失败', error);
+        void synchronizeCloudState().catch((error) => {
+          console.error('OpenPass: 解锁后同步云端数据失败', error);
         });
       }
       sendResponse({ success: true });
@@ -408,8 +427,30 @@ export default defineBackground(() => {
       return true;
     }
 
+    if (request.action === 'createChangeBackup') {
+      void (async () => {
+        try {
+          const sessionKey = await getValidSessionKey();
+          if (!sessionKey) throw new Error('请先解锁 OpenPass');
+          const secrets = Array.isArray(request.secrets)
+            ? normalizeSecretsForSync(request.secrets as StoredSecret[], new Date().toISOString())
+            : [];
+          const encryptionSettings = await getBackupEncryptionSettings();
+          const backupPassword = await resolveStoredBackupPassword(sessionKey, encryptionSettings);
+          if (encryptionSettings.enableBackupEncryption && !backupPassword) {
+            throw new Error('无法获取备份密码');
+          }
+          await saveBackupSnapshot(await createBackupData(secrets, backupPassword));
+          sendResponse({ success: true });
+        } catch (error) {
+          sendResponse({ error: error instanceof Error ? error.message : '创建同步快照失败' });
+        }
+      })();
+      return true;
+    }
+
     if (request.action === 'syncLatestCloudBackup') {
-      void syncLatestLocalSnapshot(true).then(
+      void synchronizeCloudState(true).then(
         (result) => sendResponse({ success: true, result }),
         (error) => sendResponse({ error: error instanceof Error ? error.message : '云端同步失败' })
       );
@@ -512,8 +553,17 @@ export default defineBackground(() => {
     }
 
     if (namespace === 'local' && changes.backupSnapshots) {
-      void syncLatestLocalSnapshot().catch((error) => {
-        console.error('OpenPass: 本地快照自动同步到云端失败', error);
+      void synchronizeCloudState().catch((error) => {
+        console.error('OpenPass: 本地快照双向同步失败', error);
+      });
+    }
+
+    if (namespace === 'local' && changes.cloudBackupSettings) {
+      void (async () => {
+        await syncCloudPullAlarm();
+        await synchronizeCloudState();
+      })().catch((error) => {
+        console.error('OpenPass: 应用云端同步配置失败', error);
       });
     }
   });
@@ -524,8 +574,13 @@ export default defineBackground(() => {
       await handleAutoBackup();
     }
     if (alarm.name === CLOUD_BACKUP_RETRY_ALARM_NAME) {
-      await syncLatestLocalSnapshot(true).catch((error) => {
+      await synchronizeCloudState(true).catch((error) => {
         console.error('OpenPass: 云端备份重试失败', error);
+      });
+    }
+    if (alarm.name === CLOUD_BACKUP_PULL_ALARM_NAME) {
+      await synchronizeCloudState().catch((error) => {
+        console.error('OpenPass: 定时拉取云端备份失败', error);
       });
     }
   });
@@ -566,6 +621,18 @@ export default defineBackground(() => {
     });
   }
 
+  async function syncCloudPullAlarm() {
+    const settings = await chrome.storage.local.get<{
+      cloudBackupSettings?: { enabled?: boolean };
+    }>(['cloudBackupSettings']);
+    await chrome.alarms.clear(CLOUD_BACKUP_PULL_ALARM_NAME);
+    if (settings.cloudBackupSettings?.enabled !== true) return;
+    chrome.alarms.create(CLOUD_BACKUP_PULL_ALARM_NAME, {
+      delayInMinutes: 1,
+      periodInMinutes: 5
+    });
+  }
+
   async function getValidSessionKey() {
     if (cachedSessionKey) {
       return cachedSessionKey;
@@ -593,7 +660,10 @@ export default defineBackground(() => {
     return null;
   }
 
-  async function syncLatestLocalSnapshot(force = false) {
+  async function syncLatestLocalSnapshot(
+    force = false,
+    expectedLatestETag?: string | null
+  ) {
     if (cloudBackupInFlight) return cloudBackupInFlight;
 
     cloudBackupInFlight = (async () => {
@@ -632,10 +702,15 @@ export default defineBackground(() => {
       }
 
       try {
-        const uploaded = await uploadBackupToS3(latest.data, sessionKey);
+        const uploaded = await uploadBackupToS3(
+          latest.data,
+          sessionKey,
+          expectedLatestETag
+        );
         await chrome.alarms.clear(CLOUD_BACKUP_RETRY_ALARM_NAME);
         await chrome.storage.local.set({
           cloudBackupLastLocalTimestamp: latest.timestamp,
+          cloudBackupLastPulledETag: uploaded.etag,
           cloudBackupRetryCount: 0
         });
         return uploaded;
@@ -666,6 +741,176 @@ export default defineBackground(() => {
     }
   }
 
+  type SyncStoredSecret = StoredSecret & SyncSecretLike;
+
+  function normalizeSecretsForSync(
+    secrets: StoredSecret[],
+    fallbackTime: string
+  ): SyncStoredSecret[] {
+    return secrets
+      .filter((secret) => typeof secret.secret === 'string' && typeof secret.site === 'string')
+      .map((secret) => {
+        const createdAt = secret.createdAt || secret.importedAt || fallbackTime;
+        return {
+          ...secret,
+          id: secret.id || crypto.randomUUID(),
+          createdAt,
+          updatedAt: secret.updatedAt || createdAt
+        };
+      });
+  }
+
+  async function persistMergedSyncState(
+    secrets: SyncStoredSecret[],
+    tombstones: Awaited<ReturnType<typeof loadSecretTombstones>>,
+    sessionKey: string
+  ) {
+    const CryptoUtils = await import('../utils/crypto');
+    const encryptionSettings = await getBackupEncryptionSettings();
+    const backupPassword = await resolveStoredBackupPassword(sessionKey, encryptionSettings);
+    if (encryptionSettings.enableBackupEncryption && !backupPassword) {
+      throw new Error('无法解密备份密码，已停止多设备同步');
+    }
+
+    const serialized = JSON.stringify(secrets);
+    const storageData: Record<string, unknown> = {
+      secrets,
+      sitesList: secrets.map((secret) => ({ site: secret.site })),
+      secretTombstones: tombstones,
+      encryptedSecrets: await CryptoUtils.default.encrypt(serialized, sessionKey)
+    };
+    if (
+      encryptionSettings.enableBackupEncryption &&
+      !encryptionSettings.useMasterPasswordForBackup &&
+      backupPassword
+    ) {
+      storageData.encryptedSecretsForBackup = await CryptoUtils.default.encrypt(
+        serialized,
+        backupPassword
+      );
+    }
+    await chrome.storage.local.set(storageData);
+    await saveBackupSnapshot(await createBackupData(secrets, backupPassword));
+  }
+
+  async function synchronizeCloudState(force = false) {
+    if (cloudPullInFlight) return cloudPullInFlight;
+    cloudPullInFlight = (async () => {
+      const state = await chrome.storage.local.get<{
+        cloudBackupSettings?: { enabled?: boolean };
+        cloudBackupStatus?: Record<string, unknown>;
+        cloudBackupLastPulledETag?: string;
+        secrets?: StoredSecret[];
+      }>([
+        'cloudBackupSettings',
+        'cloudBackupStatus',
+        'cloudBackupLastPulledETag',
+        'secrets'
+      ]);
+      if (state.cloudBackupSettings?.enabled !== true) return { skipped: 'disabled' };
+
+      const sessionKey = await getValidSessionKey();
+      if (!sessionKey) {
+        await chrome.storage.local.set({
+          cloudBackupStatus: {
+            ...(state.cloudBackupStatus || {}),
+            state: 'pending',
+            message: '等待解锁后拉取并合并云端数据'
+          }
+        });
+        return { skipped: 'locked' };
+      }
+
+      await chrome.storage.local.set({
+        cloudBackupStatus: {
+          ...(state.cloudBackupStatus || {}),
+          state: 'syncing',
+          message: '正在拉取并合并云端数据'
+        }
+      });
+
+      let remote;
+      try {
+        remote = await downloadLatestBackupStateFromS3<StoredSecret>(sessionKey);
+      } catch (error) {
+        if (error instanceof Error && error.name === 'CloudBackupNotFound') {
+          return syncLatestLocalSnapshot(true, null);
+        }
+        throw error;
+      }
+
+      if (!force && remote.etag && remote.etag === state.cloudBackupLastPulledETag) {
+        return syncLatestLocalSnapshot(false, remote.etag);
+      }
+
+      const encryptionSettings = await getBackupEncryptionSettings();
+      const backupPassword = await resolveStoredBackupPassword(sessionKey, encryptionSettings);
+      let remoteSecrets: StoredSecret[];
+      if (remote.backupData.encrypted) {
+        if (!backupPassword) throw new Error('无法解密远端备份，请检查备份密码');
+        remoteSecrets = await decryptBackupData(remote.backupData, backupPassword);
+      } else {
+        remoteSecrets = Array.isArray(remote.backupData.secrets)
+          ? remote.backupData.secrets
+          : [];
+      }
+
+      const localSecrets = normalizeSecretsForSync(
+        Array.isArray(state.secrets) ? state.secrets : [],
+        '1970-01-01T00:00:00.000Z'
+      );
+      const normalizedRemote = normalizeSecretsForSync(
+        remoteSecrets,
+        remote.backupData.exportTime
+      );
+      const localTombstones = await loadSecretTombstones();
+      const merged = mergeSyncState(
+        localSecrets,
+        localTombstones,
+        normalizedRemote,
+        remote.backupData.sync?.tombstones ?? []
+      );
+
+      await chrome.storage.local.set({
+        cloudBackupLastPulledETag: remote.etag,
+        cloudBackupStatus: {
+          ...(state.cloudBackupStatus || {}),
+          state: 'success',
+          message: merged.changed ? '已自动合并云端数据' : '本地与云端已同步',
+          lastPullAt: new Date().toISOString()
+        }
+      });
+
+      if (merged.changed) {
+        await persistMergedSyncState(merged.secrets, merged.tombstones, sessionKey);
+        await syncLatestLocalSnapshot(true, remote.etag);
+      } else {
+        await syncLatestLocalSnapshot(false, remote.etag);
+      }
+      return { merged: merged.changed, count: merged.secrets.length };
+    })();
+
+    try {
+      return await cloudPullInFlight;
+    } catch (error) {
+      if (!isCloudBackupConflict(error)) {
+        const status = await chrome.storage.local.get<{
+          cloudBackupStatus?: Record<string, unknown>;
+        }>(['cloudBackupStatus']);
+        await chrome.storage.local.set({
+          cloudBackupStatus: {
+            ...(status.cloudBackupStatus || {}),
+            state: 'error',
+            message: error instanceof Error ? error.message : '多设备同步失败'
+          }
+        });
+      }
+      throw error;
+    } finally {
+      cloudPullInFlight = null;
+    }
+  }
+
   async function decryptStoredSecrets(encryptedSecrets: string, sessionKey: string) {
     const CryptoUtils = await import('../utils/crypto');
     const decrypted = await CryptoUtils.default.decrypt(encryptedSecrets, sessionKey);
@@ -688,10 +933,10 @@ export default defineBackground(() => {
     return Array.isArray(settings.secrets) ? settings.secrets : [];
   }
 
-  function createMasterPasswordEncryptedBackup(
+  async function createMasterPasswordEncryptedBackup(
     encryptedSecrets: string,
     count: number
-  ): BackupData<StoredSecret> {
+  ): Promise<BackupData<StoredSecret>> {
     return {
       format: 'openpass-backup',
       formatVersion: 1,
@@ -703,14 +948,15 @@ export default defineBackground(() => {
       encryptedData: encryptedSecrets,
       encryptionVersion: 1,
       kdf: 'PBKDF2',
-      kdfIterations: 100000
+      kdfIterations: 100000,
+      sync: await getBackupSyncMetadata()
     };
   }
 
-  function createCustomPasswordEncryptedBackup(
+  async function createCustomPasswordEncryptedBackup(
     encryptedSecretsForBackup: string,
     count: number
-  ): BackupData<StoredSecret> {
+  ): Promise<BackupData<StoredSecret>> {
     return {
       format: 'openpass-backup',
       formatVersion: 1,
@@ -722,7 +968,8 @@ export default defineBackground(() => {
       encryptedData: encryptedSecretsForBackup,
       encryptionVersion: 1,
       kdf: 'PBKDF2',
-      kdfIterations: 100000
+      kdfIterations: 100000,
+      sync: await getBackupSyncMetadata()
     };
   }
 
@@ -809,14 +1056,14 @@ export default defineBackground(() => {
         if (isMasterPasswordFastPath) {
           console.log('[AutoBackup] 使用主密码快速路径');
           backupCount = getStoredSecretCount(settings);
-          backupData = createMasterPasswordEncryptedBackup(
+          backupData = await createMasterPasswordEncryptedBackup(
             settings.encryptedSecrets!,
             backupCount
           );
         } else if (isCustomPasswordFastPath) {
           console.log('[AutoBackup] 使用自定义密码快速路径');
           backupCount = getStoredSecretCount(settings);
-          backupData = createCustomPasswordEncryptedBackup(
+          backupData = await createCustomPasswordEncryptedBackup(
             settings.encryptedSecretsForBackup!,
             backupCount
           );
@@ -948,6 +1195,10 @@ export default defineBackground(() => {
   // 扩展启动时检查备份
   chrome.runtime.onStartup.addListener(async () => {
     await syncAutoBackupAlarm();
+    await syncCloudPullAlarm();
+    await synchronizeCloudState().catch((error) => {
+      console.error('OpenPass: 启动时同步云端数据失败', error);
+    });
   });
 
   // 扩展更新时检查备份
@@ -955,6 +1206,7 @@ export default defineBackground(() => {
     if (details.reason === 'install') return;
 
     await syncAutoBackupAlarm();
+    await syncCloudPullAlarm();
   });
 
   function safeSetBadge(tabId: number, text: string, color: string | null = null) {

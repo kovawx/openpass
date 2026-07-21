@@ -5,7 +5,13 @@ import {
   S3Client,
   type S3ClientConfig
 } from '@aws-sdk/client-s3';
-import type { BackupData, BackupSecretLike } from './backup';
+import {
+  decryptBackupData,
+  getBackupEncryptionSettings,
+  resolveStoredBackupPassword,
+  type BackupData,
+  type BackupSecretLike
+} from './backup';
 import { unwrapCloudBackup, wrapBackupForCloud } from './cloudBackup';
 import {
   loadCloudBackupSecrets,
@@ -68,6 +74,7 @@ async function updateStatus(status: Partial<CloudBackupStatus>) {
       state: 'idle',
       message: null,
       lastSuccessAt: null,
+      lastPullAt: null,
       latestETag: null,
       latestSnapshotKey: null,
       ...result.cloudBackupStatus,
@@ -83,6 +90,27 @@ async function resolveRuntime(masterPassword: string) {
   ]);
   if (!settings.enabled) throw new Error('云端备份未启用');
   return { settings, secrets, client: createClient(settings, secrets) };
+}
+
+async function prepareBackupForCloud<T extends BackupSecretLike>(
+  backupData: BackupData<T>,
+  masterPassword: string
+): Promise<BackupData<T>> {
+  if (!backupData.encrypted) return backupData;
+  const encryptionSettings = await getBackupEncryptionSettings();
+  const backupPassword = await resolveStoredBackupPassword(masterPassword, encryptionSettings);
+  if (!backupPassword) throw new Error('无法解密本地备份，请检查备份密码');
+  const secrets = await decryptBackupData(backupData, backupPassword);
+  return {
+    ...backupData,
+    encrypted: false,
+    encryptedData: undefined,
+    encryptionVersion: undefined,
+    kdf: undefined,
+    kdfIterations: undefined,
+    secrets,
+    count: secrets.length
+  };
 }
 
 async function readBodyAsText(body: unknown): Promise<string> {
@@ -113,9 +141,10 @@ export async function testS3CloudBackupConnection(masterPassword: string) {
   }
 }
 
-export async function uploadBackupToS3<T>(
+export async function uploadBackupToS3<T extends BackupSecretLike>(
   backupData: BackupData<T>,
-  masterPassword: string
+  masterPassword: string,
+  expectedLatestETag?: string | null
 ) {
   const { settings, secrets, client } = await resolveRuntime(masterPassword);
   const snapshotId = crypto.randomUUID();
@@ -123,7 +152,8 @@ export async function uploadBackupToS3<T>(
 
   await updateStatus({ state: 'syncing', message: '正在上传云端备份' });
   try {
-    const envelope = await wrapBackupForCloud(backupData, secrets.cloudPassword);
+    const cloudBackupData = await prepareBackupForCloud(backupData, masterPassword);
+    const envelope = await wrapBackupForCloud(cloudBackupData, secrets.cloudPassword);
     const body = JSON.stringify(envelope);
     await client.send(new PutObjectCommand({
       Bucket: settings.bucket,
@@ -133,15 +163,18 @@ export async function uploadBackupToS3<T>(
       IfNoneMatch: '*'
     }));
 
-    let currentETag: string | undefined;
-    try {
-      const head = await client.send(new HeadObjectCommand({
-        Bucket: settings.bucket,
-        Key: keys.latest
-      }));
-      currentETag = head.ETag;
-    } catch (error) {
-      if (!isNotFound(error)) throw error;
+    let currentETag = expectedLatestETag;
+    if (expectedLatestETag === undefined) {
+      try {
+        const head = await client.send(new HeadObjectCommand({
+          Bucket: settings.bucket,
+          Key: keys.latest
+        }));
+        currentETag = head.ETag;
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
+        currentETag = null;
+      }
     }
 
     let latestResult;
@@ -192,6 +225,12 @@ export async function uploadBackupToS3<T>(
 export async function downloadLatestBackupFromS3<T extends BackupSecretLike>(
   masterPassword: string
 ): Promise<BackupData<T>> {
+  return (await downloadLatestBackupStateFromS3<T>(masterPassword)).backupData;
+}
+
+export async function downloadLatestBackupStateFromS3<T extends BackupSecretLike>(
+  masterPassword: string
+): Promise<{ backupData: BackupData<T>; etag: string | null }> {
   const { settings, secrets, client } = await resolveRuntime(masterPassword);
   const latestKey = getCloudBackupObjectKeys(settings, 'restore').latest;
   try {
@@ -200,9 +239,16 @@ export async function downloadLatestBackupFromS3<T extends BackupSecretLike>(
       Key: latestKey
     }));
     const body = await readBodyAsText(result.Body);
-    return unwrapCloudBackup<T>(JSON.parse(body), secrets.cloudPassword);
+    return {
+      backupData: await unwrapCloudBackup<T>(JSON.parse(body), secrets.cloudPassword),
+      etag: result.ETag ?? null
+    };
   } catch (error) {
-    if (isNotFound(error)) throw new Error('云端尚无可恢复的备份', { cause: error });
+    if (isNotFound(error)) {
+      const notFoundError = new Error('云端尚无可恢复的备份', { cause: error });
+      notFoundError.name = 'CloudBackupNotFound';
+      throw notFoundError;
+    }
     throw error;
   } finally {
     client.destroy();

@@ -5,9 +5,20 @@ import { unwrapCloudBackup, wrapBackupForCloud } from './cloudBackup';
 const secrets = [{ site: 'example.com', secret: 'TOPSECRET' }];
 
 beforeAll(() => {
+  const storage = new Map<string, unknown>();
   vi.stubGlobal('chrome', {
     runtime: {
       getManifest: () => ({ version: '0.2.1' })
+    },
+    storage: {
+      local: {
+        get: async (keys: string[]) => Object.fromEntries(
+          keys.filter((key) => storage.has(key)).map((key) => [key, storage.get(key)])
+        ),
+        set: async (values: Record<string, unknown>) => {
+          for (const [key, value] of Object.entries(values)) storage.set(key, value);
+        }
+      }
     }
   });
 });

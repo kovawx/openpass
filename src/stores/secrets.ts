@@ -2,6 +2,7 @@ import { defineStore } from 'pinia';
 import { ref } from 'vue';
 import { useAuthStore } from './auth';
 import CryptoUtils from '@/utils/crypto';
+import { recordSecretDeletion } from '@/utils/syncMerge';
 import { showToast } from '@/utils/ui';
 import {
   buildSecretIdentity,
@@ -10,8 +11,6 @@ import {
   decryptBackupData,
   getBackupEncryptionSettings,
   migrateBackupData,
-  resolveStoredBackupPassword,
-  triggerChangeBackup,
   validateBackupData
 } from '@/utils/backup';
 
@@ -129,11 +128,11 @@ export const useSecretStore = defineStore('secrets', () => {
     await chrome.storage.local.set(data);
 
     if (options.triggerSnapshot) {
-      const encryptionSettings = await getBackupEncryptionSettings();
-      const password = await resolveStoredBackupPassword(authStore.sessionKey, encryptionSettings);
-      void triggerChangeBackup(plainSecrets, password).catch((error) => {
-        console.error('触发本地快照失败:', error);
+      const result = await chrome.runtime.sendMessage({
+        action: 'createChangeBackup',
+        secrets: plainSecrets
       });
+      if (result?.error) throw new Error(result.error);
     }
   }
 
@@ -168,6 +167,7 @@ export const useSecretStore = defineStore('secrets', () => {
   }
 
   async function deleteSecret(id: string) {
+    await recordSecretDeletion(id);
     secrets.value = secrets.value.filter((secret) => secret.id !== id);
     await saveSecrets({ triggerSnapshot: true });
     showToast('密钥已删除', 'success');

@@ -20,6 +20,7 @@ export interface CloudBackupStatus {
   state: 'disabled' | 'idle' | 'pending' | 'syncing' | 'success' | 'conflict' | 'error';
   message: string | null;
   lastSuccessAt: string | null;
+  lastPullAt: string | null;
   latestETag: string | null;
   latestSnapshotKey: string | null;
 }
@@ -37,6 +38,7 @@ export const DEFAULT_CLOUD_BACKUP_STATUS: CloudBackupStatus = {
   state: 'disabled',
   message: null,
   lastSuccessAt: null,
+  lastPullAt: null,
   latestETag: null,
   latestSnapshotKey: null
 };
