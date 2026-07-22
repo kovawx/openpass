@@ -1,6 +1,8 @@
 import {
+  DeleteObjectsCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
   type S3ClientConfig
@@ -23,8 +25,25 @@ import {
 
 const CONTENT_TYPE = 'application/vnd.openpass.cloud-backup+json';
 
+export interface CloudBackupVersion {
+  key: string;
+  lastModified: string | null;
+  size: number;
+  etag: string | null;
+}
+
 function objectKey(settings: CloudBackupSettings, suffix: string) {
   return `${settings.prefix}/v1/${suffix}`;
+}
+
+function historyPrefix(settings: CloudBackupSettings) {
+  return objectKey(settings, 'objects/');
+}
+
+function isHistoryKey(settings: CloudBackupSettings, key: string) {
+  const prefix = historyPrefix(settings);
+  const suffix = key.startsWith(prefix) ? key.slice(prefix.length) : '';
+  return /^[a-zA-Z0-9-]+\.opb$/.test(suffix);
 }
 
 export function getCloudBackupObjectKeys(settings: CloudBackupSettings, snapshotId: string) {
@@ -77,6 +96,8 @@ async function updateStatus(status: Partial<CloudBackupStatus>) {
       lastPullAt: null,
       latestETag: null,
       latestSnapshotKey: null,
+      lastRetentionAt: null,
+      lastRetentionError: null,
       ...result.cloudBackupStatus,
       ...status
     } satisfies CloudBackupStatus
@@ -228,6 +249,48 @@ export async function downloadLatestBackupFromS3<T extends BackupSecretLike>(
   return (await downloadLatestBackupStateFromS3<T>(masterPassword)).backupData;
 }
 
+async function listVersionObjects(
+  client: S3Client,
+  settings: CloudBackupSettings
+): Promise<CloudBackupVersion[]> {
+  const versions: CloudBackupVersion[] = [];
+  let continuationToken: string | undefined;
+
+  do {
+    const result = await client.send(new ListObjectsV2Command({
+      Bucket: settings.bucket,
+      Prefix: historyPrefix(settings),
+      ContinuationToken: continuationToken
+    }));
+    for (const object of result.Contents ?? []) {
+      if (!object.Key || !isHistoryKey(settings, object.Key)) continue;
+      versions.push({
+        key: object.Key,
+        lastModified: object.LastModified?.toISOString() ?? null,
+        size: object.Size ?? 0,
+        etag: object.ETag ?? null
+      });
+    }
+    if (!result.IsTruncated) break;
+    if (!result.NextContinuationToken || result.NextContinuationToken === continuationToken) {
+      throw new Error('S3 历史版本分页响应无效');
+    }
+    continuationToken = result.NextContinuationToken;
+  } while (continuationToken);
+
+  return versions.sort((left, right) => {
+    const timeDiff = Date.parse(right.lastModified || '') - Date.parse(left.lastModified || '');
+    if (Number.isFinite(timeDiff) && timeDiff !== 0) return timeDiff;
+    return right.key.localeCompare(left.key);
+  });
+}
+
+function assertHistoryKey(settings: CloudBackupSettings, key: string) {
+  if (!isHistoryKey(settings, key)) {
+    throw new Error('无效的云端历史版本标识');
+  }
+}
+
 export async function downloadLatestBackupStateFromS3<T extends BackupSecretLike>(
   masterPassword: string
 ): Promise<{ backupData: BackupData<T>; etag: string | null }> {
@@ -252,5 +315,88 @@ export async function downloadLatestBackupStateFromS3<T extends BackupSecretLike
     throw error;
   } finally {
     client.destroy();
+  }
+}
+
+export async function listCloudBackupVersions(
+  masterPassword: string
+): Promise<CloudBackupVersion[]> {
+  const { settings, client } = await resolveRuntime(masterPassword);
+  try {
+    return await listVersionObjects(client, settings);
+  } finally {
+    client.destroy();
+  }
+}
+
+export async function downloadCloudBackupVersion<T extends BackupSecretLike>(
+  key: string,
+  masterPassword: string
+): Promise<BackupData<T>> {
+  const { settings, secrets, client } = await resolveRuntime(masterPassword);
+  try {
+    assertHistoryKey(settings, key);
+    const result = await client.send(new GetObjectCommand({
+      Bucket: settings.bucket,
+      Key: key
+    }));
+    const body = await readBodyAsText(result.Body);
+    return unwrapCloudBackup<T>(JSON.parse(body), secrets.cloudPassword);
+  } finally {
+    client.destroy();
+  }
+}
+
+export async function applyCloudBackupRetention(
+  masterPassword: string,
+  protectedKey?: string
+): Promise<{ deleted: number; kept: number; error?: string }> {
+  let client: S3Client | undefined;
+  try {
+    const runtime = await resolveRuntime(masterPassword);
+    client = runtime.client;
+    const { settings } = runtime;
+    const versions = await listVersionObjects(client, settings);
+    const protectedKeys = new Set([protectedKey, versions[0]?.key].filter(Boolean));
+    const cutoff = Date.now() - settings.retentionDays * 24 * 60 * 60 * 1000;
+    const candidates = versions.filter((version, index) => {
+      if (protectedKeys.has(version.key)) return false;
+      const expired = version.lastModified
+        ? Date.parse(version.lastModified) < cutoff
+        : false;
+      return index >= settings.retentionMaxVersions || expired;
+    });
+
+    for (let index = 0; index < candidates.length; index += 1000) {
+      const chunk = candidates.slice(index, index + 1000);
+      const result = await client.send(new DeleteObjectsCommand({
+        Bucket: settings.bucket,
+        Delete: {
+          Quiet: true,
+          Objects: chunk.map((version) => ({ Key: version.key }))
+        }
+      }));
+      if (result.Errors?.length) {
+        throw new Error(`有 ${result.Errors.length} 个历史版本清理失败`);
+      }
+    }
+
+    await updateStatus({
+      message: candidates.length > 0
+        ? `已清理 ${candidates.length} 个过期云端版本`
+        : '云端历史版本在保留范围内',
+      lastRetentionAt: new Date().toISOString(),
+      lastRetentionError: null
+    });
+    return { deleted: candidates.length, kept: versions.length - candidates.length };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '历史版本清理失败';
+    await updateStatus({
+      message: `同步成功，但历史版本清理失败：${message}`,
+      lastRetentionError: message
+    }).catch(() => undefined);
+    return { deleted: 0, kept: 0, error: message };
+  } finally {
+    client?.destroy();
   }
 }

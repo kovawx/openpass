@@ -7,6 +7,8 @@ export interface CloudBackupSettings {
   region: string;
   prefix: string;
   forcePathStyle: boolean;
+  retentionMaxVersions: number;
+  retentionDays: number;
 }
 
 export interface CloudBackupSecrets {
@@ -23,6 +25,8 @@ export interface CloudBackupStatus {
   lastPullAt: string | null;
   latestETag: string | null;
   latestSnapshotKey: string | null;
+  lastRetentionAt: string | null;
+  lastRetentionError: string | null;
 }
 
 export const DEFAULT_CLOUD_BACKUP_SETTINGS: CloudBackupSettings = {
@@ -31,7 +35,9 @@ export const DEFAULT_CLOUD_BACKUP_SETTINGS: CloudBackupSettings = {
   bucket: '',
   region: 'us-east-1',
   prefix: 'openpass',
-  forcePathStyle: true
+  forcePathStyle: true,
+  retentionMaxVersions: 30,
+  retentionDays: 90
 };
 
 export const DEFAULT_CLOUD_BACKUP_STATUS: CloudBackupStatus = {
@@ -40,8 +46,15 @@ export const DEFAULT_CLOUD_BACKUP_STATUS: CloudBackupStatus = {
   lastSuccessAt: null,
   lastPullAt: null,
   latestETag: null,
-  latestSnapshotKey: null
+  latestSnapshotKey: null,
+  lastRetentionAt: null,
+  lastRetentionError: null
 };
+
+function normalizeRetention(value: number, fallback: number, maximum: number) {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(maximum, Math.max(1, Math.trunc(value)));
+}
 
 export function normalizeCloudEndpoint(endpoint: string): string {
   const url = new URL(endpoint.trim());
@@ -75,7 +88,9 @@ export function validateCloudBackupInput(
     endpoint: normalizeCloudEndpoint(settings.endpoint),
     bucket: settings.bucket.trim(),
     region: settings.region.trim() || 'us-east-1',
-    prefix: normalizeCloudPrefix(settings.prefix)
+    prefix: normalizeCloudPrefix(settings.prefix),
+    retentionMaxVersions: normalizeRetention(settings.retentionMaxVersions, 30, 200),
+    retentionDays: normalizeRetention(settings.retentionDays, 90, 3650)
   };
 
   if (!normalized.bucket) throw new Error('Bucket 不能为空');

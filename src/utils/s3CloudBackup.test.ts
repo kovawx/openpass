@@ -14,8 +14,10 @@ vi.mock('@aws-sdk/client-s3', () => {
       send = sdk.send;
       destroy = sdk.destroy;
     },
+    DeleteObjectsCommand: Command,
     GetObjectCommand: Command,
     HeadObjectCommand: Command,
+    ListObjectsV2Command: Command,
     PutObjectCommand: Command
   };
 });
@@ -25,8 +27,11 @@ import { unwrapCloudBackup } from './cloudBackup';
 import { saveCloudBackupConfiguration } from './cloudBackupSettings';
 import CryptoUtils from './crypto';
 import {
+  applyCloudBackupRetention,
+  downloadCloudBackupVersion,
   getCloudBackupObjectKeys,
   isCloudBackupConflict,
+  listCloudBackupVersions,
   uploadBackupToS3
 } from './s3CloudBackup';
 
@@ -37,7 +42,9 @@ const settings = {
   bucket: 'backups',
   region: 'us-east-1',
   prefix: 'team/openpass',
-  forcePathStyle: true
+  forcePathStyle: true,
+  retentionMaxVersions: 2,
+  retentionDays: 90
 };
 
 beforeEach(async () => {
@@ -188,5 +195,80 @@ describe('S3 cloud backup transport', () => {
       state: 'conflict',
       message: expect.stringContaining('未覆盖远端最新备份')
     });
+  });
+
+  it('lists encrypted history objects newest first', async () => {
+    sdk.send.mockResolvedValueOnce({
+      IsTruncated: false,
+      Contents: [
+        {
+          Key: 'team/openpass/v1/objects/older.opb',
+          LastModified: new Date('2026-07-20T00:00:00.000Z'),
+          Size: 100,
+          ETag: 'older-etag'
+        },
+        {
+          Key: 'team/openpass/v1/objects/newer.opb',
+          LastModified: new Date('2026-07-21T00:00:00.000Z'),
+          Size: 200,
+          ETag: 'newer-etag'
+        },
+        {
+          Key: 'team/openpass/v1/objects/unmanaged/nested.opb',
+          LastModified: new Date('2026-07-22T00:00:00.000Z')
+        }
+      ]
+    });
+
+    const versions = await listCloudBackupVersions('master-password');
+
+    expect(versions.map((version) => version.key)).toEqual([
+      'team/openpass/v1/objects/newer.opb',
+      'team/openpass/v1/objects/older.opb'
+    ]);
+  });
+
+  it('deletes versions beyond the configured finite retention', async () => {
+    sdk.send
+      .mockResolvedValueOnce({
+        IsTruncated: false,
+        Contents: [
+          {
+            Key: 'team/openpass/v1/objects/newest.opb',
+            LastModified: new Date('2999-07-22T00:00:00.000Z')
+          },
+          {
+            Key: 'team/openpass/v1/objects/second.opb',
+            LastModified: new Date('2999-07-21T00:00:00.000Z')
+          },
+          {
+            Key: 'team/openpass/v1/objects/oldest.opb',
+            LastModified: new Date('2999-07-20T00:00:00.000Z')
+          }
+        ]
+      })
+      .mockResolvedValueOnce({});
+
+    await expect(
+      applyCloudBackupRetention(
+        'master-password',
+        'team/openpass/v1/objects/newest.opb'
+      )
+    ).resolves.toMatchObject({ deleted: 1, kept: 2 });
+
+    const deleteInput = sdk.send.mock.calls[1][0].input as {
+      Delete: { Objects: Array<{ Key: string }> };
+    };
+    expect(deleteInput.Delete.Objects).toEqual([
+      { Key: 'team/openpass/v1/objects/oldest.opb' }
+    ]);
+  });
+
+  it('rejects history keys outside the configured random-object prefix', async () => {
+    await expect(
+      downloadCloudBackupVersion('another-prefix/v1/objects/version.opb', 'master-password')
+    ).rejects.toThrow('无效的云端历史版本标识');
+    expect(sdk.send).not.toHaveBeenCalled();
+    expect(sdk.destroy).toHaveBeenCalledOnce();
   });
 });

@@ -23,9 +23,12 @@ import {
   type SyncSecretLike
 } from '@/utils/syncMerge';
 import {
+  applyCloudBackupRetention,
+  downloadCloudBackupVersion,
   downloadLatestBackupFromS3,
   downloadLatestBackupStateFromS3,
   isCloudBackupConflict,
+  listCloudBackupVersions,
   testS3CloudBackupConnection,
   uploadBackupToS3
 } from '@/utils/s3CloudBackup';
@@ -471,6 +474,40 @@ export default defineBackground(() => {
       return true;
     }
 
+    if (request.action === 'listCloudBackupVersions') {
+      void (async () => {
+        try {
+          const sessionKey = await getValidSessionKey();
+          if (!sessionKey) throw new Error('请先解锁 OpenPass');
+          sendResponse({
+            success: true,
+            versions: await listCloudBackupVersions(sessionKey)
+          });
+        } catch (error) {
+          sendResponse({ error: error instanceof Error ? error.message : '读取历史版本失败' });
+        }
+      })();
+      return true;
+    }
+
+    if (request.action === 'restoreCloudBackupVersion') {
+      void (async () => {
+        try {
+          const sessionKey = await getValidSessionKey();
+          if (!sessionKey) throw new Error('请先解锁 OpenPass');
+          if (typeof request.key !== 'string') throw new Error('无效的历史版本标识');
+          const backupData = await downloadCloudBackupVersion<StoredSecret>(
+            request.key,
+            sessionKey
+          );
+          sendResponse({ success: true, backupData });
+        } catch (error) {
+          sendResponse({ error: error instanceof Error ? error.message : '历史版本恢复失败' });
+        }
+      })();
+      return true;
+    }
+
     if (request.action === 'checkSetup') {
       (async () => {
         const setupComplete = await checkSetupComplete();
@@ -562,6 +599,10 @@ export default defineBackground(() => {
       void (async () => {
         await syncCloudPullAlarm();
         await synchronizeCloudState();
+        const sessionKey = await getValidSessionKey();
+        const enabled = (changes.cloudBackupSettings.newValue as { enabled?: boolean } | undefined)
+          ?.enabled;
+        if (sessionKey && enabled === true) await applyCloudBackupRetention(sessionKey);
       })().catch((error) => {
         console.error('OpenPass: 应用云端同步配置失败', error);
       });
@@ -707,6 +748,7 @@ export default defineBackground(() => {
           sessionKey,
           expectedLatestETag
         );
+        await applyCloudBackupRetention(sessionKey, uploaded.snapshotKey);
         await chrome.alarms.clear(CLOUD_BACKUP_RETRY_ALARM_NAME);
         await chrome.storage.local.set({
           cloudBackupLastLocalTimestamp: latest.timestamp,
@@ -840,7 +882,21 @@ export default defineBackground(() => {
       }
 
       if (!force && remote.etag && remote.etag === state.cloudBackupLastPulledETag) {
-        return syncLatestLocalSnapshot(false, remote.etag);
+        const result = await syncLatestLocalSnapshot(false, remote.etag);
+        const current = await chrome.storage.local.get<{
+          cloudBackupStatus?: Record<string, unknown>;
+        }>(['cloudBackupStatus']);
+        await chrome.storage.local.set({
+          cloudBackupStatus: {
+            ...(current.cloudBackupStatus || {}),
+            state: 'success',
+            message: current.cloudBackupStatus?.lastRetentionError
+              ? current.cloudBackupStatus.message
+              : '本地与云端已同步',
+            lastPullAt: new Date().toISOString()
+          }
+        });
+        return result;
       }
 
       const encryptionSettings = await getBackupEncryptionSettings();

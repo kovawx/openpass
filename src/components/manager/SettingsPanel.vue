@@ -1,12 +1,13 @@
 ﻿<script setup lang="ts">
 import { ref, computed, onMounted } from 'vue';
-import { useSecretStore } from '@/stores/secrets';
+import { useSecretStore, type Secret } from '@/stores/secrets';
 import { useAuthStore } from '@/stores/auth';
 import { useAutoBackup, type DirectoryInfo } from '@/composables/useAutoBackup';
 import { getErrorMessage } from '@/utils/error';
 import { showToast } from '@/utils/ui';
 import CryptoUtils from '@/utils/crypto';
 import {
+  type BackupData,
   getBackupEncryptionSettings,
   resolveStoredBackupPassword
 } from '@/utils/backup';
@@ -68,6 +69,15 @@ const savingCloud = ref(false);
 const testingCloud = ref(false);
 const syncingCloud = ref(false);
 const restoringCloud = ref(false);
+const loadingCloudVersions = ref(false);
+const cloudVersionsLoaded = ref(false);
+const restoringCloudVersionKey = ref<string | null>(null);
+const cloudVersions = ref<Array<{
+  key: string;
+  lastModified: string | null;
+  size: number;
+  etag: string | null;
+}>>([]);
 
 onMounted(async () => {
   await loadAllSettings();
@@ -451,12 +461,34 @@ async function syncCloudNow() {
     const result = await chrome.runtime.sendMessage({ action: 'syncLatestCloudBackup' });
     if (result?.error) throw new Error(result.error);
     await refreshCloudStatus();
+    await loadCloudVersions();
     showToast('多设备双向同步完成', 'success');
   } catch (error) {
     await refreshCloudStatus();
     showToast(getErrorMessage(error, '云端同步失败'), 'error');
   } finally {
     syncingCloud.value = false;
+  }
+}
+
+async function importCloudBackupData(backupData: BackupData<Secret>) {
+  let password: string | undefined;
+  if (backupData.encrypted) {
+    const encryptionSettings = await getBackupEncryptionSettings();
+    password = await resolveStoredBackupPassword(authStore.sessionKey, encryptionSettings);
+    if (!password) throw new Error('当前备份密码不可用，请先检查备份加密设置');
+  }
+
+  const file = new File([JSON.stringify(backupData)], 'openpass-cloud-restore.json', {
+    type: 'application/json'
+  });
+  try {
+    return await secretStore.importSecrets(file, password);
+  } catch (error) {
+    if (!backupData.encrypted) throw error;
+    const manualPassword = prompt('当前备份密码无法解密，请输入创建这份备份时使用的密码');
+    if (!manualPassword) throw error;
+    return secretStore.importSecrets(file, manualPassword);
   }
 }
 
@@ -469,31 +501,57 @@ async function restoreCloudLatest() {
       throw new Error(result?.error || '云端未返回有效备份');
     }
 
-    let password: string | undefined;
-    if (result.backupData.encrypted) {
-      const encryptionSettings = await getBackupEncryptionSettings();
-      password = await resolveStoredBackupPassword(authStore.sessionKey, encryptionSettings);
-      if (!password) throw new Error('当前备份密码不可用，请先检查备份加密设置');
-    }
-
-    const file = new File([JSON.stringify(result.backupData)], 'openpass-cloud-restore.json', {
-      type: 'application/json'
-    });
-    let count: number;
-    try {
-      count = await secretStore.importSecrets(file, password);
-    } catch (error) {
-      if (!result.backupData.encrypted) throw error;
-      const manualPassword = prompt('当前备份密码无法解密，请输入创建这份备份时使用的密码');
-      if (!manualPassword) throw error;
-      count = await secretStore.importSecrets(file, manualPassword);
-    }
+    const count = await importCloudBackupData(result.backupData);
     showToast(count > 0 ? `已从云端导入 ${count} 个密钥` : '云端备份没有新的密钥', 'success');
   } catch (error) {
     showToast(getErrorMessage(error, '云端恢复失败'), 'error');
   } finally {
     restoringCloud.value = false;
   }
+}
+
+async function loadCloudVersions() {
+  loadingCloudVersions.value = true;
+  try {
+    const result = await chrome.runtime.sendMessage({ action: 'listCloudBackupVersions' });
+    if (result?.error) throw new Error(result.error);
+    cloudVersions.value = Array.isArray(result?.versions) ? result.versions : [];
+    cloudVersionsLoaded.value = true;
+  } catch (error) {
+    showToast(getErrorMessage(error, '读取云端历史版本失败'), 'error');
+  } finally {
+    loadingCloudVersions.value = false;
+  }
+}
+
+async function restoreCloudVersion(version: (typeof cloudVersions.value)[number]) {
+  const displayTime = version.lastModified
+    ? new Date(version.lastModified).toLocaleString('zh-CN')
+    : version.key.split('/').pop();
+  if (!confirm(`从 ${displayTime} 的云端历史版本导入密钥？现有密钥不会被删除。`)) return;
+
+  restoringCloudVersionKey.value = version.key;
+  try {
+    const result = await chrome.runtime.sendMessage({
+      action: 'restoreCloudBackupVersion',
+      key: version.key
+    });
+    if (result?.error || !result?.backupData) {
+      throw new Error(result?.error || '云端未返回有效历史版本');
+    }
+    const count = await importCloudBackupData(result.backupData);
+    showToast(count > 0 ? `已从历史版本导入 ${count} 个密钥` : '该版本没有新的密钥', 'success');
+  } catch (error) {
+    showToast(getErrorMessage(error, '历史版本恢复失败'), 'error');
+  } finally {
+    restoringCloudVersionKey.value = null;
+  }
+}
+
+function formatCloudObjectSize(size: number) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function openPasswordModal() {
@@ -880,6 +938,14 @@ async function resetAllData() {
             <input v-model="cloudSettings.prefix" type="text" class="form-input" placeholder="openpass">
           </div>
           <div class="form-group">
+            <label>最多保留版本</label>
+            <input v-model.number="cloudSettings.retentionMaxVersions" type="number" min="1" max="200" class="form-input">
+          </div>
+          <div class="form-group">
+            <label>最长保留天数</label>
+            <input v-model.number="cloudSettings.retentionDays" type="number" min="1" max="3650" class="form-input">
+          </div>
+          <div class="form-group">
             <label>Access Key ID</label>
             <input v-model="cloudAccessKeyId" type="text" class="form-input" autocomplete="off">
           </div>
@@ -915,6 +981,12 @@ async function resetAllData() {
           <span v-if="cloudStatus.lastPullAt">
             上次拉取：{{ new Date(cloudStatus.lastPullAt).toLocaleString('zh-CN') }}
           </span>
+          <span v-if="cloudStatus.lastRetentionAt">
+            上次清理：{{ new Date(cloudStatus.lastRetentionAt).toLocaleString('zh-CN') }}
+          </span>
+          <span v-if="cloudStatus.lastRetentionError" class="cloud-warning">
+            历史清理失败：{{ cloudStatus.lastRetentionError }}
+          </span>
         </div>
 
         <div class="button-group cloud-actions">
@@ -928,11 +1000,41 @@ async function resetAllData() {
             {{ syncingCloud ? '同步中...' : '立即双向同步' }}
           </button>
           <button class="btn-secondary" :disabled="restoringCloud" @click="restoreCloudLatest">
-            {{ restoringCloud ? '恢复中...' : '从云端恢复' }}
+            {{ restoringCloud ? '恢复中...' : '恢复最新版本' }}
           </button>
           <button v-if="cloudSettings.enabled" class="btn-secondary" @click="disableCloudBackup">
             停用
           </button>
+        </div>
+
+        <div class="cloud-history">
+          <div class="cloud-history-header">
+            <div>
+              <strong>云端历史版本</strong>
+              <p>每次同步生成不可变密文版本，超出数量或天数限制后自动清理。</p>
+            </div>
+            <button class="btn-secondary" :disabled="loadingCloudVersions" @click="loadCloudVersions">
+              {{ loadingCloudVersions ? '读取中...' : '刷新版本' }}
+            </button>
+          </div>
+          <p v-if="!loadingCloudVersions && cloudVersions.length === 0" class="cloud-history-empty">
+            {{ cloudVersionsLoaded ? '云端暂无历史版本' : '尚未读取历史版本' }}
+          </p>
+          <div v-for="version in cloudVersions" :key="version.key" class="cloud-history-item">
+            <div>
+              <strong>
+                {{ version.lastModified ? new Date(version.lastModified).toLocaleString('zh-CN') : '时间未知' }}
+              </strong>
+              <span>{{ formatCloudObjectSize(version.size) }} · {{ version.key.split('/').pop() }}</span>
+            </div>
+            <button
+              class="btn-secondary"
+              :disabled="restoringCloudVersionKey !== null"
+              @click="restoreCloudVersion(version)"
+            >
+              {{ restoringCloudVersionKey === version.key ? '恢复中...' : '恢复此版本' }}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -1315,6 +1417,10 @@ async function resetAllData() {
   color: #0f172a;
 }
 
+.cloud-warning {
+  color: #b45309;
+}
+
 .cloud-actions {
   flex-wrap: wrap;
   margin-top: 16px;
@@ -1322,6 +1428,50 @@ async function resetAllData() {
 
 .cloud-actions button {
   min-width: 132px;
+}
+
+.cloud-history {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.cloud-history-header,
+.cloud-history-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.cloud-history-header p,
+.cloud-history-empty {
+  margin: 4px 0 0;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.cloud-history-item {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.cloud-history-item > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cloud-history-item span {
+  overflow: hidden;
+  color: #64748b;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .btn-secondary {

@@ -46,7 +46,7 @@ OSS/S3 仅作为不可信对象存储。不得直接上传 `BackupData`：未加
 每次成功的本地备份对应一个不可变云端对象：
 
 ```text
-<prefix>/v1/<random-vault-id>/objects/<random-snapshot-id>.opb
+<prefix>/v1/objects/<random-snapshot-id>.opb
 ```
 
 对象 key 只使用随机 ID，避免泄露时间和设备信息。禁止用时间戳作为唯一排序依据。
@@ -54,7 +54,7 @@ OSS/S3 仅作为不可信对象存储。不得直接上传 `BackupData`：未加
 另有一个固定 key：
 
 ```text
-<prefix>/v1/<random-vault-id>/latest.opb
+<prefix>/v1/latest.opb
 ```
 
 `latest.opb` 保存同一份加密备份，供新设备无需 `ListBucket` 即可恢复。不可变对象用于历史恢复，`latest.opb` 用于快捷恢复。
@@ -79,18 +79,20 @@ S3 官方规定 `If-Match` 会在 ETag 不匹配时拒绝写入，因此可用�
 - 本地磁盘和浏览器数据同时损坏。
 - 错误密码、扩展缺陷或损坏对象导致最新备份不可恢复。
 
-先上传不可变对象，再更新 latest，可以保证 latest 冲突或错误备份不会删除先前版本。建议同时开启 Bucket Versioning，并在云端保留最近 10 至 30 个对象；清理历史必须作为独立任务执行，不能发生在正常上传请求中。
+先上传不可变对象，再更新 latest，可以保证 latest 冲突或错误备份不会删除先前版本。客户端默认最多保留 30 个、最长保留 90 天；用户可以在 1～200 个、1～3650 天范围内调整。任一条件超限即可清理，但至少保护最新历史对象和本次上传对象。也建议开启 Bucket Versioning 作为对象存储侧的第二层保护。
 
 ## 6. 凭据与权限
 
 优先使用短期 STS 凭据。若允许用户直接填写 Access Key，Secret Access Key 必须由主密码加密后保存在 `chrome.storage.local`，只在解锁会话中使用，禁止进入日志、错误报告和备份对象。
 
-最小权限限定为随机 Vault 前缀：
+权限必须限定为用户配置的对象前缀：
 
 - `s3:GetObject`
 - `s3:PutObject`
+- `s3:ListBucket`，并限制到 `<prefix>/v1/objects/`
+- `s3:DeleteObject`，并限制到 `<prefix>/v1/objects/*`
 
-读取 latest 不需要 `ListBucket`。历史列表可以在后续版本通过加密索引实现；首版不授予 `DeleteObject`，防止客户端缺陷批量删除云端备份。
+日常读取 `latest.opb` 不依赖列表权限；历史版本界面和有限保留需要列表权限，自动清理需要删除权限。客户端只接受当前前缀下由随机 ID 组成的 `.opb` 历史 key，不允许界面传入任意对象 key。缺少列表或删除权限时同步结果仍然保留，但设置页会明确显示历史清理失败，避免重试不断生成额外版本。
 
 ## 7. 故障处理
 
@@ -100,12 +102,13 @@ S3 官方规定 `If-Match` 会在 ETag 不匹配时拒绝写入，因此可用�
 - 412：并发更新，禁止覆盖，保留两份备份。
 - 解密/GCM 认证失败：停止恢复，不返回部分数据，不上传本地对象覆盖远端。
 - 云端上传完成后才记录 remote snapshot ID 和 ETag。
+- 历史清理失败：不回滚已经成功的 latest 更新，不把清理失败当作上传失败重试。
 
 ## 8. 客户端实现
 
 OpenPass 使用 AWS SDK for JavaScript v3 的 S3 客户端执行 Signature V4 请求，并支持自定义 Endpoint、Region 和 Path-style 地址。
 
-设置页保存以下非敏感字段：Endpoint、Bucket、Region、对象前缀和 Path-style 开关。Access Key ID、Secret Access Key、可选 Session Token 与云端加密密码组成一个整体，使用当前主密码加密后写入 `chrome.storage.local`。修改主密码时必须同步重加密这组凭据。
+设置页保存以下非敏感字段：Endpoint、Bucket、Region、对象前缀、Path-style 开关、最多保留版本数和最长保留天数。Access Key ID、Secret Access Key、可选 Session Token 与云端加密密码组成一个整体，使用当前主密码加密后写入 `chrome.storage.local`。修改主密码时必须同步重加密这组凭据。
 
 启用云端备份时会动态请求对应 Endpoint 的扩展访问权限。远程 HTTP Endpoint 会被拒绝；仅 `localhost` 与 `127.0.0.1` 允许 HTTP，方便本地 MinIO 测试。
 
@@ -116,7 +119,9 @@ OpenPass 使用 AWS SDK for JavaScript v3 的 S3 客户端执行 Signature V4 �
 - 网络或服务错误：按 5、15、60、180 分钟退避重试。
 - 412 并发冲突：保留不可变对象并停止自动覆盖，等待用户处理。
 
-设置页提供连接检查、立即双向同步和从 `latest.opb` 手动恢复。手动恢复沿用现有导入语义；日常多设备同步则按记录 ID、更新时间和删除墓碑自动合并。
+设置页提供连接检查、立即双向同步、恢复 `latest.opb`，以及历史版本列表和指定版本恢复。历史列表只展示 S3 返回的更新时间、密文大小和随机对象 ID；选择版本后才下载并在内存中解密。手动恢复沿用现有导入语义；日常多设备同步则按记录 ID、更新时间和删除墓碑自动合并。
+
+每次 latest 更新成功后执行有限保留：列出 `objects/` 下的历史密文，按 `LastModified` 从新到旧排序，然后删除超出版本数量或保留天数的对象。清理分批执行，每批最多 1000 个 key；`latest.opb` 从不参与清理。
 
 ## 9. 多设备合并
 

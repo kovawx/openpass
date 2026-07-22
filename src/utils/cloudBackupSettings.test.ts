@@ -33,7 +33,9 @@ describe('cloud backup settings', () => {
         bucket: 'backups',
         region: 'us-east-1',
         prefix: '/team/openpass/',
-        forcePathStyle: true
+        forcePathStyle: true,
+        retentionMaxVersions: 30,
+        retentionDays: 90
       },
       {
         accessKeyId: 'ACCESS_KEY',
