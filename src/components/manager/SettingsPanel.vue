@@ -19,6 +19,7 @@ import {
   loadCloudBackupSettings,
   loadCloudBackupStatus,
   saveCloudBackupConfiguration,
+  validateCloudBackupInput,
   type CloudBackupSettings,
   type CloudBackupStatus
 } from '@/utils/cloudBackupSettings';
@@ -65,7 +66,9 @@ const cloudSecretAccessKey = ref('');
 const cloudSessionToken = ref('');
 const cloudPassword = ref('');
 const cloudPasswordConfirm = ref('');
+const hasStoredCloudCredentials = ref(false);
 const savingCloud = ref(false);
+const togglingCloud = ref(false);
 const testingCloud = ref(false);
 const syncingCloud = ref(false);
 const restoringCloud = ref(false);
@@ -103,6 +106,10 @@ async function loadAllSettings() {
   useMasterPasswordForBackup.value = encryptionResult.useMasterPasswordForBackup;
   cloudSettings.value = await loadCloudBackupSettings();
   cloudStatus.value = await loadCloudBackupStatus();
+  const cloudCredentials = await chrome.storage.local.get<{ encryptedCloudBackupSecrets?: string }>([
+    'encryptedCloudBackupSecrets'
+  ]);
+  hasStoredCloudCredentials.value = typeof cloudCredentials.encryptedCloudBackupSecrets === 'string';
 
   isInitialized.value = true;
 }
@@ -394,7 +401,14 @@ async function saveCloudSettings() {
     showToast('请先解锁 OpenPass', 'error');
     return;
   }
-  if (cloudPassword.value !== cloudPasswordConfirm.value) {
+  const credentialsTouched = Boolean(
+    cloudAccessKeyId.value.trim() ||
+    cloudSecretAccessKey.value ||
+    cloudSessionToken.value.trim() ||
+    cloudPassword.value ||
+    cloudPasswordConfirm.value
+  );
+  if (credentialsTouched && cloudPassword.value !== cloudPasswordConfirm.value) {
     showToast('两次输入的云端加密密码不一致', 'error');
     return;
   }
@@ -405,26 +419,36 @@ async function saveCloudSettings() {
     const granted = await chrome.permissions.request({ origins: [origin] });
     if (!granted) throw new Error('未获得 S3 Endpoint 访问权限');
 
-    cloudSettings.value = await saveCloudBackupConfiguration(
-      cloudSettings.value,
-      {
-        accessKeyId: cloudAccessKeyId.value.trim(),
-        secretAccessKey: cloudSecretAccessKey.value,
-        sessionToken: cloudSessionToken.value.trim() || undefined,
-        cloudPassword: cloudPassword.value
-      },
-      authStore.sessionKey
-    );
+    if (credentialsTouched || !hasStoredCloudCredentials.value) {
+      cloudSettings.value = await saveCloudBackupConfiguration(
+        cloudSettings.value,
+        {
+          accessKeyId: cloudAccessKeyId.value.trim(),
+          secretAccessKey: cloudSecretAccessKey.value,
+          sessionToken: cloudSessionToken.value.trim() || undefined,
+          cloudPassword: cloudPassword.value
+        },
+        authStore.sessionKey
+      );
+      hasStoredCloudCredentials.value = true;
+    } else {
+      cloudSettings.value = validateCloudBackupInput(cloudSettings.value);
+      await chrome.storage.local.set({
+        cloudBackupSettings: cloudSettings.value,
+        cloudBackupStatus: { ...cloudStatus.value, state: 'idle', message: null }
+      });
+    }
     if (cloudSettings.value.enabled && !enableLocalSnapshot.value) {
       enableLocalSnapshot.value = true;
       await autoBackup.saveSettings({ enableLocalSnapshot: true });
     }
+    cloudAccessKeyId.value = '';
     cloudSecretAccessKey.value = '';
     cloudSessionToken.value = '';
     cloudPassword.value = '';
     cloudPasswordConfirm.value = '';
     await refreshCloudStatus();
-    showToast('云端备份配置已加密保存', 'success');
+    showToast('云端同步已启用，配置已加密保存', 'success');
   } catch (error) {
     showToast(getErrorMessage(error, '保存云端备份配置失败'), 'error');
   } finally {
@@ -433,13 +457,49 @@ async function saveCloudSettings() {
 }
 
 async function disableCloudBackup() {
-  cloudSettings.value.enabled = false;
-  await chrome.storage.local.set({
-    cloudBackupSettings: cloudSettings.value,
-    cloudBackupStatus: { ...cloudStatus.value, state: 'disabled', message: null }
-  });
-  await refreshCloudStatus();
-  showToast('云端备份已停用，远端对象未删除', 'success');
+  togglingCloud.value = true;
+  try {
+    cloudSettings.value.enabled = false;
+    await chrome.storage.local.set({
+      cloudBackupSettings: cloudSettings.value,
+      cloudBackupStatus: { ...cloudStatus.value, state: 'disabled', message: null }
+    });
+    cloudVersions.value = [];
+    cloudVersionsLoaded.value = false;
+    await refreshCloudStatus();
+    showToast('云端同步已停用，本地数据和远端密文均已保留', 'success');
+  } catch (error) {
+    cloudSettings.value.enabled = true;
+    showToast(getErrorMessage(error, '停用云端同步失败'), 'error');
+  } finally {
+    togglingCloud.value = false;
+  }
+}
+
+async function handleCloudSyncToggle() {
+  if (!cloudSettings.value.enabled) {
+    await disableCloudBackup();
+    return;
+  }
+  if (!hasStoredCloudCredentials.value) return;
+
+  togglingCloud.value = true;
+  try {
+    const origin = getCloudEndpointOriginPattern(cloudSettings.value.endpoint);
+    const granted = await chrome.permissions.request({ origins: [origin] });
+    if (!granted) throw new Error('未获得 S3 Endpoint 访问权限');
+    await chrome.storage.local.set({
+      cloudBackupSettings: cloudSettings.value,
+      cloudBackupStatus: { ...cloudStatus.value, state: 'idle', message: null }
+    });
+    await refreshCloudStatus();
+    showToast('云端同步已重新启用', 'success');
+  } catch (error) {
+    cloudSettings.value.enabled = false;
+    showToast(getErrorMessage(error, '启用云端同步失败'), 'error');
+  } finally {
+    togglingCloud.value = false;
+  }
 }
 
 async function testCloudConnection() {
@@ -906,21 +966,32 @@ async function resetAllData() {
       <div class="settings-section">
         <h3>S3 / OSS 多设备同步</h3>
         <p class="settings-desc">
-          自动拉取、合并并上传最新快照。凭据由主密码加密保存，云端始终只有密文。
+          可选能力。关闭时所有数据只保存在本地；开启后自动拉取、合并并上传密文快照。
         </p>
 
         <div class="settings-item">
           <div class="settings-item-info">
-            <span class="settings-item-label">启用云端备份</span>
-            <span class="settings-item-desc">停用不会删除任何远端对象</span>
+            <span class="settings-item-label">启用云端同步</span>
+            <span class="settings-item-desc">
+              {{ !cloudSettings.enabled
+                ? '当前仅使用本地存储与本地备份'
+                : cloudStatus.state === 'disabled'
+                  ? '填写并保存配置后生效'
+                  : '已启用自动双向同步与密文历史版本' }}
+            </span>
           </div>
           <label class="toggle">
-            <input v-model="cloudSettings.enabled" type="checkbox">
+            <input
+              v-model="cloudSettings.enabled"
+              type="checkbox"
+              :disabled="togglingCloud"
+              @change="handleCloudSyncToggle"
+            >
             <span class="toggle-slider"></span>
           </label>
         </div>
 
-        <div class="cloud-grid">
+        <div v-if="cloudSettings.enabled" class="cloud-grid">
           <div class="form-group cloud-wide">
             <label>S3 Endpoint</label>
             <input v-model="cloudSettings.endpoint" type="url" class="form-input" placeholder="https://s3.example.com">
@@ -945,9 +1016,18 @@ async function resetAllData() {
             <label>最长保留天数</label>
             <input v-model.number="cloudSettings.retentionDays" type="number" min="1" max="3650" class="form-input">
           </div>
+          <p v-if="hasStoredCloudCredentials" class="cloud-wide cloud-credential-hint">
+            凭据已加密保存。以下凭据字段全部留空时沿用现有配置；填写任一项时需要完整重填。
+          </p>
           <div class="form-group">
             <label>Access Key ID</label>
-            <input v-model="cloudAccessKeyId" type="text" class="form-input" autocomplete="off">
+            <input
+              v-model="cloudAccessKeyId"
+              type="text"
+              class="form-input"
+              autocomplete="off"
+              :placeholder="hasStoredCloudCredentials ? '留空沿用已保存凭据' : ''"
+            >
           </div>
           <div class="form-group">
             <label>Secret Access Key</label>
@@ -967,12 +1047,12 @@ async function resetAllData() {
           </div>
         </div>
 
-        <label class="cloud-checkbox">
+        <label v-if="cloudSettings.enabled" class="cloud-checkbox">
           <input v-model="cloudSettings.forcePathStyle" type="checkbox">
           使用 Path-style 地址（MinIO 与多数兼容 OSS 推荐）
         </label>
 
-        <div class="cloud-status">
+        <div v-if="cloudSettings.enabled && cloudStatus.state !== 'disabled'" class="cloud-status">
           <strong>{{ formattedCloudStatus }}</strong>
           <span v-if="cloudStatus.message">{{ cloudStatus.message }}</span>
           <span v-if="cloudStatus.lastSuccessAt">
@@ -989,25 +1069,40 @@ async function resetAllData() {
           </span>
         </div>
 
-        <div class="button-group cloud-actions">
+        <div v-if="cloudSettings.enabled" class="button-group cloud-actions">
           <button class="btn-primary" :disabled="savingCloud" @click="saveCloudSettings">
-            {{ savingCloud ? '保存中...' : '加密保存配置' }}
+            {{ savingCloud ? '保存中...' : hasStoredCloudCredentials ? '保存设置' : '加密保存并启用' }}
           </button>
-          <button class="btn-secondary" :disabled="testingCloud" @click="testCloudConnection">
+          <button
+            v-if="cloudStatus.state !== 'disabled'"
+            class="btn-secondary"
+            :disabled="testingCloud"
+            @click="testCloudConnection"
+          >
             {{ testingCloud ? '测试中...' : '测试连接' }}
           </button>
-          <button class="btn-secondary" :disabled="syncingCloud" @click="syncCloudNow">
+          <button
+            v-if="cloudStatus.state !== 'disabled'"
+            class="btn-secondary"
+            :disabled="syncingCloud"
+            @click="syncCloudNow"
+          >
             {{ syncingCloud ? '同步中...' : '立即双向同步' }}
           </button>
-          <button class="btn-secondary" :disabled="restoringCloud" @click="restoreCloudLatest">
+          <button
+            v-if="cloudStatus.state !== 'disabled'"
+            class="btn-secondary"
+            :disabled="restoringCloud"
+            @click="restoreCloudLatest"
+          >
             {{ restoringCloud ? '恢复中...' : '恢复最新版本' }}
-          </button>
-          <button v-if="cloudSettings.enabled" class="btn-secondary" @click="disableCloudBackup">
-            停用
           </button>
         </div>
 
-        <div class="cloud-history">
+        <div
+          v-if="cloudSettings.enabled && cloudStatus.state !== 'disabled'"
+          class="cloud-history"
+        >
           <div class="cloud-history-header">
             <div>
               <strong>云端历史版本</strong>
@@ -1390,6 +1485,12 @@ async function resetAllData() {
 
 .cloud-wide {
   grid-column: 1 / -1;
+}
+
+.cloud-credential-hint {
+  margin: 0;
+  color: #64748b;
+  font-size: 12px;
 }
 
 .cloud-checkbox {

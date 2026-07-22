@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  DEFAULT_CLOUD_BACKUP_SETTINGS,
   getCloudEndpointOriginPattern,
   loadCloudBackupSecrets,
   normalizeCloudPrefix,
@@ -25,6 +26,10 @@ beforeEach(() => {
 });
 
 describe('cloud backup settings', () => {
+  it('keeps cloud synchronization opt-in by default', () => {
+    expect(DEFAULT_CLOUD_BACKUP_SETTINGS.enabled).toBe(false);
+  });
+
   it('encrypts credentials before persisting them', async () => {
     await saveCloudBackupConfiguration(
       {
