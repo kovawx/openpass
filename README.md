@@ -2,12 +2,14 @@
 
 > 开源、本地、安全的两步验证管理器
 
+当前版本：v0.3.0
+
 [![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=google-chrome&logoColor=white)](https://chromewebstore.google.com/detail/ejokhmkfamhdcopmfockefjfgdiginpp?utm_source=item-share-cb)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## 简介
 
-OpenPass 是一款 Chrome 浏览器扩展，支持 TOTP/HOTP 验证码管理。默认使用本地加密存储；可由用户主动启用自己的 S3/OSS 密文备份与多设备同步。下述能力描述对应当前开发分支。
+OpenPass 是一款 Chrome 浏览器扩展，支持 TOTP/HOTP 验证码管理。默认使用本地加密存储；可由用户主动启用自己的 S3/OSS 密文备份与多设备同步。
 
 **核心特性：**
 
