@@ -81,7 +81,7 @@ async function handleSubmit() {
       password.value = '';
       const urlParams = new URLSearchParams(window.location.search);
       const redirect = urlParams.get('redirect') || 'options.html';
-      window.location.href = redirect;
+      window.location.href = chrome.runtime.getURL(redirect === 'popup.html' ? 'popup.html' : 'options.html');
     } else {
       if (isLocked.value) {
         error.value = '尝试次数过多，请稍后再试';

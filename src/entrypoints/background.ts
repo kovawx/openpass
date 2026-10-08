@@ -1,9 +1,15 @@
-﻿import jsQR from 'jsqr';
-import { TOTP } from 'otpauth';
+import jsQR from 'jsqr';
+import CryptoUtils from '@/utils/crypto';
+import { getBackupSchedule } from '@/utils/backupSchedule';
+import { decodeRestoreBackup, planRestore, type RestoreMode } from '@/utils/restore';
+import { generateOtp, normalizeOtpSettings } from '@/utils/otp';
+import { readVault, writeVault, normalizeVaultSecrets, mergeHotpCounters, applyHotpCounters,
+  prepareDeviceOtpState, readDeviceOtpVault, writeDeviceOtpCounters, assertDeviceOtpAccess, toOtpAccount, migrateLegacyVault, type VaultSecret } from '@/utils/vault';
+import { getValidSessionKey, requireSessionKey, assertSessionKey, SESSION_ALARM } from '@/utils/session';
 import {
   type BackupData,
   createBackupData,
-  decryptBackupData,
+  validateBackupData,
   getBackupEncryptionSettings,
   resolveStoredBackupPassword,
   saveBackupSnapshot
@@ -15,16 +21,19 @@ import {
   getCustomBackupLocationLabel,
   type BackupDirectoryWriteResult
 } from '@/utils/backupDestination';
-import { installGlobalRuntimeErrorListeners } from '@/utils/runtimeErrors';
+import { installGlobalRuntimeErrorListeners, type ErrorEventTarget } from '@/utils/runtimeErrors';
 import {
   getBackupSyncMetadata,
   loadSecretTombstones,
+  getOrCreateSyncDeviceId,
+  getSecretTimestamp,
   mergeSyncState,
   type SyncSecretLike
 } from '@/utils/syncMerge';
 import {
   applyCloudBackupRetention,
   downloadCloudBackupVersion,
+  deleteCloudBackupVersions,
   downloadLatestBackupFromS3,
   downloadLatestBackupStateFromS3,
   isCloudBackupConflict,
@@ -32,7 +41,7 @@ import {
   testS3CloudBackupConnection,
   uploadBackupToS3
 } from '@/utils/s3CloudBackup';
-import { isSiteMatched, parseUrl } from '@/utils/domainMatch';
+import { isSiteMatched, parseUrl, matchSecrets } from '@/utils/domainMatch';
 import { parseOtpAuth } from '@/utils/otpAuth';
 import {
   createScanRegions,
@@ -43,20 +52,8 @@ import {
 
 type BackupFrequency = 'every5min' | 'daily' | 'weekly' | 'monthly';
 
-interface StoredSecret {
-  id?: string;
-  secret: string;
-  site: string;
-  name?: string;
-  digits?: number;
-  period?: number;
-  algorithm?: string;
-  createdAt?: string;
-  updatedAt?: string;
-  importedAt?: string;
-}
-
-type PendingSecret = StoredSecret;
+type StoredSecret = VaultSecret;
+type PendingSecret = Omit<VaultSecret, 'id'>;
 
 interface QrCandidate {
   secret: PendingSecret;
@@ -83,33 +80,58 @@ const BACKUP_INTERVALS: Record<BackupFrequency, number> = {
 };
 
 export default defineBackground(() => {
-  installGlobalRuntimeErrorListeners('background', self as unknown as {
-    addEventListener: (
-      type: 'error' | 'unhandledrejection',
-      listener: (event: any) => void
-    ) => void;
-  });
+  installGlobalRuntimeErrorListeners('background', self as unknown as ErrorEventTarget);
 
-  // SessionKey 内存缓存，供自动备份解密使用
-  let cachedSessionKey: string | null = null;
+  // 所有密钥写入及云端合并串行处理，逐次验证会话。
+  let vaultOperation: Promise<unknown> = Promise.resolve();
+  function withVaultLock<T>(operation: () => Promise<T>): Promise<T> {
+    const result = vaultOperation.then(operation);
+    vaultOperation = result.catch(() => {});
+    return result;
+  }
+  const isTrustedPage = (sender: chrome.runtime.MessageSender) =>
+    sender.id === chrome.runtime.id && !!sender.url?.startsWith(chrome.runtime.getURL(''));
+
   let cloudBackupInFlight: Promise<unknown> | null = null;
   let cloudPullInFlight: Promise<unknown> | null = null;
+  let backupScheduleUpdate: Promise<void> = Promise.resolve();
 
-  // 启动时自动修复 secrets 结构
-  (async () => {
-    const result = await chrome.storage.local.get<{
-      secrets?: StoredSecret[];
-      encryptedSecrets?: string;
-    }>(['secrets', 'encryptedSecrets']);
-    if (!Array.isArray(result.secrets)) {
-      console.warn('[Background] secrets 格式异常，尝试修复');
-      // 如果存在 encryptedSecrets，等待用户解锁后修复
-      // 如果没有数据，则初始化为空数组
-      if (!result.encryptedSecrets) {
-        await chrome.storage.local.set({ secrets: [], sitesList: [] });
-      }
-    }
-  })();
+  void Promise.all([
+    chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }),
+    chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
+  ]).catch((error) => console.error('OpenPass: 限制存储访问失败', error));
+
+  // 升级时已有管理会话可直接初始化免密副本，不要求用户再输一次密码。
+  void withVaultLock(async () => {
+    const key = await getValidSessionKey();
+    if (!key) return;
+    const state = await chrome.storage.local.get(['encryptedSecrets', 'deviceOtpEnabled', 'deviceOtpRevision', 'encryptedDeviceOtpSecrets']);
+    if (state.deviceOtpEnabled === false || typeof state.encryptedSecrets !== 'string' ||
+        (state.deviceOtpRevision === state.encryptedSecrets && typeof state.encryptedDeviceOtpSecrets === 'string')) return;
+    const deviceOtpState = await prepareDeviceOtpState(await readVault(key), state.encryptedSecrets);
+    await assertSessionKey(key);
+    const current = await chrome.storage.local.get(['encryptedSecrets']);
+    if (current.encryptedSecrets !== state.encryptedSecrets) return;
+    await chrome.storage.local.set(deviceOtpState);
+    await notifyVaultChanged();
+  }).catch((error) => console.error('OpenPass: 初始化验证码免密失败', error));
+
+  async function notifyVaultChanged() {
+    const tabs = await chrome.tabs.query({});
+    await Promise.all(tabs.map(async (tab) => {
+      if (typeof tab.id !== 'number') return;
+      try { await chrome.tabs.sendMessage(tab.id, { action: 'vaultChanged' }); } catch { /* 未注入内容脚本 */ }
+    }));
+  }
+
+  async function syncSessionAlarm() {
+    await chrome.alarms.clear(SESSION_ALARM);
+    if (!await getValidSessionKey()) return;
+    const { sessionExpiresAt } = await chrome.storage.local.get<{ sessionExpiresAt: number }>(['sessionExpiresAt']);
+    await chrome.alarms.create(SESSION_ALARM, { when: sessionExpiresAt });
+  }
+  void syncSessionAlarm().catch(console.error);
+  void syncAutoBackupAlarm().catch(console.error);
 
   // 创建右键菜单
   chrome.runtime.onInstalled.addListener((details) => {
@@ -122,9 +144,6 @@ export default defineBackground(() => {
     // 创建自动备份定时器
     void syncAutoBackupAlarm().catch((error) => {
       console.error('OpenPass: 初始化自动备份定时器失败', error);
-    });
-    void syncCloudPullAlarm().catch((error) => {
-      console.error('OpenPass: 初始化云端同步定时器失败', error);
     });
 
     // 首次安装时自动打开管理页面
@@ -301,6 +320,7 @@ export default defineBackground(() => {
         throw new Error('未找到可扫描的浏览器窗口，请先切换到要扫描的普通网页后重试');
       }
 
+      await requireSessionKey();
       const candidates = await scanQrImage(await captureTab(tab), crop);
       if (candidates.length === 1) {
         await acceptQrSecret(candidates[0].secret, tab);
@@ -314,7 +334,7 @@ export default defineBackground(() => {
 
       await sendToTab(tab, {
         action: 'startQrSelection',
-        message: crop ? '选区内未识别到 TOTP 二维码，请重新框选' : '未自动识别到二维码，请框选二维码区域'
+        message: crop ? '选区内未识别到 OTP 二维码，请重新框选' : '未自动识别到二维码，请框选二维码区域'
       });
     } catch (error) {
       console.error('OpenPass: 页面二维码扫描失败', error);
@@ -332,20 +352,163 @@ export default defineBackground(() => {
       secret.site = pageUrl;
     }
 
-    await chrome.storage.local.set({ pendingSecret: secret });
+    await requireSessionKey();
+    await chrome.storage.session.set({ pendingSecret: secret });
   }
 
   function showNotification(title: string, message: string) {
-    chrome.notifications.create({
+    void chrome.notifications.create({
       type: 'basic',
       iconUrl: 'icons/icon128.png',
       title,
       message
-    });
+    }).catch((error) => console.warn('OpenPass: 通知失败', error));
   }
 
   // 消息监听
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    const contentActions = ['getSecrets', 'generateCode', 'consumeCode', 'startQrScan', 'scanQrSelection', 'selectQrCandidate', 'checkSetup'];
+    if (!isTrustedPage(sender) && !contentActions.includes(request.action)) {
+      sendResponse({ error: '该操作仅允许在 OpenPass 扩展页面执行' });
+      return;
+    }
+    if (request.action === 'migrateVaultForUnlock') {
+      void withVaultLock(async () => {
+        const state = await chrome.storage.local.get(['masterPasswordHash', 'masterPasswordSalt']);
+        if (typeof request.password !== 'string' || !await CryptoUtils.verifyMasterPassword(request.password,
+          String(state.masterPasswordHash), String(state.masterPasswordSalt))) throw new Error('主密码错误');
+        await migrateLegacyVault(request.password);
+        return { success: true };
+      }).then(sendResponse, (error) => sendResponse({ error: error.message }));
+      return true;
+    }
+    if (request.action === 'setDeviceOtpEnabled') {
+      void withVaultLock(async () => {
+        const key = await requireSessionKey();
+        if (typeof request.enabled !== 'boolean') throw new Error('免密设置格式无效');
+        const secrets = await readVault(key);
+        const { encryptedSecrets } = await chrome.storage.local.get<{ encryptedSecrets?: string }>(['encryptedSecrets']);
+        if (!encryptedSecrets) await writeVault(secrets, key, { deviceOtpEnabled: request.enabled });
+        else {
+          const state = await prepareDeviceOtpState(secrets, encryptedSecrets, request.enabled);
+          await assertSessionKey(key);
+          await chrome.storage.local.set(state);
+        }
+        await notifyVaultChanged();
+        return { success: true };
+      }).then(sendResponse, (error) => sendResponse({ error: error.message }));
+      return true;
+    }
+    if (request.action === 'changeMasterPassword') {
+      void withVaultLock(async () => {
+        const key = await requireSessionKey();
+        const state = await chrome.storage.local.get(['masterPasswordHash', 'masterPasswordSalt',
+          'encryptedSecrets', 'encryptedBackupPassword', 'encryptedCloudBackupSecrets', 'encryptedPendingSecret', 'backupSnapshots']);
+        if (typeof request.currentPassword !== 'string' || typeof request.password !== 'string' || request.password.length < 6 ||
+          !await CryptoUtils.verifyMasterPassword(request.currentPassword, String(state.masterPasswordHash), String(state.masterPasswordSalt))) {
+          throw new Error('当前密码错误或新密码格式无效');
+        }
+        const password = request.password as string;
+        const updates: Record<string, unknown> = {};
+        for (const field of ['encryptedSecrets', 'encryptedBackupPassword', 'encryptedCloudBackupSecrets', 'encryptedPendingSecret']) {
+          if (typeof state[field] === 'string') updates[field] = await CryptoUtils.encrypt(await CryptoUtils.decrypt(state[field] as string, key), password);
+        }
+        if (Array.isArray(state.backupSnapshots)) {
+          updates.backupSnapshots = await Promise.all(state.backupSnapshots.map(async (snapshot) => {
+            if (!snapshot.data?.encryptedData) return snapshot;
+            try {
+              const data = await CryptoUtils.decrypt(snapshot.data.encryptedData, key);
+              return { ...snapshot, data: { ...snapshot.data, encryptedData: await CryptoUtils.encrypt(data, password) } };
+            } catch { return snapshot; } // 独立密码或历史密码快照保持原样，可手动输入旧密码恢复。
+          }));
+        }
+        const verifier = await CryptoUtils.createMasterPasswordHash(password);
+        if (typeof updates.encryptedSecrets === 'string') {
+          Object.assign(updates, await prepareDeviceOtpState(await readVault(key), updates.encryptedSecrets));
+        }
+        await assertSessionKey(key);
+        await chrome.storage.local.set({ ...updates, masterPasswordHash: verifier.hash, masterPasswordSalt: verifier.salt });
+        await chrome.storage.session.set({ sessionKey: password });
+        conflictReview = null;
+        return { success: true };
+      }).then(sendResponse, (error) => sendResponse({ error: error.message }));
+      return true;
+    }
+    if (request.action === 'prepareVaultClear' || request.action === 'clearVault' || request.action === 'prepareCloudVersionDelete' || request.action === 'deleteCloudBackupVersion' || request.action === 'resetLocalData') {
+      void withVaultLock(async () => {
+        if (request.action === 'prepareVaultClear') return prepareVaultClear(request.scope);
+        if (request.action === 'clearVault') return clearVault(request.token, request.confirmation);
+        const key = await requireSessionKey();
+        if (request.action === 'resetLocalData') {
+          if (request.confirmation !== 'RESET') throw new Error('请明确确认重置本机数据');
+          await chrome.storage.local.set({ cloudBackupSettings: { enabled: false } });
+          await chrome.alarms.clear(CLOUD_BACKUP_RETRY_ALARM_NAME);
+          await chrome.storage.session.clear(); await chrome.storage.local.clear();
+          clearReview = null; cloudDeleteReview = null; conflictReview = null;
+          return { success: true };
+        }
+        const context = await chrome.storage.local.get(['cloudBackupSettings', 'encryptedCloudBackupSecrets']);
+        const config = JSON.stringify([context.cloudBackupSettings, context.encryptedCloudBackupSecrets]);
+        if (request.action === 'prepareCloudVersionDelete') {
+          if (typeof request.key !== 'string') throw new Error('无效的云端版本');
+          const version = (await listCloudBackupVersions(key)).find(entry => entry.key === request.key);
+          if (!version || version.current) throw new Error('版本不存在或为受保护的当前同步版本');
+          await assertCloudContext(key, config);
+          cloudDeleteReview = { token: globalThis.crypto.randomUUID(), expires: Date.now() + 300000, key: version.key, config };
+          return { success: true, token: cloudDeleteReview.token };
+        }
+        const review = cloudDeleteReview;
+        if (!review || review.token !== request.token || review.expires < Date.now() || request.confirmation !== 'DELETE') throw new Error('请重新确认删除所选云端版本');
+        await assertCloudContext(key, review.config);
+        const result = await deleteCloudBackupVersions([review.key], key, () => assertCloudContext(key, review.config));
+        if (result.failed.length) throw new Error(result.failed[0].error);
+        cloudDeleteReview = null;
+        return { success: true, deleted: result.deleted };
+      }).then(sendResponse, (error) => sendResponse({ error: error.message }));
+      return true;
+    }
+    if (request.action === 'restoreVault' || request.action === 'compareCloudConflict' || request.action === 'resolveCloudConflict') {
+      void withVaultLock(async () => {
+        if (request.action === 'restoreVault') return restoreVault(request.backupData, request.mode, request.password);
+        if (request.action === 'compareCloudConflict') return compareCloudConflict();
+        return resolveCloudConflict(request.token, request.choice);
+      }).then(sendResponse, (error) => sendResponse({ error: error.message }));
+      return true;
+    }
+    if (request.action === 'saveVault') {
+      void withVaultLock(async () => {
+        const key = await requireSessionKey();
+        const current = await readVault(key);
+        if (typeof request.expectedSecrets !== 'string' || request.expectedSecrets !== JSON.stringify(current)) {
+          throw new Error('密钥已被其他页面或设备更新，请刷新后重新操作');
+        }
+        const next = normalizeVaultSecrets(request.secrets).map((entry) => {
+          const previous = current.find((record) => record.id === entry.id && record.secret === entry.secret);
+          const result = entry.type === 'hotp' && previous?.type === 'hotp'
+            ? { ...entry, counter: Math.max(entry.counter ?? 0, previous.counter ?? 0) } : entry;
+          if (!previous || JSON.stringify(result) !== JSON.stringify(previous)) {
+            result.updatedAt = new Date(Math.max(Date.now(), getSecretTimestamp(result), previous ? getSecretTimestamp(previous) : 0) + 1).toISOString();
+          }
+          return result;
+        });
+        const removed = current.filter((entry) => !next.some((record) => record.id === entry.id));
+        const tombstones = await loadSecretTombstones();
+        const deletedAt = new Date(Math.max(Date.now(), ...removed.map(getSecretTimestamp)) + 1).toISOString();
+        const deviceId = await getOrCreateSyncDeviceId();
+        const removedIds = new Set(removed.map((entry) => entry.id));
+        const nextTombstones = [...tombstones.filter((entry) => !removedIds.has(entry.id)),
+          ...removed.map(({ id }) => ({ id, deletedAt, deviceId }))];
+        await writeVault(next, key, { secretTombstones: nextTombstones });
+        if (request.triggerSnapshot) {
+          const settings = await getBackupEncryptionSettings();
+          const password = await resolveStoredBackupPassword(key, settings) || key;
+          await saveBackupSnapshot(await createBackupData(await readVault(key), password));
+        }
+        return { success: true, secrets: await readVault(key) };
+      }).then(sendResponse, (error) => sendResponse({ error: error.message }));
+      return true;
+    }
+
     if (request.action === 'startQrScan') {
       void startQrScan(sender.tab).then(
         () => sendResponse({ success: true }),
@@ -370,49 +533,58 @@ export default defineBackground(() => {
       return true;
     }
 
-    if (request.action === 'generateCode') {
-      (async () => {
-        try {
-          const totp = new TOTP({
-            secret: request.secret,
-            algorithm: 'SHA1',
-            digits: request.digits || 6,
-            period: 30
-          });
-          const code = totp.generate();
-          const time = Math.floor(Date.now() / 1000);
-          const remainingSeconds = 30 - (time % 30);
-          sendResponse({ code, remainingSeconds });
-        } catch (error) {
-          sendResponse({ error: (error as Error).message });
+    if (request.action === 'generateCode' || request.action === 'consumeCode') {
+      void withVaultLock(async () => {
+        const key = await getValidSessionKey();
+        const device = key ? null : await readDeviceOtpVault();
+        const secrets = key ? await readVault(key) : device!.secrets;
+        let secret = typeof request.id === 'string' ? secrets.find((entry) => entry.id === request.id) : undefined;
+        if (!secret && isTrustedPage(sender) && typeof request.secret === 'string' && request.action === 'generateCode') {
+          if (!key) throw new Error('编辑密钥需要先解锁 OpenPass');
+          secret = { ...normalizeOtpSettings(request), id: '', site: '', secret: request.secret };
         }
-      })();
+        if (!secret) throw new Error('密钥不存在');
+        if (!isTrustedPage(sender)) {
+          const page = sender.url ? parseUrl(sender.url) : null;
+          if (!page || !isSiteMatched(page, secret.site)) throw new Error('当前页面与密钥站点不匹配');
+        }
+        const result = generateOtp(secret.secret, secret);
+        if (request.action === 'consumeCode' && secret.type === 'hotp') {
+          secret.counter = (secret.counter ?? 0) + 1;
+          secret.updatedAt = new Date().toISOString();
+          if (key) {
+            await writeVault(secrets, key);
+            await saveBackupSnapshot(await createBackupData(secrets, key));
+          } else {
+            device!.context = await writeDeviceOtpCounters(secrets, device!.context);
+          }
+        }
+        if (key) await assertSessionKey(key);
+        else await assertDeviceOtpAccess(device!.context);
+        return result;
+      }).then(sendResponse, (error) => sendResponse({ error: error.message }));
       return true;
     }
 
-    // 缓存 sessionKey，供用户解锁时写入
-    if (request.action === 'cacheSessionKey') {
-      cachedSessionKey = request.sessionKey || null;
-      if (cachedSessionKey) {
-        void synchronizeCloudState().catch((error) => {
-          console.error('OpenPass: 解锁后同步云端数据失败', error);
-        });
-      }
-      sendResponse({ success: true });
-      return true;
-    }
-
-    // 获取缓存的 sessionKey，供自动备份使用
-    if (request.action === 'getCachedSessionKey') {
-      sendResponse({ sessionKey: cachedSessionKey });
+    if (request.action === 'sessionChanged') {
+      void (async () => {
+        await syncSessionAlarm();
+        await notifyVaultChanged();
+        if (await getValidSessionKey()) void synchronizeCloudState().catch(console.error);
+        return { success: true };
+      })().then(sendResponse, (error) => sendResponse({ error: error.message }));
       return true;
     }
 
     // 测试自动备份
+    if (request.action === 'updateBackupSchedule') {
+      void syncAutoBackupAlarm().then(() => sendResponse({ success: true }),
+        (error) => sendResponse({ error: error.message }));
+      return true;
+    }
     if (request.action === 'testAutoBackup') {
       (async () => {
-        console.log('[AutoBackup] 手动触发自动备份测试');
-        sendResponse(await handleAutoBackup(true));
+        sendResponse(await withVaultLock(() => handleAutoBackup(true)));
       })();
       return true;
     }
@@ -435,15 +607,13 @@ export default defineBackground(() => {
         try {
           const sessionKey = await getValidSessionKey();
           if (!sessionKey) throw new Error('请先解锁 OpenPass');
-          const secrets = Array.isArray(request.secrets)
-            ? normalizeSecretsForSync(request.secrets as StoredSecret[], new Date().toISOString())
-            : [];
+          const secrets = await readVault(sessionKey);
           const encryptionSettings = await getBackupEncryptionSettings();
           const backupPassword = await resolveStoredBackupPassword(sessionKey, encryptionSettings);
           if (encryptionSettings.enableBackupEncryption && !backupPassword) {
             throw new Error('无法获取备份密码');
           }
-          await saveBackupSnapshot(await createBackupData(secrets, backupPassword));
+          await saveBackupSnapshot(await createBackupData(secrets, backupPassword || sessionKey));
           sendResponse({ success: true });
         } catch (error) {
           sendResponse({ error: error instanceof Error ? error.message : '创建同步快照失败' });
@@ -454,7 +624,10 @@ export default defineBackground(() => {
 
     if (request.action === 'syncLatestCloudBackup') {
       void synchronizeCloudState(true).then(
-        (result) => sendResponse({ success: true, result }),
+        (result) => sendResponse(typeof result === 'object' && result !== null && 'skipped' in result &&
+          (result.skipped === 'locked' || result.skipped === 'disabled')
+          ? { error: result.skipped === 'locked' ? '请先解锁 OpenPass' : '云端同步未启用' }
+          : { success: true, result }),
         (error) => sendResponse({ error: error instanceof Error ? error.message : '云端同步失败' })
       );
       return true;
@@ -517,39 +690,22 @@ export default defineBackground(() => {
     }
 
     if (request.action === 'getSecrets') {
-      (async () => {
-        try {
-          const setupComplete = await checkSetupComplete();
-          if (!setupComplete) {
-            sendResponse({ error: 'not_setup' });
-            return;
+      void (async () => {
+        const key = await getValidSessionKey();
+        if (!key) {
+          try {
+            const { secrets } = await readDeviceOtpVault();
+            return { locked: true, otpAvailable: true,
+              secrets: (isTrustedPage(sender) ? secrets : matchSecrets(sender.url || '', secrets)).map(toOtpAccount) };
+          } catch (error) {
+            return { secrets: [], locked: true, otpAvailable: false, message: (error as Error).message };
           }
-
-          const result = await chrome.storage.local.get<{
-            encryptedSecrets?: string;
-            secrets?: StoredSecret[];
-          }>(['encryptedSecrets', 'secrets']);
-
-          // 优先尝试用缓存的 sessionKey 解密
-          if (typeof result.encryptedSecrets === 'string' && cachedSessionKey) {
-            const CryptoUtils = await import('../utils/crypto');
-            const decrypted = await CryptoUtils.default.decrypt(result.encryptedSecrets, cachedSessionKey);
-            const secrets = JSON.parse(decrypted);
-            sendResponse({ secrets });
-          } else if (typeof result.encryptedSecrets === 'string' && typeof request.sessionKey === 'string') {
-            const CryptoUtils = await import('../utils/crypto');
-            const decrypted = await CryptoUtils.default.decrypt(result.encryptedSecrets, request.sessionKey);
-            const secrets = JSON.parse(decrypted);
-            sendResponse({ secrets });
-          } else if (Array.isArray(result.secrets)) {
-            sendResponse({ secrets: result.secrets });
-          } else {
-            sendResponse({ secrets: [] });
-          }
-        } catch (error) {
-          sendResponse({ error: (error as Error).message });
         }
-      })();
+        const secrets = await readVault(key);
+        if (isTrustedPage(sender)) return { secrets, locked: false };
+        return { locked: false, secrets: matchSecrets(sender.url || '', secrets)
+          .map(({ id, site, name, type, digits, period, algorithm, counter }) => ({ id, site, name, type, digits, period, algorithm, counter })) };
+      })().then(sendResponse, (error) => sendResponse({ error: error.message, secrets: [] }));
       return true;
     }
   });
@@ -571,8 +727,15 @@ export default defineBackground(() => {
   });
 
   chrome.storage.onChanged.addListener((changes, namespace) => {
+    if ((namespace === 'local' && (changes.encryptedSecrets || changes.encryptedDeviceOtpSecrets || changes.deviceOtpEnabled || changes.sessionExpiresAt)) ||
+        (namespace === 'session' && changes.sessionKey)) {
+      void notifyVaultChanged().catch(console.error);
+    }
+    if (namespace === 'local' && changes.sessionExpiresAt) void syncSessionAlarm().catch(console.error);
+
     if (namespace === 'local' && (changes.secrets || changes.encryptedSecrets || changes.sitesList)) {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (chrome.runtime.lastError) return;
         const activeTab = tabs[0];
         if (activeTab?.url && typeof activeTab.id === 'number') {
           updateBadgeForTab(activeTab.id, activeTab.url);
@@ -597,7 +760,7 @@ export default defineBackground(() => {
 
     if (namespace === 'local' && changes.cloudBackupSettings) {
       void (async () => {
-        await syncCloudPullAlarm();
+        await syncAutoBackupAlarm();
         await synchronizeCloudState();
         const sessionKey = await getValidSessionKey();
         const enabled = (changes.cloudBackupSettings.newValue as { enabled?: boolean } | undefined)
@@ -611,17 +774,13 @@ export default defineBackground(() => {
 
   // 自动备份定时器
   chrome.alarms.onAlarm.addListener(async (alarm) => {
+    if (alarm.name === SESSION_ALARM) { await getValidSessionKey(); await notifyVaultChanged(); }
     if (alarm.name === AUTO_BACKUP_ALARM_NAME) {
-      await handleAutoBackup();
+      await runBackupCycle();
     }
     if (alarm.name === CLOUD_BACKUP_RETRY_ALARM_NAME) {
       await synchronizeCloudState(true).catch((error) => {
         console.error('OpenPass: 云端备份重试失败', error);
-      });
-    }
-    if (alarm.name === CLOUD_BACKUP_PULL_ALARM_NAME) {
-      await synchronizeCloudState().catch((error) => {
-        console.error('OpenPass: 定时拉取云端备份失败', error);
       });
     }
   });
@@ -630,75 +789,27 @@ export default defineBackground(() => {
     return BACKUP_INTERVALS[frequency ?? 'weekly'] ?? BACKUP_INTERVALS.weekly;
   }
 
-  function getAutoBackupDelayInMinutes(nextBackupTime?: string | null) {
-    if (!nextBackupTime) {
-      return 60;
-    }
-
-    const nextTime = new Date(nextBackupTime).getTime();
-    if (!Number.isFinite(nextTime)) {
-      return 1;
-    }
-
-    const minutesUntilNextBackup = Math.ceil((nextTime - Date.now()) / (60 * 1000));
-    return Math.max(1, minutesUntilNextBackup);
+  function syncAutoBackupAlarm() {
+    const result = backupScheduleUpdate.then(updateBackupAlarm);
+    backupScheduleUpdate = result.catch(() => {});
+    return result;
   }
-
-  async function syncAutoBackupAlarm() {
+  async function updateBackupAlarm() {
     const settings = await chrome.storage.local.get<{
       enableAutoBackup?: boolean;
       nextBackupTime?: string;
-    }>(['enableAutoBackup', 'nextBackupTime']);
-
-    await chrome.alarms.clear(AUTO_BACKUP_ALARM_NAME);
-
-    if (settings.enableAutoBackup !== true) {
-      return;
-    }
-
-    chrome.alarms.create(AUTO_BACKUP_ALARM_NAME, {
-      delayInMinutes: getAutoBackupDelayInMinutes(settings.nextBackupTime),
-      periodInMinutes: 60
-    });
-  }
-
-  async function syncCloudPullAlarm() {
-    const settings = await chrome.storage.local.get<{
+      backupFrequency?: string;
       cloudBackupSettings?: { enabled?: boolean };
-    }>(['cloudBackupSettings']);
+    }>(['enableAutoBackup', 'nextBackupTime', 'backupFrequency', 'cloudBackupSettings']);
+    await chrome.alarms.clear(AUTO_BACKUP_ALARM_NAME);
     await chrome.alarms.clear(CLOUD_BACKUP_PULL_ALARM_NAME);
-    if (settings.cloudBackupSettings?.enabled !== true) return;
-    chrome.alarms.create(CLOUD_BACKUP_PULL_ALARM_NAME, {
-      delayInMinutes: 1,
-      periodInMinutes: 5
-    });
+    const schedule = getBackupSchedule(settings);
+    if (schedule) await chrome.alarms.create(AUTO_BACKUP_ALARM_NAME, schedule);
   }
-
-  async function getValidSessionKey() {
-    if (cachedSessionKey) {
-      return cachedSessionKey;
-    }
-
-    const [localResult, sessionResult] = await Promise.all([
-      chrome.storage.local.get<{ sessionExpiresAt?: number }>(['sessionExpiresAt']),
-      chrome.storage.session.get<{ sessionKey?: string }>(['sessionKey'])
-    ]);
-
-    if (
-      typeof localResult.sessionExpiresAt === 'number' &&
-      Date.now() > localResult.sessionExpiresAt
-    ) {
-      await chrome.storage.session.remove(['sessionKey']);
-      cachedSessionKey = null;
-      return null;
-    }
-
-    if (typeof sessionResult.sessionKey === 'string') {
-      cachedSessionKey = sessionResult.sessionKey;
-      return cachedSessionKey;
-    }
-
-    return null;
+  async function runBackupCycle() {
+    const { enableAutoBackup } = await chrome.storage.local.get(['enableAutoBackup']);
+    if (enableAutoBackup === true) await withVaultLock(() => handleAutoBackup());
+    await synchronizeCloudState().catch((error) => console.error('OpenPass: 备份任务云端同步失败', error));
   }
 
   async function syncLatestLocalSnapshot(
@@ -724,6 +835,7 @@ export default defineBackground(() => {
       ]);
 
       if (result.cloudBackupSettings?.enabled !== true) return { skipped: 'disabled' };
+      if (result.cloudBackupStatus?.state === 'conflict') throw new Error('请先解决云端冲突');
       const latest = Array.isArray(result.backupSnapshots) ? result.backupSnapshots[0] : undefined;
       if (!latest?.data) throw new Error('没有可同步的本地快照，请先执行一次备份');
       if (!force && result.cloudBackupLastLocalTimestamp === latest.timestamp) {
@@ -795,7 +907,7 @@ export default defineBackground(() => {
         const createdAt = secret.createdAt || secret.importedAt || fallbackTime;
         return {
           ...secret,
-          id: secret.id || crypto.randomUUID(),
+          id: secret.id || globalThis.crypto.randomUUID(),
           createdAt,
           updatedAt: secret.updatedAt || createdAt
         };
@@ -805,188 +917,234 @@ export default defineBackground(() => {
   async function persistMergedSyncState(
     secrets: SyncStoredSecret[],
     tombstones: Awaited<ReturnType<typeof loadSecretTombstones>>,
-    sessionKey: string
+    sessionKey: string,
+    hotpCounters?: Record<string, number>
   ) {
-    const CryptoUtils = await import('../utils/crypto');
     const encryptionSettings = await getBackupEncryptionSettings();
     const backupPassword = await resolveStoredBackupPassword(sessionKey, encryptionSettings);
     if (encryptionSettings.enableBackupEncryption && !backupPassword) {
       throw new Error('无法解密备份密码，已停止多设备同步');
     }
 
-    const serialized = JSON.stringify(secrets);
-    const storageData: Record<string, unknown> = {
-      secrets,
-      sitesList: secrets.map((secret) => ({ site: secret.site })),
-      secretTombstones: tombstones,
-      encryptedSecrets: await CryptoUtils.default.encrypt(serialized, sessionKey)
-    };
-    if (
-      encryptionSettings.enableBackupEncryption &&
-      !encryptionSettings.useMasterPasswordForBackup &&
-      backupPassword
-    ) {
-      storageData.encryptedSecretsForBackup = await CryptoUtils.default.encrypt(
-        serialized,
-        backupPassword
-      );
-    }
-    await chrome.storage.local.set(storageData);
-    await saveBackupSnapshot(await createBackupData(secrets, backupPassword));
+    const saved = await writeVault(secrets, sessionKey, { secretTombstones: tombstones, hotpCounters });
+    await saveBackupSnapshot(await createBackupData(saved, backupPassword || sessionKey));
   }
 
   async function synchronizeCloudState(force = false) {
     if (cloudPullInFlight) return cloudPullInFlight;
-    cloudPullInFlight = (async () => {
-      const state = await chrome.storage.local.get<{
-        cloudBackupSettings?: { enabled?: boolean };
-        cloudBackupStatus?: Record<string, unknown>;
-        cloudBackupLastPulledETag?: string;
-        secrets?: StoredSecret[];
-      }>([
-        'cloudBackupSettings',
-        'cloudBackupStatus',
-        'cloudBackupLastPulledETag',
-        'secrets'
-      ]);
-      if (state.cloudBackupSettings?.enabled !== true) return { skipped: 'disabled' };
-
-      const sessionKey = await getValidSessionKey();
-      if (!sessionKey) {
-        await chrome.storage.local.set({
-          cloudBackupStatus: {
-            ...(state.cloudBackupStatus || {}),
-            state: 'pending',
-            message: '等待解锁后拉取并合并云端数据'
-          }
-        });
+    cloudPullInFlight = withVaultLock(async () => {
+      const state = await chrome.storage.local.get(['cloudBackupSettings', 'cloudBackupStatus', 'cloudBackupLastPulledETag', 'encryptedCloudBackupSecrets']);
+      if (!(state.cloudBackupSettings as { enabled?: boolean })?.enabled) return { skipped: 'disabled' };
+      if ((state.cloudBackupStatus as { state?: string })?.state === 'conflict') {
+        throw new Error('云端存在并发冲突，请先比较并选择保留方式');
+      }
+      const key = await getValidSessionKey();
+      if (!key) {
+        await chrome.storage.local.set({ cloudBackupStatus: { ...(state.cloudBackupStatus as object), state: 'pending', message: '等待解锁后同步' } });
         return { skipped: 'locked' };
       }
-
-      await chrome.storage.local.set({
-        cloudBackupStatus: {
-          ...(state.cloudBackupStatus || {}),
-          state: 'syncing',
-          message: '正在拉取并合并云端数据'
-        }
-      });
-
-      let remote;
-      try {
-        remote = await downloadLatestBackupStateFromS3<StoredSecret>(sessionKey);
-      } catch (error) {
-        if (error instanceof Error && error.name === 'CloudBackupNotFound') {
-          return syncLatestLocalSnapshot(true, null);
-        }
-        throw error;
-      }
-
-      if (!force && remote.etag && remote.etag === state.cloudBackupLastPulledETag) {
-        const result = await syncLatestLocalSnapshot(false, remote.etag);
-        const current = await chrome.storage.local.get<{
-          cloudBackupStatus?: Record<string, unknown>;
-        }>(['cloudBackupStatus']);
-        await chrome.storage.local.set({
-          cloudBackupStatus: {
-            ...(current.cloudBackupStatus || {}),
-            state: 'success',
-            message: current.cloudBackupStatus?.lastRetentionError
-              ? current.cloudBackupStatus.message
-              : '本地与云端已同步',
-            lastPullAt: new Date().toISOString()
-          }
-        });
-        return result;
-      }
-
-      const encryptionSettings = await getBackupEncryptionSettings();
-      const backupPassword = await resolveStoredBackupPassword(sessionKey, encryptionSettings);
-      let remoteSecrets: StoredSecret[];
-      if (remote.backupData.encrypted) {
-        if (!backupPassword) throw new Error('无法解密远端备份，请检查备份密码');
-        remoteSecrets = await decryptBackupData(remote.backupData, backupPassword);
-      } else {
-        remoteSecrets = Array.isArray(remote.backupData.secrets)
-          ? remote.backupData.secrets
-          : [];
-      }
-
-      const localSecrets = normalizeSecretsForSync(
-        Array.isArray(state.secrets) ? state.secrets : [],
-        '1970-01-01T00:00:00.000Z'
-      );
-      const normalizedRemote = normalizeSecretsForSync(
-        remoteSecrets,
-        remote.backupData.exportTime
-      );
+      const config = JSON.stringify([state.cloudBackupSettings, state.encryptedCloudBackupSecrets]);
+      const local = normalizeSecretsForSync(await readVault(key), '1970-01-01T00:00:00.000Z');
       const localTombstones = await loadSecretTombstones();
-      const merged = mergeSyncState(
-        localSecrets,
-        localTombstones,
-        normalizedRemote,
-        remote.backupData.sync?.tombstones ?? []
-      );
-
-      await chrome.storage.local.set({
-        cloudBackupLastPulledETag: remote.etag,
-        cloudBackupStatus: {
-          ...(state.cloudBackupStatus || {}),
-          state: 'success',
-          message: merged.changed ? '已自动合并云端数据' : '本地与云端已同步',
-          lastPullAt: new Date().toISOString()
-        }
-      });
-
-      if (merged.changed) {
-        await persistMergedSyncState(merged.secrets, merged.tombstones, sessionKey);
-        await syncLatestLocalSnapshot(true, remote.etag);
-      } else {
-        await syncLatestLocalSnapshot(false, remote.etag);
+      let remote;
+      try { remote = await downloadLatestBackupStateFromS3<StoredSecret>(key); }
+      catch (error) {
+        if (!(error instanceof Error) || error.name !== 'CloudBackupNotFound') throw error;
+        remote = null;
       }
+      await assertCloudContext(key, config);
+      if (remote && !remote.etag) throw new Error('S3 未返回 ETag，无法安全同步');
+      if (remote && !force && remote.etag === state.cloudBackupLastPulledETag) {
+        return syncLatestLocalSnapshot(false, remote.etag);
+      }
+      const settings = await getBackupEncryptionSettings();
+      const password = await resolveStoredBackupPassword(key, settings);
+      const remoteSecrets = remote ? await decodeRestoreBackup(remote.backupData, [password || key, key]) : [];
+      const merged = mergeSyncState(local, localTombstones,
+        normalizeSecretsForSync(remoteSecrets, remote?.backupData.exportTime || new Date().toISOString()),
+        remote?.backupData.sync?.tombstones ?? []);
+      const metadata = await getBackupSyncMetadata();
+      const adjusted = await applyHotpCounters(merged.secrets, mergeHotpCounters(metadata.hotpCounters, remote?.backupData.sync?.hotpCounters));
+      const backup = await createBackupData(adjusted.secrets, password || key);
+      backup.sync = { ...metadata, tombstones: merged.tombstones, hotpCounters: adjusted.counters };
+      // 先条件上传；412 或网络失败时不覆盖本地数据。
+      const uploaded = await uploadBackupToS3(backup, key, remote?.etag ?? null);
+      await assertCloudContext(key, config);
+      await persistMergedSyncState(adjusted.secrets, merged.tombstones, key, adjusted.counters);
+      const snapshots = await chrome.storage.local.get<{ backupSnapshots?: Array<{ timestamp: string }> }>(['backupSnapshots']);
+      await chrome.storage.local.set({ cloudBackupLastPulledETag: uploaded.etag,
+        cloudBackupLastLocalTimestamp: snapshots.backupSnapshots?.[0]?.timestamp,
+        cloudBackupRetryCount: 0 });
+      await chrome.alarms.clear(CLOUD_BACKUP_RETRY_ALARM_NAME);
+      await applyCloudBackupRetention(key, uploaded.snapshotKey);
       return { merged: merged.changed, count: merged.secrets.length };
-    })();
-
-    try {
-      return await cloudPullInFlight;
-    } catch (error) {
-      if (!isCloudBackupConflict(error)) {
-        const status = await chrome.storage.local.get<{
-          cloudBackupStatus?: Record<string, unknown>;
-        }>(['cloudBackupStatus']);
-        await chrome.storage.local.set({
-          cloudBackupStatus: {
-            ...(status.cloudBackupStatus || {}),
-            state: 'error',
-            message: error instanceof Error ? error.message : '多设备同步失败'
-          }
-        });
+    });
+    try { return await cloudPullInFlight; }
+    catch (error) {
+      const { cloudBackupStatus } = await chrome.storage.local.get<{ cloudBackupStatus?: Record<string, unknown> }>(['cloudBackupStatus']);
+      if (!isCloudBackupConflict(error) && cloudBackupStatus?.state !== 'conflict') {
+        await chrome.storage.local.set({ cloudBackupStatus: { ...cloudBackupStatus, state: 'error',
+          message: error instanceof Error ? error.message : '多设备同步失败' } });
+      }
+      if (!isCloudBackupConflict(error) && cloudBackupStatus?.state !== 'conflict') {
+        const retryState = await chrome.storage.local.get<{ cloudBackupRetryCount?: number }>(['cloudBackupRetryCount']);
+        const retryCount = Math.min((retryState.cloudBackupRetryCount ?? 0) + 1, CLOUD_BACKUP_RETRY_MINUTES.length);
+        await chrome.storage.local.set({ cloudBackupRetryCount: retryCount });
+        await chrome.alarms.create(CLOUD_BACKUP_RETRY_ALARM_NAME, { delayInMinutes: CLOUD_BACKUP_RETRY_MINUTES[retryCount - 1] });
       }
       throw error;
-    } finally {
-      cloudPullInFlight = null;
-    }
+    } finally { cloudPullInFlight = null; }
   }
 
-  async function decryptStoredSecrets(encryptedSecrets: string, sessionKey: string) {
-    const CryptoUtils = await import('../utils/crypto');
-    const decrypted = await CryptoUtils.default.decrypt(encryptedSecrets, sessionKey);
-    const parsed: unknown = JSON.parse(decrypted);
-    return Array.isArray(parsed) ? (parsed as StoredSecret[]) : [];
+  async function assertCloudContext(key: string, config: string) {
+    await assertSessionKey(key);
+    const { cloudBackupSettings, encryptedCloudBackupSecrets } = await chrome.storage.local.get(['cloudBackupSettings', 'encryptedCloudBackupSecrets']);
+    if (JSON.stringify([cloudBackupSettings, encryptedCloudBackupSecrets]) !== config) throw new Error('云端配置已变更，请重新同步');
   }
 
-  async function resolveAutoBackupSecrets(
-    settings: { encryptedSecrets?: string; secrets?: StoredSecret[] },
-    sessionKey: string | null
-  ) {
-    if (typeof settings.encryptedSecrets === 'string' && sessionKey) {
-      try {
-        return await decryptStoredSecrets(settings.encryptedSecrets, sessionKey);
-      } catch (error) {
-        console.error('OpenPass: 自动备份解密失败，尝试使用明文缓存', error);
-      }
+  let clearReview: { token: string; expires: number; scope: 'local' | 'cloud'; revision: unknown;
+    config: string; etag: string | null; secrets: StoredSecret[];
+    tombstones: Awaited<ReturnType<typeof loadSecretTombstones>>; historyKeys: string[] } | null = null;
+  let cloudDeleteReview: { token: string; expires: number; key: string; config: string } | null = null;
+  async function prepareVaultClear(scope: string) {
+    if (scope !== 'local' && scope !== 'cloud') throw new Error('请选择清理范围');
+    const key = await requireSessionKey();
+    const state = await chrome.storage.local.get(['encryptedSecrets', 'cloudBackupSettings', 'encryptedCloudBackupSecrets']);
+    const config = JSON.stringify([state.cloudBackupSettings, state.encryptedCloudBackupSecrets]);
+    const local = await readVault(key);
+    let remote: StoredSecret[] = [];
+    let etag: string | null = null;
+    let tombstones = await loadSecretTombstones();
+    let historyKeys: string[] = [];
+    if (scope === 'cloud') {
+      const cloud = await downloadLatestBackupStateFromS3<StoredSecret>(key, true).catch((error) => {
+        if (error.name === 'CloudBackupNotFound') return null;
+        throw error;
+      });
+      if (cloud && !cloud.etag) throw new Error('云端未返回同步版本，不能安全清理');
+      etag = cloud?.etag ?? null;
+      const settings = await getBackupEncryptionSettings();
+      const password = await resolveStoredBackupPassword(key, settings);
+      remote = cloud ? await decodeRestoreBackup(cloud.backupData, [password || key, key]) : [];
+      tombstones = mergeSyncState(local, tombstones, remote, cloud?.backupData.sync?.tombstones || []).tombstones;
+      historyKeys = (await listCloudBackupVersions(key)).map(version => version.key);
+      await assertCloudContext(key, config);
     }
+    clearReview = { token: globalThis.crypto.randomUUID(), expires: Date.now() + 300000, scope,
+      revision: state.encryptedSecrets, config, etag, secrets: [...local, ...remote], tombstones, historyKeys };
+    return { success: true, token: clearReview.token, localCount: local.length, remoteCount: remote.length,
+      historyCount: historyKeys.length, bucket: (state.cloudBackupSettings as { bucket?: string })?.bucket,
+      prefix: (state.cloudBackupSettings as { prefix?: string })?.prefix };
+  }
+  async function clearVault(token: string, confirmation: string) {
+    const key = await requireSessionKey();
+    const review = clearReview;
+    if (!review || review.token !== token || review.expires < Date.now()) throw new Error('确认已失效，请重新检查清理范围');
+    if (confirmation !== (review.scope === 'cloud' ? 'DELETE CLOUD' : 'DELETE')) throw new Error('请输入正确的确认文字');
+    const state = await chrome.storage.local.get(['encryptedSecrets', 'cloudBackupSettings']);
+    if (state.encryptedSecrets !== review.revision) throw new Error('密钥已变更，请重新检查清理范围');
+    await assertCloudContext(key, review.config);
+    if (review.scope === 'local') {
+      const settings = state.cloudBackupSettings as object | undefined;
+      await chrome.storage.local.set({ cloudBackupSettings: { ...settings, enabled: false },
+        cloudBackupStatus: { state: 'disabled', message: '仅清理本机，云端数据已保留' } });
+      await chrome.alarms.clear(CLOUD_BACKUP_RETRY_ALARM_NAME);
+      await writeVault([], key, { secretTombstones: [] });
+      await chrome.storage.local.remove(['backupSnapshots', 'cloudBackupLastLocalTimestamp', 'cloudBackupLastPulledETag']);
+      clearReview = null;
+      return { success: true, scope: 'local' };
+    }
+    const plan = planRestore(review.secrets, [], review.tombstones, 'replace', await getOrCreateSyncDeviceId());
+    const tombstones = mergeSyncState([], plan.tombstones, [], []).tombstones;
+    const backup = await createBackupData([], key);
+    backup.sync = { ...await getBackupSyncMetadata(), tombstones };
+    // Commit the empty state conditionally before clearing local data or deleting reviewed history.
+    const uploaded = await uploadBackupToS3(backup, key, review.etag, true);
+    await assertCloudContext(key, review.config);
+    await writeVault([], key, { secretTombstones: tombstones });
+    await chrome.storage.local.remove(['backupSnapshots', 'cloudBackupLastLocalTimestamp']);
+    const baseline = await saveBackupSnapshot(backup);
+    await chrome.storage.local.set({ cloudBackupLastPulledETag: uploaded.etag,
+      cloudBackupLastLocalTimestamp: baseline[0]?.timestamp });
+    clearReview = null;
+    const cleanup = await deleteCloudBackupVersions(review.historyKeys, key, () => assertCloudContext(key, review.config)).catch((error) => ({
+      deleted: 0, failed: [{ key: '', error: error.message }] }));
+    const warning = cleanup.failed.length ? `密钥已清空，但部分云端历史删除失败：${cleanup.failed[0].error}` : null;
+    return { success: true, scope: 'cloud', deleted: cleanup.deleted, warning };
+  }
 
-    return Array.isArray(settings.secrets) ? settings.secrets : [];
+  async function restoreVault(backup: unknown, mode: RestoreMode, manualPassword?: string) {
+    const key = await requireSessionKey();
+    const settings = await getBackupEncryptionSettings();
+    const password = await resolveStoredBackupPassword(key, settings);
+    const incoming = await decodeRestoreBackup(backup, [manualPassword || '', password || key, key]);
+    const current = await readVault(key);
+    const plan = planRestore(current, incoming, await loadSecretTombstones(), mode, await getOrCreateSyncDeviceId());
+    await saveBackupSnapshot(await createBackupData(current, key));
+    await persistMergedSyncState(plan.secrets, plan.tombstones, key, validateBackupData(backup).data?.sync?.hotpCounters);
+    return { success: true, count: plan.secrets.length };
+  }
+
+  let conflictReview: { token: string; revision: unknown; config: string; etag: string;
+    local: StoredSecret[]; remote: StoredSecret[]; hotpCounters?: Record<string, number>; tombstones: Awaited<ReturnType<typeof loadSecretTombstones>> } | null = null;
+
+  async function compareCloudConflict() {
+    const key = await requireSessionKey();
+    const context = await chrome.storage.local.get(['cloudBackupSettings', 'encryptedCloudBackupSecrets']);
+    const config = JSON.stringify([context.cloudBackupSettings, context.encryptedCloudBackupSecrets]);
+    const remote = await downloadLatestBackupStateFromS3<StoredSecret>(key);
+    if (!remote.etag) throw new Error('S3 未返回 ETag，无法安全解决并发冲突');
+    const settings = await getBackupEncryptionSettings();
+    const password = await resolveStoredBackupPassword(key, settings);
+    const remoteSecrets = await decodeRestoreBackup(remote.backupData, [password || key, key]);
+    await assertCloudContext(key, config);
+    const local = await readVault(key);
+    const state = await chrome.storage.local.get(['encryptedSecrets', 'cloudBackupSettings']);
+    conflictReview = { token: globalThis.crypto.randomUUID(), revision: state.encryptedSecrets,
+      config, etag: remote.etag, local, remote: remoteSecrets,
+      tombstones: remote.backupData.sync?.tombstones ?? [], hotpCounters: remote.backupData.sync?.hotpCounters };
+    const ids = new Set([...local, ...remoteSecrets].map((entry) => entry.id));
+    return { token: conflictReview.token, localCount: local.length, remoteCount: remoteSecrets.length,
+      differences: [...ids].flatMap((id) => {
+        const left = local.find((entry) => entry.id === id);
+        const right = remoteSecrets.find((entry) => entry.id === id);
+        if (JSON.stringify(left) === JSON.stringify(right)) return [];
+        return [{ id, local: left ? { site: left.site, name: left.name, counter: left.counter, updatedAt: left.updatedAt } : null,
+          remote: right ? { site: right.site, name: right.name, counter: right.counter, updatedAt: right.updatedAt } : null,
+          keyChanged: !!left && !!right && left.secret !== right.secret }];
+      }) };
+  }
+
+  async function resolveCloudConflict(token: string, choice: string) {
+    const key = await requireSessionKey();
+    const review = conflictReview;
+    if (!review || token !== review.token || !['local', 'remote', 'merge'].includes(choice)) throw new Error('请重新比较冲突');
+    const state = await chrome.storage.local.get(['encryptedSecrets']);
+    if (state.encryptedSecrets !== review.revision) throw new Error('本地数据已变更，请重新比较');
+    await assertCloudContext(key, review.config);
+    const localTombstones = await loadSecretTombstones();
+    const merged = mergeSyncState(review.local, localTombstones, review.remote, review.tombstones);
+    const plan = choice === 'merge' ? merged : planRestore(
+      [...review.remote, ...review.local],
+      choice === 'local' ? review.local : review.remote,
+      merged.tombstones, 'replace', await getOrCreateSyncDeviceId());
+    // 提交前保留本地密文；只用比较时读取的 ETag 更新 latest。
+    await saveBackupSnapshot(await createBackupData(review.local, key));
+    const metadata = await getBackupSyncMetadata();
+    const adjusted = await applyHotpCounters(plan.secrets, mergeHotpCounters(metadata.hotpCounters, review.hotpCounters));
+    const backup = await createBackupData(adjusted.secrets, key);
+    backup.sync = { ...metadata, tombstones: plan.tombstones, hotpCounters: adjusted.counters };
+    const uploaded = await uploadBackupToS3(backup, key, review.etag);
+    await assertCloudContext(key, review.config);
+    await persistMergedSyncState(adjusted.secrets, plan.tombstones, key, adjusted.counters);
+    await chrome.storage.local.set({ cloudBackupLastPulledETag: uploaded.etag });
+    conflictReview = null;
+    await applyCloudBackupRetention(key, uploaded.snapshotKey);
+    return { success: true, count: plan.secrets.length };
+  }
+
+  async function resolveAutoBackupSecrets(_settings: unknown, sessionKey: string | null) {
+    return sessionKey ? readVault(sessionKey) : [];
   }
 
   async function createMasterPasswordEncryptedBackup(
@@ -1097,27 +1255,15 @@ export default defineBackground(() => {
           !encryptionSettings.useMasterPasswordForBackup &&
           typeof settings.encryptedSecretsForBackup === 'string';
 
-        console.log('[AutoBackup] ========== 自动备份检查 ==========');
-        console.log('[AutoBackup] 自动备份已启用:', settings.enableAutoBackup);
-        console.log('[AutoBackup] 加密设置 - enableBackupEncryption:', encryptionSettings.enableBackupEncryption);
-        console.log('[AutoBackup] 加密设置 - useMasterPasswordForBackup:', encryptionSettings.useMasterPasswordForBackup);
-        console.log('[AutoBackup] encryptedSecrets 存在:', typeof settings.encryptedSecrets === 'string');
-        console.log('[AutoBackup] encryptedSecretsForBackup 存在:', typeof settings.encryptedSecretsForBackup === 'string');
-        console.log('[AutoBackup] sessionKey 存在:', !!sessionKey);
-        console.log('[AutoBackup] isMasterPasswordFastPath:', isMasterPasswordFastPath);
-        console.log('[AutoBackup] isCustomPasswordFastPath:', isCustomPasswordFastPath);
-        console.log('[AutoBackup] =========================================');
 
         // 快速路径：复用已加密的数据，不需要sessionKey，即使会话过期也能备份
         if (isMasterPasswordFastPath) {
-          console.log('[AutoBackup] 使用主密码快速路径');
           backupCount = getStoredSecretCount(settings);
           backupData = await createMasterPasswordEncryptedBackup(
             settings.encryptedSecrets!,
             backupCount
           );
         } else if (isCustomPasswordFastPath) {
-          console.log('[AutoBackup] 使用自定义密码快速路径');
           backupCount = getStoredSecretCount(settings);
           backupData = await createCustomPasswordEncryptedBackup(
             settings.encryptedSecretsForBackup!,
@@ -1251,10 +1397,7 @@ export default defineBackground(() => {
   // 扩展启动时检查备份
   chrome.runtime.onStartup.addListener(async () => {
     await syncAutoBackupAlarm();
-    await syncCloudPullAlarm();
-    await synchronizeCloudState().catch((error) => {
-      console.error('OpenPass: 启动时同步云端数据失败', error);
-    });
+    await runBackupCycle();
   });
 
   // 扩展更新时检查备份
@@ -1262,7 +1405,6 @@ export default defineBackground(() => {
     if (details.reason === 'install') return;
 
     await syncAutoBackupAlarm();
-    await syncCloudPullAlarm();
   });
 
   function safeSetBadge(tabId: number, text: string, color: string | null = null) {
@@ -1315,5 +1457,3 @@ export default defineBackground(() => {
     }
   }
 });
-
-

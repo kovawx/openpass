@@ -11,8 +11,17 @@ describe('parseOtpAuth', () => {
       secret: 'JBSWY3DPEHPK3PXP',
       site: 'github',
       name: 'GitHub',
-      digits: 8
+      digits: 8, type: 'totp', algorithm: 'SHA1', period: 30, counter: 0
     });
+  });
+
+  it('preserves HOTP counters and TOTP algorithms and periods', () => {
+    expect(parseOtpAuth('otpauth://hotp/Test?secret=JBSWY3DPEHPK3PXP&counter=42&algorithm=SHA256&digits=8'))
+      .toMatchObject({ type: 'hotp', counter: 42, algorithm: 'SHA256', digits: 8 });
+    expect(parseOtpAuth('otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&algorithm=SHA512&period=60'))
+      .toMatchObject({ type: 'totp', algorithm: 'SHA512', period: 60 });
+    expect(parseOtpAuth('otpauth://hotp/Test?secret=JBSWY3DPEHPK3PXP&counter=-1')).toBeNull();
+    expect(parseOtpAuth('otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&period=0')).toBeNull();
   });
 
   it('uses the label issuer when the issuer parameter is absent', () => {

@@ -8,6 +8,7 @@
     "doc": "docs"
   },
   "scripts": {
+    "postinstall": "wxt prepare",
     "dev": "wxt",
     "dev:firefox": "wxt -b firefox",
     "build": "wxt build",
@@ -20,7 +21,9 @@
     "format": "prettier --write src/",
     "test": "vitest run",
     "check": "pnpm test && pnpm compile && pnpm lint:check && pnpm build",
-    "release": "node scripts/release.mjs"
+    "release": "node scripts/release.mjs",
+    "test:cloud-worker": "node scripts/check-cloud-worker.mjs",
+    "test:cloud-settings": "node scripts/check-cloud-settings.mjs"
   },
   "repository": {
     "type": "git",
@@ -66,6 +69,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1090.0",
+    "@aws-sdk/xml-builder": "3.972.36",
     "@vueuse/core": "^14.2.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -76,5 +80,10 @@
     "radix-vue": "^1.9.17",
     "reka-ui": "^2.9.5",
     "tailwind-merge": "^3.5.0"
+  },
+  "pnpm": {
+    "patchedDependencies": {
+      "@aws-sdk/xml-builder@3.972.36": "patches/aws-sdk-xml-builder-worker.patch"
+    }
   }
 }

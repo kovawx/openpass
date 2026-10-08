@@ -16,6 +16,12 @@ export interface CloudBackupSecrets {
   secretAccessKey: string;
   sessionToken?: string;
   cloudPassword: string;
+  cloudPasswordMode?: 'master' | 'custom';
+}
+
+export function getCloudPasswordChoice(secrets: CloudBackupSecrets | null, masterPassword: string | null): 'master' | 'saved' {
+  if (!secrets) return 'master';
+  return secrets.cloudPasswordMode === 'master' && secrets.cloudPassword === masterPassword ? 'master' : 'saved';
 }
 
 export interface CloudBackupStatus {
@@ -70,6 +76,10 @@ export function normalizeCloudEndpoint(endpoint: string): string {
   }
 
   url.pathname = url.pathname.replace(/\/$/, '');
+  // AWS signing must target OSS's S3-compatible endpoint, not its native API.
+  if (/^oss-[a-z0-9-]+\.aliyuncs\.com$/.test(url.hostname)) {
+    url.hostname = `s3.${url.hostname}`;
+  }
   url.search = '';
   url.hash = '';
   return url.toString().replace(/\/$/, '');
@@ -77,6 +87,10 @@ export function normalizeCloudEndpoint(endpoint: string): string {
 
 export function normalizeCloudPrefix(prefix: string): string {
   return prefix.trim().replace(/^\/+|\/+$/g, '') || 'openpass';
+}
+
+export function isAliyunOssEndpoint(endpoint: string): boolean {
+  return /^s3\.oss-[a-z0-9-]+\.aliyuncs\.com$/.test(new URL(normalizeCloudEndpoint(endpoint)).hostname);
 }
 
 export function validateCloudBackupInput(
@@ -89,6 +103,7 @@ export function validateCloudBackupInput(
     bucket: settings.bucket.trim(),
     region: settings.region.trim() || 'us-east-1',
     prefix: normalizeCloudPrefix(settings.prefix),
+    forcePathStyle: isAliyunOssEndpoint(settings.endpoint) ? false : settings.forcePathStyle,
     retentionMaxVersions: normalizeRetention(settings.retentionMaxVersions, 30, 200),
     retentionDays: normalizeRetention(settings.retentionDays, 90, 3650)
   };
@@ -97,8 +112,12 @@ export function validateCloudBackupInput(
   if (secrets) {
     if (!secrets.accessKeyId?.trim()) throw new Error('Access Key ID 不能为空');
     if (!secrets.secretAccessKey?.trim()) throw new Error('Secret Access Key 不能为空');
-    if (!secrets.cloudPassword || secrets.cloudPassword.length < 8) {
-      throw new Error('云端加密密码至少需要 8 个字符');
+    if (secrets.cloudPasswordMode && !['master', 'custom'].includes(secrets.cloudPasswordMode)) {
+      throw new Error('无效的云端密码方式');
+    }
+    if (!secrets.cloudPassword || secrets.cloudPassword.length < (secrets.cloudPasswordMode === 'master' ? 6 : 8)) {
+      throw new Error(secrets.cloudPasswordMode === 'master'
+        ? '主密码至少需要 6 个字符' : '云端加密密码至少需要 8 个字符');
     }
   }
   return normalized;
@@ -107,17 +126,39 @@ export function validateCloudBackupInput(
 export async function saveCloudBackupConfiguration(
   settings: CloudBackupSettings,
   secrets: CloudBackupSecrets,
-  masterPassword: string
+  masterPassword: string,
+  passwordChoice: 'master' | 'custom' | 'saved' = secrets.cloudPasswordMode || 'custom'
 ) {
   if (!masterPassword) throw new Error('请先解锁 OpenPass');
-  const normalized = validateCloudBackupInput(settings, secrets);
-  const encryptedSecrets = await CryptoUtils.encrypt(JSON.stringify(secrets), masterPassword);
+  const resolvedSecrets: CloudBackupSecrets = {
+    ...secrets,
+    cloudPasswordMode: passwordChoice === 'saved' ? secrets.cloudPasswordMode || 'custom' : passwordChoice,
+    // Capture once: rotating the local master password must not strand remote history.
+    cloudPassword: passwordChoice === 'master' ? masterPassword : secrets.cloudPassword
+  };
+  const normalized = validateCloudBackupInput(settings, resolvedSecrets);
+  const stored = await chrome.storage.local.get(['encryptedCloudBackupSecrets']);
+  const previousSettings = await loadCloudBackupSettings();
+  const sameLocation = Boolean(stored.encryptedCloudBackupSecrets) &&
+    normalizeCloudEndpoint(previousSettings.endpoint) === normalized.endpoint &&
+    previousSettings.bucket === normalized.bucket && previousSettings.prefix === normalized.prefix;
+  if (stored.encryptedCloudBackupSecrets) {
+    const previousSecrets = await loadCloudBackupSecrets(masterPassword);
+    if (
+      previousSecrets.cloudPassword !== resolvedSecrets.cloudPassword &&
+      sameLocation
+    ) {
+      throw new Error('此云端位置已保存另一加密密码。请沿用已保存密码，或更换对象前缀建立新备份。');
+    }
+  }
+  const encryptedSecrets = await CryptoUtils.encrypt(JSON.stringify(resolvedSecrets), masterPassword);
+  const previousStatus = sameLocation ? await loadCloudBackupStatus() : DEFAULT_CLOUD_BACKUP_STATUS;
   await chrome.storage.local.set({
     cloudBackupSettings: normalized,
     encryptedCloudBackupSecrets: encryptedSecrets,
     cloudBackupStatus: {
-      ...DEFAULT_CLOUD_BACKUP_STATUS,
-      state: normalized.enabled ? 'idle' : 'disabled'
+      ...previousStatus,
+      state: !normalized.enabled ? 'disabled' : previousStatus.state === 'disabled' ? 'idle' : previousStatus.state
     } satisfies CloudBackupStatus
   });
   return normalized;
@@ -154,7 +195,8 @@ export async function loadCloudBackupSecrets(masterPassword: string): Promise<Cl
       accessKeyId: parsed.accessKeyId,
       secretAccessKey: parsed.secretAccessKey,
       sessionToken: parsed.sessionToken || undefined,
-      cloudPassword: parsed.cloudPassword
+      cloudPassword: parsed.cloudPassword,
+      cloudPasswordMode: parsed.cloudPasswordMode === 'master' ? 'master' : 'custom'
     };
   } catch {
     throw new Error('无法解密云端凭据，请重新保存配置');
@@ -163,4 +205,19 @@ export async function loadCloudBackupSecrets(masterPassword: string): Promise<Cl
 
 export function getCloudEndpointOriginPattern(endpoint: string): string {
   return `${new URL(normalizeCloudEndpoint(endpoint)).origin}/*`;
+}
+
+export function getCloudEndpointOriginPatterns(settings: CloudBackupSettings): string[] {
+  const normalized = validateCloudBackupInput(settings);
+  const url = new URL(normalized.endpoint);
+  const origins = [getCloudEndpointOriginPattern(normalized.endpoint)];
+  if (!normalized.forcePathStyle) {
+    url.hostname = `${normalized.bucket}.${url.hostname}`;
+    origins.push(`${url.origin}/*`);
+    if (isAliyunOssEndpoint(normalized.endpoint)) {
+      url.hostname = url.hostname.replace(`${normalized.bucket}.s3.`, `${normalized.bucket}.`);
+      origins.push(`${url.origin}/*`);
+    }
+  }
+  return [...new Set(origins)];
 }

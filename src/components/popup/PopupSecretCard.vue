@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import type { Secret } from '@/stores/secrets';
+import type { OtpAccount as Secret } from '@/utils/vault';
 
 interface Props {
   secret: Secret;
@@ -24,9 +24,9 @@ const props = withDefaults(defineProps<Props>(), {
 });
 const emit = defineEmits<Emits>();
 
-const progress = computed(() => `${(props.remaining / 30) * 100}%`);
-const isWarning = computed(() => props.remaining <= 10);
-const isDanger = computed(() => props.remaining <= 5);
+const progress = computed(() => `${(props.remaining / (props.secret.period || 30)) * 100}%`);
+const isWarning = computed(() => props.secret.type !== 'hotp' && props.remaining <= 10);
+const isDanger = computed(() => props.secret.type !== 'hotp' && props.remaining <= 5);
 </script>
 
 <template>
@@ -94,7 +94,7 @@ const isDanger = computed(() => props.remaining <= 5);
           :class="isDanger ? 'bg-red-500' : isWarning ? 'bg-yellow-500' : 'bg-primary-600'"
           :style="{ width: progress }"
         />
-        <span class="relative z-10">{{ remaining }}s</span>
+        <span class="relative z-10">{{ secret.type === 'hotp' ? `HOTP ${secret.counter ?? 0}` : `${remaining}s` }}</span>
       </span>
     </div>
   </div>

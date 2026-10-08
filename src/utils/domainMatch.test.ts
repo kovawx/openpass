@@ -44,12 +44,62 @@ describe('site matching', () => {
     expect(getSiteMatchPriority(info, 'https://evil.example/?next=github.com')).toBe(NO_MATCH);
   });
 
-  it('filters secrets without changing their order', () => {
+  it('filters and ranks secrets without changing the stored order', () => {
     const secrets = [
       { site: 'example.com', id: 1 },
       { site: 'github.com', id: 2 },
       { site: 'accounts.github.com', id: 3 }
     ];
-    expect(matchSecrets(info.fullUrl, secrets).map(({ id }) => id)).toEqual([2, 3]);
+    expect(matchSecrets(info.fullUrl, secrets).map(({ id }) => id)).toEqual([3, 2]);
+    expect(secrets.map(({ id }) => id)).toEqual([1, 2, 3]);
+  });
+
+  it('ranks the current host ahead of a sibling site from the same main domain', () => {
+    const secrets = [
+      { site: 'https://idc.starmerx.com', id: 'idc' },
+      { site: 'jms.yt.starmerx.com', id: 'jump-server' }
+    ];
+    const url = 'https://jms.yt.starmerx.com/core/auth/login/mfa/?next=/luna/';
+    expect(matchSecrets(url, secrets).map(({ id }) => id)).toEqual(['jump-server', 'idc']);
+  });
+
+  it('normalizes a site URL with a trailing slash before ranking its domain', () => {
+    const secrets = [
+      { site: 'github.com', id: 'parent' },
+      { site: 'https://accounts.github.com/', id: 'current' }
+    ];
+    expect(matchSecrets(info.fullUrl, secrets).map(({ id }) => id)).toEqual(['current', 'parent']);
+  });
+
+  it('ranks exact URLs and more specific matching paths before the origin', () => {
+    const url = 'https://accounts.github.com/settings/security?tab=otp';
+    const secrets = [
+      { site: 'https://accounts.github.com/', id: 'origin' },
+      { site: 'https://accounts.github.com/settings', id: 'settings' },
+      { site: 'https://accounts.github.com/settings/security', id: 'security' },
+      { site: url, id: 'exact' }
+    ];
+    expect(matchSecrets(url, secrets).map(({ id }) => id)).toEqual(['exact', 'security', 'settings', 'origin']);
+    expect(getSiteMatchPriority(parseUrl('https://accounts.github.com/settings-old')!, secrets[1].site)).toBe(3);
+  });
+
+  it('ranks the closest parent before broader parent domains and sibling sites', () => {
+    const secrets = [
+      { site: 'starmerx.com', id: 'root' },
+      { site: 'idc.starmerx.com', id: 'sibling' },
+      { site: 'yt.starmerx.com', id: 'parent' }
+    ];
+    expect(matchSecrets('https://jms.yt.starmerx.com/', secrets).map(({ id }) => id)).toEqual(['parent', 'root', 'sibling']);
+  });
+
+  it('preserves the original order and objects for equally matching secrets', () => {
+    const secrets = [
+      { site: 'accounts.github.com', id: 'first' },
+      { site: 'accounts.github.com', id: 'second' }
+    ];
+    const matched = matchSecrets(info.fullUrl, secrets);
+    expect(matched).toEqual(secrets);
+    expect(matched).not.toBe(secrets);
+    expect(matched[0]).toBe(secrets[0]);
   });
 });

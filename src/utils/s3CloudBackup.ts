@@ -18,10 +18,15 @@ import { unwrapCloudBackup, wrapBackupForCloud } from './cloudBackup';
 import {
   loadCloudBackupSecrets,
   loadCloudBackupSettings,
+  getCloudEndpointOriginPatterns,
+  validateCloudBackupInput,
+  isAliyunOssEndpoint,
   type CloudBackupSecrets,
   type CloudBackupSettings,
   type CloudBackupStatus
 } from './cloudBackupSettings';
+
+import { readOssIndex, requestOss, appendOssIndex, getOssIndexKey, ossCursor, parseOssCursor } from './ossCloudIndex';
 
 const CONTENT_TYPE = 'application/vnd.openpass.cloud-backup+json';
 
@@ -30,6 +35,7 @@ export interface CloudBackupVersion {
   lastModified: string | null;
   size: number;
   etag: string | null;
+  current?: boolean;
 }
 
 function objectKey(settings: CloudBackupSettings, suffix: string) {
@@ -58,6 +64,8 @@ function createClient(settings: CloudBackupSettings, secrets: CloudBackupSecrets
     endpoint: settings.endpoint,
     region: settings.region,
     forcePathStyle: settings.forcePathStyle,
+    requestChecksumCalculation: 'WHEN_REQUIRED',
+    responseChecksumValidation: 'WHEN_REQUIRED',
     credentials: {
       accessKeyId: secrets.accessKeyId,
       secretAccessKey: secrets.secretAccessKey,
@@ -74,6 +82,7 @@ function getHttpStatus(error: unknown) {
 }
 
 function isNotFound(error: unknown) {
+  if (error instanceof Error && error.name === 'NoSuchBucket') return false;
   return getHttpStatus(error) === 404 ||
     (error instanceof Error && (error.name === 'NotFound' || error.name === 'NoSuchKey'));
 }
@@ -81,7 +90,7 @@ function isNotFound(error: unknown) {
 export function isCloudBackupConflict(error: unknown) {
   return getHttpStatus(error) === 412 ||
     (error instanceof Error &&
-      (error.name === 'PreconditionFailed' || error.name === 'CloudBackupConflict'));
+      (error.name === 'PreconditionFailed' || error.name === 'PositionNotEqualToLength' || error.name === 'CloudBackupConflict'));
 }
 
 async function updateStatus(status: Partial<CloudBackupStatus>) {
@@ -104,13 +113,19 @@ async function updateStatus(status: Partial<CloudBackupStatus>) {
   });
 }
 
-async function resolveRuntime(masterPassword: string) {
+async function resolveRuntime(masterPassword: string, allowDisabled = false) {
   const [settings, secrets] = await Promise.all([
     loadCloudBackupSettings(),
     loadCloudBackupSecrets(masterPassword)
   ]);
-  if (!settings.enabled) throw new Error('云端备份未启用');
-  return { settings, secrets, client: createClient(settings, secrets) };
+  if (!settings.enabled && !allowDisabled) throw new Error('云端备份未启用');
+  const normalized = validateCloudBackupInput(settings);
+  if (chrome.permissions?.contains && !await chrome.permissions.contains({
+    origins: getCloudEndpointOriginPatterns(normalized)
+  })) {
+    throw new Error('云端地址尚未获得访问权限，请在设置页保存配置或重新测试连接以授权');
+  }
+  return { settings: normalized, secrets, client: createClient(normalized, secrets) };
 }
 
 async function prepareBackupForCloud<T extends BackupSecretLike>(
@@ -120,8 +135,12 @@ async function prepareBackupForCloud<T extends BackupSecretLike>(
   if (!backupData.encrypted) return backupData;
   const encryptionSettings = await getBackupEncryptionSettings();
   const backupPassword = await resolveStoredBackupPassword(masterPassword, encryptionSettings);
-  if (!backupPassword) throw new Error('无法解密本地备份，请检查备份密码');
-  const secrets = await decryptBackupData(backupData, backupPassword);
+  let secrets: T[];
+  try { secrets = await decryptBackupData(backupData, backupPassword || masterPassword); }
+  catch (error) {
+    if (!backupPassword || backupPassword === masterPassword) throw error;
+    secrets = await decryptBackupData(backupData, masterPassword);
+  }
   return {
     ...backupData,
     encrypted: false,
@@ -152,11 +171,13 @@ export async function testS3CloudBackupConnection(masterPassword: string) {
   const { settings, client } = await resolveRuntime(masterPassword);
   const latestKey = getCloudBackupObjectKeys(settings, 'probe').latest;
   try {
-    const result = await client.send(new HeadObjectCommand({ Bucket: settings.bucket, Key: latestKey }));
-    return { success: true, exists: true, etag: result.ETag ?? null };
-  } catch (error) {
-    if (isNotFound(error)) return { success: true, exists: false, etag: null };
-    throw error;
+    // Listing distinguishes an empty bucket from a missing bucket or denied access.
+    const result = await client.send(new ListObjectsV2Command({
+      Bucket: settings.bucket, Prefix: isAliyunOssEndpoint(settings.endpoint) ? `${settings.prefix}/v1/latest.` : latestKey, MaxKeys: 2
+    }));
+    const latest = result.Contents?.find((object) => object.Key === getOssIndexKey(settings))
+      || result.Contents?.find((object) => object.Key === latestKey);
+    return { success: true, exists: Boolean(latest), etag: latest?.ETag ?? null };
   } finally {
     client.destroy();
   }
@@ -165,10 +186,11 @@ export async function testS3CloudBackupConnection(masterPassword: string) {
 export async function uploadBackupToS3<T extends BackupSecretLike>(
   backupData: BackupData<T>,
   masterPassword: string,
-  expectedLatestETag?: string | null
+  expectedLatestETag?: string | null,
+  allowDisabled = false
 ) {
-  const { settings, secrets, client } = await resolveRuntime(masterPassword);
-  const snapshotId = crypto.randomUUID();
+  const { settings, secrets, client } = await resolveRuntime(masterPassword, allowDisabled);
+  const snapshotId = globalThis.crypto.randomUUID();
   const keys = getCloudBackupObjectKeys(settings, snapshotId);
 
   await updateStatus({ state: 'syncing', message: '正在上传云端备份' });
@@ -176,16 +198,22 @@ export async function uploadBackupToS3<T extends BackupSecretLike>(
     const cloudBackupData = await prepareBackupForCloud(backupData, masterPassword);
     const envelope = await wrapBackupForCloud(cloudBackupData, secrets.cloudPassword);
     const body = JSON.stringify(envelope);
-    await client.send(new PutObjectCommand({
-      Bucket: settings.bucket,
-      Key: keys.snapshot,
-      Body: body,
-      ContentType: CONTENT_TYPE,
-      IfNoneMatch: '*'
-    }));
+    const oss = isAliyunOssEndpoint(settings.endpoint);
+    if (oss) {
+      await requestOss(settings, secrets, 'PUT', keys.snapshot, {
+        body, headers: { 'content-type': CONTENT_TYPE, 'x-oss-forbid-overwrite': 'true' }
+      });
+    } else {
+      await client.send(new PutObjectCommand({
+        Bucket: settings.bucket, Key: keys.snapshot, Body: body,
+        ContentType: CONTENT_TYPE, IfNoneMatch: '*'
+      }));
+    }
 
     let currentETag = expectedLatestETag;
-    if (expectedLatestETag === undefined) {
+    if (oss && expectedLatestETag === undefined) {
+      currentETag = ossCursor((await readOssIndex(settings, secrets)).position);
+    } else if (!oss && expectedLatestETag === undefined) {
       try {
         const head = await client.send(new HeadObjectCommand({
           Bucket: settings.bucket,
@@ -200,18 +228,17 @@ export async function uploadBackupToS3<T extends BackupSecretLike>(
 
     let latestResult;
     try {
-      latestResult = await client.send(new PutObjectCommand({
-        Bucket: settings.bucket,
-        Key: keys.latest,
-        Body: body,
-        ContentType: CONTENT_TYPE,
-        ...(currentETag ? { IfMatch: currentETag } : { IfNoneMatch: '*' })
-      }));
+      latestResult = oss
+        ? { ETag: await appendOssIndex(settings, secrets, keys.snapshot, parseOssCursor(currentETag ?? null)) }
+        : await client.send(new PutObjectCommand({
+          Bucket: settings.bucket, Key: keys.latest, Body: body, ContentType: CONTENT_TYPE,
+          ...(currentETag ? { IfMatch: currentETag } : { IfNoneMatch: '*' })
+        }));
     } catch (error) {
       if (isCloudBackupConflict(error)) {
         await updateStatus({
           state: 'conflict',
-          message: '其他设备已更新 latest；本次不可变备份已保留，未覆盖远端最新备份',
+          message: '其他设备已更新云端版本；本次不可变备份已保留，未覆盖远端最新备份',
           latestSnapshotKey: keys.snapshot
         });
         const conflictError = new Error('云端最新备份发生并发冲突，本次历史备份已安全保留');
@@ -229,7 +256,7 @@ export async function uploadBackupToS3<T extends BackupSecretLike>(
       latestETag: latestResult.ETag ?? null,
       latestSnapshotKey: keys.snapshot
     });
-    return { snapshotKey: keys.snapshot, latestKey: keys.latest, etag: latestResult.ETag ?? null };
+    return { snapshotKey: keys.snapshot, latestKey: oss ? getOssIndexKey(settings) : keys.latest, etag: latestResult.ETag ?? null };
   } catch (error) {
     if (!isCloudBackupConflict(error)) {
       await updateStatus({
@@ -246,7 +273,7 @@ export async function uploadBackupToS3<T extends BackupSecretLike>(
 export async function downloadLatestBackupFromS3<T extends BackupSecretLike>(
   masterPassword: string
 ): Promise<BackupData<T>> {
-  return (await downloadLatestBackupStateFromS3<T>(masterPassword)).backupData;
+  return (await downloadLatestBackupStateFromS3<T>(masterPassword, true)).backupData;
 }
 
 async function listVersionObjects(
@@ -292,11 +319,27 @@ function assertHistoryKey(settings: CloudBackupSettings, key: string) {
 }
 
 export async function downloadLatestBackupStateFromS3<T extends BackupSecretLike>(
-  masterPassword: string
+  masterPassword: string,
+  allowDisabled = false
 ): Promise<{ backupData: BackupData<T>; etag: string | null }> {
-  const { settings, secrets, client } = await resolveRuntime(masterPassword);
+  const { settings, secrets, client } = await resolveRuntime(masterPassword, allowDisabled);
   const latestKey = getCloudBackupObjectKeys(settings, 'restore').latest;
   try {
+    if (isAliyunOssEndpoint(settings.endpoint)) {
+      const index = await readOssIndex(settings, secrets);
+      if (index.key) {
+        try {
+          const result = await client.send(new GetObjectCommand({ Bucket: settings.bucket, Key: index.key }));
+          return { backupData: await unwrapCloudBackup<T>(JSON.parse(await readBodyAsText(result.Body)), secrets.cloudPassword), etag: ossCursor(index.position) };
+        } catch (error) {
+          if (isNotFound(error)) throw new Error('OSS 最新已提交备份缺失，已停止同步以保护本地数据', { cause: error });
+          throw error;
+        }
+      }
+      // Existing S3-format latest remains readable until the first index commit.
+      const result = await client.send(new GetObjectCommand({ Bucket: settings.bucket, Key: latestKey }));
+      return { backupData: await unwrapCloudBackup<T>(JSON.parse(await readBodyAsText(result.Body)), secrets.cloudPassword), etag: ossCursor(0) };
+    }
     const result = await client.send(new GetObjectCommand({
       Bucket: settings.bucket,
       Key: latestKey
@@ -321,19 +364,53 @@ export async function downloadLatestBackupStateFromS3<T extends BackupSecretLike
 export async function listCloudBackupVersions(
   masterPassword: string
 ): Promise<CloudBackupVersion[]> {
-  const { settings, client } = await resolveRuntime(masterPassword);
+  const { settings, secrets, client } = await resolveRuntime(masterPassword, true);
   try {
-    return await listVersionObjects(client, settings);
+    const versions = await listVersionObjects(client, settings);
+    const current = isAliyunOssEndpoint(settings.endpoint)
+      ? (await readOssIndex(settings, secrets)).key : versions[0]?.key;
+    return versions.map(version => ({ ...version, current: version.key === current }));
   } finally {
     client.destroy();
   }
+}
+
+/** Only explicit history keys may be deleted; never delete latest or the OSS index. */
+export async function deleteCloudBackupVersions(keys: string[], masterPassword: string, beforeDelete?: () => Promise<void>) {
+  const { settings, secrets, client } = await resolveRuntime(masterPassword, true);
+  try {
+    const uniqueKeys = [...new Set(keys)];
+    uniqueKeys.forEach(key => assertHistoryKey(settings, key));
+    const versions = await listVersionObjects(client, settings);
+    const current = isAliyunOssEndpoint(settings.endpoint)
+      ? (await readOssIndex(settings, secrets)).key : versions[0]?.key;
+    if (uniqueKeys.includes(current || '')) throw new Error('当前同步版本不能删除，请先生成新的同步版本');
+    const existing = new Set(versions.map(version => version.key));
+    const failed: Array<{ key: string; error: string }> = [];
+    let deleted = 0;
+    for (const key of uniqueKeys) {
+      if (!existing.has(key)) continue;
+      try { await beforeDelete?.(); }
+      catch (error) { failed.push({ key, error: error instanceof Error ? error.message : '清理权限已变更' }); break; }
+      try {
+        if (isAliyunOssEndpoint(settings.endpoint)) await requestOss(settings, secrets, 'DELETE', key);
+        else {
+          const result = await client.send(new DeleteObjectsCommand({ Bucket: settings.bucket,
+            Delete: { Quiet: true, Objects: [{ Key: key }] } }));
+          if (result.Errors?.length) throw new Error(result.Errors[0].Message || '删除云端历史失败');
+        }
+        deleted++;
+      } catch (error) { failed.push({ key, error: error instanceof Error ? error.message : '删除失败' }); }
+    }
+    return { deleted, failed };
+  } finally { client.destroy(); }
 }
 
 export async function downloadCloudBackupVersion<T extends BackupSecretLike>(
   key: string,
   masterPassword: string
 ): Promise<BackupData<T>> {
-  const { settings, secrets, client } = await resolveRuntime(masterPassword);
+  const { settings, secrets, client } = await resolveRuntime(masterPassword, true);
   try {
     assertHistoryKey(settings, key);
     const result = await client.send(new GetObjectCommand({
@@ -355,12 +432,15 @@ export async function applyCloudBackupRetention(
   try {
     const runtime = await resolveRuntime(masterPassword);
     client = runtime.client;
-    const { settings } = runtime;
+    const { settings, secrets } = runtime;
+    const ossIndex = isAliyunOssEndpoint(settings.endpoint) ? await readOssIndex(settings, secrets) : null;
     const versions = await listVersionObjects(client, settings);
-    const protectedKeys = new Set([protectedKey, versions[0]?.key].filter(Boolean));
+    const protectedKeys = new Set([protectedKey, versions[0]?.key, ossIndex?.key].filter(Boolean));
     const cutoff = Date.now() - settings.retentionDays * 24 * 60 * 60 * 1000;
     const candidates = versions.filter((version, index) => {
       if (protectedKeys.has(version.key)) return false;
+      // An uncommitted upload may still be waiting to append at the observed position.
+      if (ossIndex && !ossIndex.committedKeys.has(version.key)) return false;
       const expired = version.lastModified
         ? Date.parse(version.lastModified) < cutoff
         : false;
@@ -369,12 +449,12 @@ export async function applyCloudBackupRetention(
 
     for (let index = 0; index < candidates.length; index += 1000) {
       const chunk = candidates.slice(index, index + 1000);
-      const result = await client.send(new DeleteObjectsCommand({
+      const result = ossIndex ? await (async () => {
+        for (const version of chunk) await requestOss(settings, secrets, 'DELETE', version.key);
+        return { Errors: [] };
+      })() : await client.send(new DeleteObjectsCommand({
         Bucket: settings.bucket,
-        Delete: {
-          Quiet: true,
-          Objects: chunk.map((version) => ({ Key: version.key }))
-        }
+        Delete: { Quiet: true, Objects: chunk.map((version) => ({ Key: version.key })) }
       }));
       if (result.Errors?.length) {
         throw new Error(`有 ${result.Errors.length} 个历史版本清理失败`);

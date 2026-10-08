@@ -104,11 +104,14 @@ async function handleStorageChange(
   changes: Record<string, chrome.storage.StorageChange>,
   areaName: chrome.storage.AreaName
 ) {
-  if (areaName !== 'local') {
+  if (areaName !== 'local' && areaName !== 'session') {
     return;
   }
 
-  if (!changes.secrets && !changes.encryptedSecrets) {
+  if (changes.sessionKey || changes.sessionExpiresAt) {
+    if (!await ensureAuthenticated()) { secretStore.secrets = []; return; }
+  }
+  if (!changes.encryptedSecrets) {
     return;
   }
 
@@ -148,7 +151,7 @@ const shortcuts = useKeyboardShortcuts({
     const selectedSecret = getSelectedSecret();
     if (currentPage.value === 'secrets' && selectedSecret) {
       const { TOTP } = await import('@/utils/totp');
-      const result = await TOTP.generateCode(selectedSecret.secret, selectedSecret.digits || 6);
+      const result = await TOTP.generateCode(selectedSecret, 6, {}, true);
       await TOTP.copyToClipboard(result.code);
       showToast('验证码已复制', 'success');
     }
@@ -184,7 +187,7 @@ onMounted(async () => {
   await authStore.updateActivity();
 
   // 检查是否需要显示欢迎引导
-  const result = await chrome.storage.local.get(['isSetupComplete', 'welcomeCompleted', 'secrets']);
+  const result = await chrome.storage.local.get(['isSetupComplete', 'welcomeCompleted']);
   if (!result.isSetupComplete || !result.welcomeCompleted) {
     showWelcome.value = true;
   }
@@ -320,8 +323,8 @@ watch(
 
     <!-- 欢迎引导 -->
     <WelcomeGuide
-      :key="welcomeGuideKey"
       v-if="showWelcome"
+      :key="welcomeGuideKey"
       @close="handleWelcomeClose"
       @navigate="handleWelcomeNavigate"
     />

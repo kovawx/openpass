@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { ref } from 'vue';
 import CryptoUtils from '@/utils/crypto';
+import { getValidSessionKey, clearSessionStorage, SESSION_TIMEOUT } from '@/utils/session';
 
 export interface SessionData {
   sessionKey: string | null;
@@ -15,9 +16,9 @@ export const useAuthStore = defineStore('auth', () => {
   const authLockedUntil = ref<number | null>(null);
 
   const MAX_ATTEMPTS = 5;
-  const SESSION_TIMEOUT = 15 * 60 * 1000; // 15 minutes
   const LOCK_DURATION = 5 * 60 * 1000; // 5 minutes
   let unlockTimer: ReturnType<typeof setTimeout> | null = null;
+  let sessionTimer: ReturnType<typeof setTimeout> | null = null;
 
   function clearUnlockTimer() {
     if (unlockTimer) {
@@ -55,27 +56,20 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   function applySession(nextSessionKey: string | null, nextExpiresAt: number | null) {
+    if (sessionTimer) clearTimeout(sessionTimer);
+    sessionTimer = nextSessionKey && nextExpiresAt
+      ? setTimeout(() => { void checkSession(); }, Math.max(0, nextExpiresAt - Date.now()))
+      : null;
     sessionKey.value = nextSessionKey;
     expiresAt.value = nextExpiresAt;
     isAuthenticated.value = !!nextSessionKey && !!nextExpiresAt;
   }
 
   async function checkSession(): Promise<boolean> {
+    const key = await getValidSessionKey();
     const result = await chrome.storage.local.get<{ sessionExpiresAt?: number }>(['sessionExpiresAt']);
-    const sessionResult = await chrome.storage.session.get<{ sessionKey?: string }>(['sessionKey']);
-
-    if (typeof result.sessionExpiresAt === 'number' && Date.now() > result.sessionExpiresAt) {
-      await clearSession();
-      return false;
-    }
-
-    if (typeof sessionResult.sessionKey === 'string' && typeof result.sessionExpiresAt === 'number') {
-      applySession(sessionResult.sessionKey, result.sessionExpiresAt);
-      return true;
-    }
-
-    applySession(null, null);
-    return false;
+    applySession(key, key ? result.sessionExpiresAt ?? null : null);
+    return !!key;
   }
 
   async function init() {
@@ -124,6 +118,10 @@ export const useAuthStore = defineStore('auth', () => {
     );
 
     if (isValid) {
+      if (!result.masterPasswordHash.startsWith('pbkdf2-sha256$')) {
+        const upgraded = await CryptoUtils.createMasterPasswordHash(password);
+        await chrome.storage.local.set({ masterPasswordHash: upgraded.hash, masterPasswordSalt: upgraded.salt });
+      }
       await createSession(password);
       await clearAuthLock();
       return true;
@@ -144,6 +142,8 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function createSession(password: string) {
+    const migration = await chrome.runtime.sendMessage({ action: 'migrateVaultForUnlock', password });
+    if (migration?.error || !migration?.success) throw new Error(migration?.error || '解锁迁移失败');
     const nextExpiresAt = Date.now() + SESSION_TIMEOUT;
 
     await chrome.storage.session.set({ sessionKey: password });
@@ -152,10 +152,7 @@ export const useAuthStore = defineStore('auth', () => {
 
     // 通知 background 缓存 sessionKey（用于自动备份）
     try {
-      chrome.runtime.sendMessage({
-        action: 'cacheSessionKey',
-        sessionKey: password
-      });
+      await chrome.runtime.sendMessage({ action: 'sessionChanged' });
     } catch (error) {
       console.warn('Failed to cache session key in background:', error);
     }
@@ -164,19 +161,18 @@ export const useAuthStore = defineStore('auth', () => {
   async function clearSession() {
     applySession(null, null);
 
-    await chrome.storage.session.remove(['sessionKey']);
-    await chrome.storage.local.remove(['sessionExpiresAt']);
+    await clearSessionStorage();
 
     // 通知 background 清除缓存的 sessionKey
     try {
-      chrome.runtime.sendMessage({ action: 'cacheSessionKey', sessionKey: null });
+      await chrome.runtime.sendMessage({ action: 'sessionChanged' });
     } catch {
       // Ignore errors
     }
   }
 
   async function updateActivity() {
-    if (sessionKey.value) {
+    if (await checkSession()) {
       const nextExpiresAt = Date.now() + SESSION_TIMEOUT;
       applySession(sessionKey.value, nextExpiresAt);
       await chrome.storage.local.set({ sessionExpiresAt: nextExpiresAt });

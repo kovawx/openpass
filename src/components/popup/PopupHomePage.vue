@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue';
-import { getSiteMatchPriority, NO_MATCH, parseUrl } from '@/utils/domainMatch';
-import type { Secret } from '@/stores/secrets';
+import { matchSecrets } from '@/utils/domainMatch';
+import type { OtpAccount as Secret } from '@/utils/vault';
 import PopupSecretCard from './PopupSecretCard.vue';
 
 interface CodeEntry {
@@ -31,14 +31,7 @@ const searchQuery = ref('');
 
 const currentSiteMatches = computed(() => {
   if (!props.currentUrl || !Array.isArray(props.secrets)) return [];
-  const urlInfo = parseUrl(props.currentUrl);
-  if (!urlInfo) return [];
-
-  return props.secrets
-    .map(secret => ({ secret, priority: getSiteMatchPriority(urlInfo, secret.site) }))
-    .filter(item => item.priority !== NO_MATCH)
-    .sort((a, b) => a.priority - b.priority)
-    .map(item => item.secret);
+  return matchSecrets(props.currentUrl, props.secrets);
 });
 
 const searchResults = computed(() => {
@@ -61,7 +54,7 @@ function getCode(secretId: string): string {
 }
 
 function getRemaining(secretId: string): number {
-  return props.codeData.get(secretId)?.remainingSeconds || 30;
+  return props.codeData.get(secretId)?.remainingSeconds ?? 0;
 }
 </script>
 

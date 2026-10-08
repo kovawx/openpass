@@ -29,7 +29,7 @@ class CryptoUtils {
     const passwordBuffer = encoder.encode(password);
     const normalizedSalt = this.normalizeBytes(salt);
 
-    const baseKey = await crypto.subtle.importKey(
+    const baseKey = await globalThis.crypto.subtle.importKey(
       'raw',
       passwordBuffer,
       'PBKDF2',
@@ -37,7 +37,7 @@ class CryptoUtils {
       ['deriveKey']
     );
 
-    return crypto.subtle.deriveKey(
+    return globalThis.crypto.subtle.deriveKey(
       {
         name: 'PBKDF2',
         salt: normalizedSalt,
@@ -58,12 +58,12 @@ class CryptoUtils {
     const encoder = new TextEncoder();
     const data = encoder.encode(plaintext);
 
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const salt = globalThis.crypto.getRandomValues(new Uint8Array(16));
+    const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
 
     const key = await this.deriveKey(password, salt);
 
-    const encrypted = await crypto.subtle.encrypt(
+    const encrypted = await globalThis.crypto.subtle.encrypt(
       { name: 'AES-GCM', iv: iv },
       key,
       data
@@ -90,7 +90,7 @@ class CryptoUtils {
 
     const key = await this.deriveKey(password, salt);
 
-    const decrypted = await crypto.subtle.decrypt(
+    const decrypted = await globalThis.crypto.subtle.decrypt(
       { name: 'AES-GCM', iv: iv },
       key,
       encrypted
@@ -106,7 +106,7 @@ class CryptoUtils {
     const encoder = new TextEncoder();
     const data = encoder.encode(password + this.arrayBufferToBase64(this.toArrayBuffer(salt.buffer)));
 
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashBuffer = await globalThis.crypto.subtle.digest('SHA-256', data);
     return this.arrayBufferToBase64(hashBuffer);
   }
 
@@ -114,7 +114,7 @@ class CryptoUtils {
    * 生成随机 salt
    */
   static generateSalt(): string {
-    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const salt = globalThis.crypto.getRandomValues(new Uint8Array(16));
     return this.arrayBufferToBase64(salt.buffer);
   }
 
@@ -127,8 +127,20 @@ class CryptoUtils {
     salt: string
   ): Promise<boolean> {
     const saltBuffer = this.base64ToArrayBuffer(salt);
-    const hash = await this.hashPassword(password, new Uint8Array(saltBuffer));
+    const hash = storedHash.startsWith('pbkdf2-sha256$')
+      ? await this.derivePasswordVerifier(password, new Uint8Array(saltBuffer))
+      : await this.hashPassword(password, new Uint8Array(saltBuffer));
     return hash === storedHash;
+  }
+
+  static async derivePasswordVerifier(password: string, salt: Uint8Array) {
+    const key = await globalThis.crypto.subtle.importKey(
+      'raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']
+    );
+    const hash = await globalThis.crypto.subtle.deriveBits({
+      name: 'PBKDF2', hash: 'SHA-256', iterations: 600000, salt: this.normalizeBytes(salt)
+    }, key, 256);
+    return `pbkdf2-sha256$600000$${this.arrayBufferToBase64(hash)}`;
   }
 
   /**
@@ -137,7 +149,7 @@ class CryptoUtils {
   static async createMasterPasswordHash(password: string) {
     const salt = this.generateSalt();
     const saltBuffer = this.base64ToArrayBuffer(salt);
-    const hash = await this.hashPassword(password, new Uint8Array(saltBuffer));
+    const hash = await this.derivePasswordVerifier(password, new Uint8Array(saltBuffer));
     return { hash, salt };
   }
 

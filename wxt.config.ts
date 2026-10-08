@@ -4,6 +4,12 @@ import UnoCSS from 'unocss/vite';
 export default defineConfig({
   srcDir: 'src',
   manifestVersion: 3,
+  imports: {
+    dirsScanOptions: {
+      // 默认导出会按文件名注册为 crypto，不能遮蔽浏览器 Web Crypto API。
+      fileFilter: (file) => !file.replaceAll('\\', '/').endsWith('/utils/crypto.ts')
+    }
+  },
   vite: () => ({
     plugins: [UnoCSS()]
   }),

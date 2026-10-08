@@ -1,9 +1,12 @@
 import { installGlobalRuntimeErrorListeners } from '@/utils/runtimeErrors';
-import { isSiteMatched, parseUrl } from '@/utils/domainMatch';
+import { matchSecrets } from '@/utils/domainMatch';
 import { isOtpInput, isOtpSplitGroup, isPotentialSplitOtpInput } from '@/utils/otpInput';
 
 interface ContentSecret {
-  secret: string;
+  id?: string;
+  type?: 'totp' | 'hotp';
+  period?: number;
+  secret?: string;
   site: string;
   name?: string;
   digits?: number;
@@ -90,17 +93,14 @@ export default defineContentScript({
     }
 
     function getMatchingSecrets(): ContentSecret[] {
-      const urlInfo = parseUrl(currentUrl);
-      if (!urlInfo) {
-        return [];
-      }
-      return currentSecrets.filter((secret) => isSiteMatched(urlInfo, secret.site));
+      return matchSecrets(currentUrl, currentSecrets);
     }
 
     async function fetchSecrets() {
       try {
-        const result = await chrome.storage.local.get<{ secrets?: ContentSecret[] }>(['secrets']);
-        currentSecrets = Array.isArray(result.secrets) ? result.secrets : [];
+        const result = await chrome.runtime.sendMessage({ action: 'getSecrets' });
+        currentSecrets = Array.isArray(result?.secrets) ? result.secrets : [];
+        if (!currentSecrets.length) { closeSelector(); removeAllButtons(); }
         updateAllButtons();
       } catch (error) {
         if ((error as Error).message?.includes('Extension context invalidated')) {
@@ -135,7 +135,7 @@ export default defineContentScript({
 
       currentUrl = window.location.href;
       removeAllButtons();
-      detectInputs();
+      void fetchSecrets().then(detectInputs).catch(console.error);
     }
 
     function startDetection() {
@@ -215,13 +215,13 @@ export default defineContentScript({
         button.style.top = `${candidate.rect.y * 100}%`;
         button.style.width = `${candidate.rect.width * 100}%`;
         button.style.height = `${candidate.rect.height * 100}%`;
-        button.title = candidate.secret.name || candidate.secret.site || 'TOTP 账户';
+        button.title = candidate.secret.name || candidate.secret.site || 'OTP 账户';
         button.addEventListener('click', () => {
           closeQrOverlay();
           void chrome.runtime.sendMessage({
             action: 'selectQrCandidate',
             secret: candidate.secret
-          });
+          }).catch((error) => showToast((error as Error).message, 'error'));
         });
         overlay.appendChild(button);
       }
@@ -280,7 +280,7 @@ export default defineContentScript({
             width: width / window.innerWidth,
             height: height / window.innerHeight
           }
-        });
+        }).catch((error) => showToast((error as Error).message, 'error'));
       });
     }
 
@@ -482,6 +482,7 @@ export default defineContentScript({
         if (chrome.runtime.lastError) {
           throw new Error(chrome.runtime.lastError.message);
         }
+        if (response?.error) throw new Error(response.error);
 
         return response as GenerateCodeResponse;
       } catch (error) {
@@ -545,6 +546,7 @@ export default defineContentScript({
         let needRefresh = false;
 
         countdownElements.forEach((element) => {
+          if (element.dataset.type === 'hotp') return;
           let remaining = Number.parseInt(element.dataset.remaining || '0', 10) - 1;
           if (remaining <= 0) {
             remaining = 0;
@@ -565,11 +567,11 @@ export default defineContentScript({
 
         const codeValues = selector.querySelectorAll<HTMLElement>('.openpass-code-value');
         for (let index = 0; index < matches.length; index += 1) {
+          if (matches[index].type === 'hotp') continue;
           try {
             const response = await safeSendMessage({
               action: 'generateCode',
-              secret: matches[index].secret,
-              digits: matches[index].digits
+              id: matches[index].id
             });
 
             if (!response) {
@@ -601,9 +603,8 @@ export default defineContentScript({
     ) {
       try {
         const response = await safeSendMessage({
-          action: 'generateCode',
-          secret: secret.secret,
-          digits: secret.digits
+          action: 'consumeCode',
+          id: secret.id
         });
 
         if (!response?.code) {
@@ -651,8 +652,7 @@ export default defineContentScript({
         try {
           const response = await safeSendMessage({
             action: 'generateCode',
-            secret: secret.secret,
-            digits: secret.digits
+            id: secret.id
           });
           codesData.push(response);
         } catch {
@@ -663,18 +663,19 @@ export default defineContentScript({
       matches.forEach((secret, index) => {
         const codeData = codesData[index];
         const code = codeData?.code || '------';
-        const remaining = codeData?.remainingSeconds || 30;
-        const name = secret.name || secret.site;
+        const remaining = codeData?.remainingSeconds ?? 0;
+        const escapeHtml = (value: string) => value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]!));
+        const name = escapeHtml(secret.name || secret.site);
 
         html += `
           <div class="openpass-selector-item" data-index="${index}">
             <div class="openpass-selector-info">
               <div class="openpass-selector-name">${name}</div>
-              <div class="openpass-selector-site">${secret.site}</div>
+              <div class="openpass-selector-site">${escapeHtml(secret.site)}</div>
             </div>
             <div class="openpass-selector-code">
               <span class="openpass-code-value">${formatCode(code)}</span>
-              <span class="openpass-countdown" data-remaining="${remaining}">${remaining}s</span>
+              <span class="openpass-countdown" data-type="${secret.type || 'totp'}" data-remaining="${remaining}">${secret.type === 'hotp' ? 'HOTP' : `${remaining}s`}</span>
             </div>
           </div>
         `;
@@ -765,10 +766,12 @@ export default defineContentScript({
     }
 
     function init() {
-      void fetchSecrets();
+      void fetchSecrets().catch(console.error);
 
       chrome.runtime.onMessage.addListener((request) => {
-        if (request.action === 'showQrCandidates' && Array.isArray(request.candidates)) {
+        if (request.action === 'vaultChanged') {
+          void fetchSecrets().catch(console.error);
+        } else if (request.action === 'showQrCandidates' && Array.isArray(request.candidates)) {
           showQrCandidates(request.candidates as QrScanCandidate[]);
         } else if (request.action === 'startQrSelection') {
           startQrSelection(String(request.message || '请框选二维码区域'));
@@ -776,11 +779,12 @@ export default defineContentScript({
       });
 
       chrome.storage.onChanged.addListener((changes) => {
-        if (changes.secrets) {
-          void fetchSecrets();
+        if (changes.encryptedSecrets || changes.sessionExpiresAt) {
+          void fetchSecrets().catch(console.error);
         }
       });
 
+      window.setInterval(() => { void fetchSecrets().catch(console.error); }, 30000);
       observeUrlChange();
       startDetection();
     }

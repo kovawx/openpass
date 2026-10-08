@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  '@aws-sdk/xml-builder@3.972.36':
+    hash: 00f2e6c543816f8ba9afab5339634c759eea81458ca8f6e28a6f496e65366abf
+    path: patches/aws-sdk-xml-builder-worker.patch
+
 importers:
 
   .:
@@ -11,6 +16,9 @@ importers:
       '@aws-sdk/client-s3':
         specifier: ^3.1090.0
         version: 3.1090.0
+      '@aws-sdk/xml-builder':
+        specifier: 3.972.36
+        version: 3.972.36(patch_hash=00f2e6c543816f8ba9afab5339634c759eea81458ca8f6e28a6f496e65366abf)
       '@vueuse/core':
         specifier: ^14.2.1
         version: 14.2.1(vue@3.5.32(typescript@6.0.2))
@@ -3638,7 +3646,7 @@ snapshots:
   '@aws-sdk/core@3.975.3':
     dependencies:
       '@aws-sdk/types': 3.974.2
-      '@aws-sdk/xml-builder': 3.972.36
+      '@aws-sdk/xml-builder': 3.972.36(patch_hash=00f2e6c543816f8ba9afab5339634c759eea81458ca8f6e28a6f496e65366abf)
       '@aws/lambda-invoke-store': 0.3.0
       '@smithy/core': 3.29.5
       '@smithy/signature-v4': 5.6.6
@@ -3771,7 +3779,7 @@ snapshots:
       '@smithy/types': 4.16.1
       tslib: 2.8.1
 
-  '@aws-sdk/xml-builder@3.972.36':
+  '@aws-sdk/xml-builder@3.972.36(patch_hash=00f2e6c543816f8ba9afab5339634c759eea81458ca8f6e28a6f496e65366abf)':
     dependencies:
       '@smithy/types': 4.16.1
       tslib: 2.8.1

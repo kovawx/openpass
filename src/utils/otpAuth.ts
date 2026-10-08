@@ -1,4 +1,6 @@
-export interface ParsedOtpAuth {
+import { normalizeOtpSettings, type OtpSettings } from './otp';
+
+export interface ParsedOtpAuth extends OtpSettings {
   secret: string;
   site: string;
   name: string;
@@ -25,7 +27,7 @@ export function parseOtpAuth(value: string): ParsedOtpAuth | null {
 
   try {
     const url = new URL(raw);
-    if (url.protocol !== 'otpauth:' || url.hostname.toLowerCase() !== 'totp') {
+    if (url.protocol !== 'otpauth:' || !['totp', 'hotp'].includes(url.hostname.toLowerCase())) {
       return null;
     }
 
@@ -37,13 +39,21 @@ export function parseOtpAuth(value: string): ParsedOtpAuth | null {
     const labelIssuer = separator >= 0 ? label.slice(0, separator).trim() : '';
     const account = (separator >= 0 ? label.slice(separator + 1) : label).trim();
     const issuer = (url.searchParams.get('issuer') || labelIssuer).trim();
-    const parsedDigits = Number.parseInt(url.searchParams.get('digits') || '6', 10);
+    const type = url.hostname.toLowerCase() as 'totp' | 'hotp';
+    if (type === 'hotp' && !url.searchParams.has('counter')) return null;
+    const options = normalizeOtpSettings({
+      type,
+      digits: Number(url.searchParams.get('digits') || 6),
+      algorithm: url.searchParams.get('algorithm') || 'SHA1',
+      period: Number(url.searchParams.get('period') || 30),
+      counter: Number(url.searchParams.get('counter') || 0)
+    });
 
     return {
       secret,
       site: issuer.toLowerCase(),
       name: issuer || account,
-      digits: parsedDigits === 8 ? 8 : 6
+      ...options
     };
   } catch {
     return null;

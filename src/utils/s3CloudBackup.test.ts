@@ -29,9 +29,12 @@ import CryptoUtils from './crypto';
 import {
   applyCloudBackupRetention,
   downloadCloudBackupVersion,
+  deleteCloudBackupVersions,
   getCloudBackupObjectKeys,
   isCloudBackupConflict,
   listCloudBackupVersions,
+  testS3CloudBackupConnection,
+  downloadLatestBackupStateFromS3,
   uploadBackupToS3
 } from './s3CloudBackup';
 
@@ -75,6 +78,54 @@ beforeEach(async () => {
 });
 
 describe('S3 cloud backup transport', () => {
+  it('refuses deletion of latest, index and out-of-scope keys before issuing an object request', async () => {
+    for (const key of ['team/openpass/v1/latest.opb', 'team/openpass/v1/latest.idx', 'other/v1/objects/old.opb']) {
+      await expect(deleteCloudBackupVersions([key], 'master-password')).rejects.toThrow('无效');
+    }
+    expect(sdk.send).not.toHaveBeenCalled();
+  });
+  it('protects the current history and deletes only an explicitly selected old version', async () => {
+    const current = 'team/openpass/v1/objects/current.opb';
+    const old = 'team/openpass/v1/objects/old.opb';
+    const listing = { Contents: [{ Key: current, LastModified: new Date('2026-10-08') }, { Key: old, LastModified: new Date('2026-10-07') }] };
+    sdk.send.mockResolvedValueOnce(listing);
+    await expect(deleteCloudBackupVersions([current], 'master-password')).rejects.toThrow('当前同步版本');
+    sdk.send.mockResolvedValueOnce(listing).mockResolvedValueOnce({});
+    expect(await deleteCloudBackupVersions([old], 'master-password')).toEqual({ deleted: 1, failed: [] });
+    expect(sdk.send.mock.calls.at(-1)![0].input.Delete.Objects).toEqual([{ Key: old }]);
+  });
+  it('reports per-object denial and stops when the reviewed context changes', async () => {
+    const key = 'team/openpass/v1/objects/old.opb';
+    const listing = { Contents: [{ Key: key, LastModified: new Date('2026-10-07') }, { Key: 'team/openpass/v1/objects/current.opb', LastModified: new Date('2026-10-08') }] };
+    sdk.send.mockResolvedValueOnce(listing).mockResolvedValueOnce({ Errors: [{ Key: key, Message: 'access denied' }] });
+    expect(await deleteCloudBackupVersions([key], 'master-password')).toMatchObject({ deleted: 0, failed: [{ key, error: 'access denied' }] });
+    sdk.send.mockResolvedValueOnce(listing);
+    expect(await deleteCloudBackupVersions([key], 'master-password', async () => { throw new Error('configuration changed'); }))
+      .toMatchObject({ deleted: 0, failed: [{ key, error: 'configuration changed' }] });
+  });
+  it('accepts an empty bucket as connected and uploads its first backup conditionally', async () => {
+    sdk.send.mockResolvedValueOnce({ Contents: [] });
+    await expect(testS3CloudBackupConnection('master-password')).resolves.toMatchObject({ success: true, exists: false });
+    expect(sdk.send.mock.calls[0][0].input).toMatchObject({ Prefix: 'team/openpass/v1/latest.opb', MaxKeys: 2 });
+    sdk.send.mockRejectedValueOnce(Object.assign(new Error('missing'), { name: 'NoSuchKey', $metadata: { httpStatusCode: 404 } }));
+    await expect(downloadLatestBackupStateFromS3('master-password')).rejects.toMatchObject({ name: 'CloudBackupNotFound' });
+    sdk.send.mockResolvedValueOnce({ ETag: 'history' }).mockResolvedValueOnce({ ETag: 'latest' });
+    await uploadBackupToS3({ format: 'openpass-backup', formatVersion: 1, appVersion: '0.2.1',
+      exportTime: new Date().toISOString(), count: 0, encrypted: false, secrets: [] }, 'master-password', null);
+    expect(sdk.send.mock.calls[3][0].input).toMatchObject({ IfNoneMatch: '*' });
+  });
+
+  it('does not mistake a missing bucket or denied access for an empty backup', async () => {
+    const missing = Object.assign(new Error('missing bucket'), { name: 'NoSuchBucket', $metadata: { httpStatusCode: 404 } });
+    sdk.send.mockRejectedValueOnce(missing);
+    await expect(downloadLatestBackupStateFromS3('master-password')).rejects.toBe(missing);
+    sdk.send.mockRejectedValueOnce(missing);
+    await expect(testS3CloudBackupConnection('master-password')).rejects.toBe(missing);
+    const denied = Object.assign(new Error('denied'), { name: 'AccessDenied', $metadata: { httpStatusCode: 403 } });
+    sdk.send.mockRejectedValueOnce(denied);
+    await expect(testS3CloudBackupConnection('master-password')).rejects.toBe(denied);
+  });
+
   it('uses immutable random objects and a stable latest object', () => {
     expect(getCloudBackupObjectKeys(settings, 'snapshot-id')).toEqual({
       snapshot: 'team/openpass/v1/objects/snapshot-id.opb',

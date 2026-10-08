@@ -52,11 +52,11 @@ export function parseUrl(value: string): UrlInfo | null {
  *
  * 优先级（综合各处历史实现，取并集，确保不丢匹配）：
  * 1 = fullUrl 精确匹配
- * 2 = origin 精确匹配
+ * 2 = origin 精确匹配或同源路径匹配（排序时路径越具体越靠前）
  * 3 = fullDomain 精确匹配
- * 4 = mainDomain 精确匹配
- * 5 = 同源 URL 路径前缀匹配
- * 6 = 域名标签边界匹配（父域名或子域名）
+ * 4 = 父域匹配（排序时最近的父域优先）
+ * 5 = 子域匹配
+ * 6 = 同主域的其他站点
  */
 export function getSiteMatchPriority(urlInfo: UrlInfo, rawSite: string): number {
   const site = (rawSite || '').trim().toLowerCase();
@@ -72,16 +72,20 @@ export function getSiteMatchPriority(urlInfo: UrlInfo, rawSite: string): number 
   if (fullDomain === site) return 3;
   if (mainDomain === site) return 4;
   const parsedSite = parseUrl(site);
-  if (
-    parsedSite &&
-    parsedSite.origin.toLowerCase() === origin &&
-    (fullUrl.startsWith(parsedSite.fullUrl.toLowerCase()) ||
-      parsedSite.fullUrl.toLowerCase().startsWith(fullUrl))
-  ) {
-    return 5;
+  if (parsedSite && parsedSite.origin.toLowerCase() === origin) {
+    const target = new URL(parsedSite.fullUrl);
+    const page = new URL(urlInfo.fullUrl);
+    const path = target.pathname.toLowerCase();
+    const pagePath = page.pathname.toLowerCase();
+    const matchesPath = path === '/' || pagePath === path || pagePath.startsWith(path.endsWith('/') ? path : `${path}/`);
+    const matchesQuery = !target.search || target.search.toLowerCase() === page.search.toLowerCase();
+    if (matchesPath && matchesQuery) return 2;
   }
 
   const siteDomain = parsedSite?.fullDomain.toLowerCase() ?? site;
+  if (siteDomain === fullDomain) return 3;
+  if (fullDomain.endsWith(`.${siteDomain}`)) return 4;
+  if (siteDomain.endsWith(`.${fullDomain}`)) return 5;
   const hasDomainBoundary = (left: string, right: string) =>
     left === right || left.endsWith(`.${right}`) || right.endsWith(`.${left}`);
 
@@ -98,11 +102,20 @@ export function isSiteMatched(urlInfo: UrlInfo, rawSite: string): boolean {
 }
 
 /**
- * 返回与目标 URL 匹配的密钥列表（保持入参顺序）。
- * 便利封装，供需要"筛选匹配项"的调用方使用。
+ * 返回与目标 URL 匹配的密钥列表，按匹配度排序；相同匹配度保持原顺序。
+ * 不修改密钥存储顺序，供 popup、content 和后台统一使用。
  */
 export function matchSecrets<T extends { site: string }>(url: string, secrets: T[]): T[] {
   const urlInfo = parseUrl(url);
   if (!urlInfo) return [];
-  return secrets.filter((secret) => isSiteMatched(urlInfo, secret.site));
+  return secrets.map((secret, index) => {
+    const priority = getSiteMatchPriority(urlInfo, secret.site);
+    const site = parseUrl(secret.site);
+    const specificity = priority === 2 && site
+      ? new URL(site.fullUrl).pathname.length + new URL(site.fullUrl).search.length
+      : priority === 4 && site ? site.fullDomain.split('.').length : 0;
+    return { secret, priority, specificity, index };
+  }).filter(({ priority }) => priority !== NO_MATCH)
+    .sort((left, right) => left.priority - right.priority || right.specificity - left.specificity || left.index - right.index)
+    .map(({ secret }) => secret);
 }

@@ -40,7 +40,6 @@ interface BackupSnapshot<T = BackupSecretLike> {
 const DB_NAME = 'OpenPassBackupDB';
 const DB_VERSION = 1;
 const STORE_NAME = 'handles';
-const ALARM_NAME = 'openpass-auto-backup';
 
 export function useAutoBackup() {
   const settings = ref<BackupSettings>({
@@ -115,24 +114,14 @@ export function useAutoBackup() {
   }
 
   async function setupAlarm() {
-    await chrome.alarms.clear(ALARM_NAME);
-    const nextBackupTime = settings.value.nextBackupTime
-      ? new Date(settings.value.nextBackupTime).getTime()
-      : Number.NaN;
-    const delayInMinutes = Number.isFinite(nextBackupTime)
-      ? Math.max(1, Math.ceil((nextBackupTime - Date.now()) / (60 * 1000)))
-      : 60;
-
-    chrome.alarms.create(ALARM_NAME, {
-      delayInMinutes,
-      periodInMinutes: 60
-    });
+    const result = await chrome.runtime.sendMessage({ action: 'updateBackupSchedule' });
+    if (result?.error) throw new Error(result.error);
   }
 
   async function clearAlarm() {
-    await chrome.alarms.clear(ALARM_NAME);
     settings.value.nextBackupTime = null;
     await saveSettings({ nextBackupTime: null });
+    await setupAlarm();
   }
 
   async function openDB(): Promise<IDBDatabase> {

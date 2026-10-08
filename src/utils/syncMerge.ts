@@ -16,11 +16,15 @@ export interface BackupSyncMetadata {
   version: 1;
   deviceId: string;
   tombstones: SecretTombstone[];
+  hotpCounters?: Record<string, number>;
 }
 
 export interface SyncSecretLike extends BackupSecretLike {
   id: string;
+  duplicateOf?: string;
   updatedAt?: string;
+  type?: 'totp' | 'hotp';
+  counter?: number;
 }
 
 export interface SyncMergeResult<T extends SyncSecretLike> {
@@ -62,8 +66,12 @@ function stableValue(value: unknown): string {
 function chooseSecret<T extends SyncSecretLike>(left: T | undefined, right: T): T {
   if (!left) return right;
   const timeDiff = getSecretTimestamp(right) - getSecretTimestamp(left);
-  if (timeDiff !== 0) return timeDiff > 0 ? right : left;
-  return stableValue(right) > stableValue(left) ? right : left;
+  const chosen = timeDiff !== 0 ? (timeDiff > 0 ? right : left)
+    : stableValue(right) > stableValue(left) ? right : left;
+  if (left.type === 'hotp' && right.type === 'hotp' && left.secret === right.secret) {
+    return { ...chosen, counter: Math.max(left.counter ?? 0, right.counter ?? 0) };
+  }
+  return chosen;
 }
 
 function chooseTombstone(
@@ -110,10 +118,13 @@ export function mergeSyncState<T extends SyncSecretLike>(
   });
 
   // Older imports may have generated different IDs for the same TOTP secret. Keep the newest
-  // equivalent record so devices converge instead of displaying duplicates.
+  // equivalent record, while retaining copies explicitly created with “全部保留”.
   const byIdentity = new Map<string, T>();
   for (const secret of surviving) {
-    const identity = buildSecretIdentity(secret);
+    const identity = JSON.stringify([
+      buildSecretIdentity(secret),
+      secret.duplicateOf ? secret.id : null
+    ]);
     byIdentity.set(identity, chooseSecret(byIdentity.get(identity), secret));
   }
 
@@ -132,7 +143,7 @@ export function mergeSyncState<T extends SyncSecretLike>(
 export async function getOrCreateSyncDeviceId() {
   const result = await chrome.storage.local.get<{ syncDeviceId?: string }>(['syncDeviceId']);
   if (result.syncDeviceId) return result.syncDeviceId;
-  const syncDeviceId = crypto.randomUUID();
+  const syncDeviceId = globalThis.crypto.randomUUID();
   await chrome.storage.local.set({ syncDeviceId });
   return syncDeviceId;
 }
@@ -166,5 +177,6 @@ export async function getBackupSyncMetadata(): Promise<BackupSyncMetadata> {
     getOrCreateSyncDeviceId(),
     loadSecretTombstones()
   ]);
-  return { version: 1, deviceId, tombstones };
+  const { hotpCounters } = await chrome.storage.local.get<{ hotpCounters?: Record<string, number> }>(['hotpCounters']);
+  return { version: 1, deviceId, tombstones, hotpCounters };
 }
