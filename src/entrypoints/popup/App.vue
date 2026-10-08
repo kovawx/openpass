@@ -2,6 +2,10 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import TOTP from '@/utils/totp';
 import CryptoUtils from '@/utils/crypto';
+import { readVault, toOtpAccount, type OtpAccount } from '@/utils/vault';
+import { getValidSessionKey } from '@/utils/session';
+import { useAuthStore } from '@/stores/auth';
+import { normalizeOtpSettings, type OtpSettings } from '@/utils/otp';
 import { parseUrl } from '@/utils/domainMatch';
 import { showToast } from '@/utils/ui';
 import type { Secret } from '@/stores/secrets';
@@ -13,10 +17,11 @@ import PopupAboutModal from '@/components/popup/PopupAboutModal.vue';
 import PopupRepairModal from '@/components/popup/PopupRepairModal.vue';
 import PopupSetupPrompt from '@/components/popup/PopupSetupPrompt.vue';
 
-interface PendingSecret {
+interface PendingSecret extends OtpSettings {
   secret: string;
   site: string;
   name: string;
+  digits?: number;
 }
 
 interface CodeEntry {
@@ -25,10 +30,9 @@ interface CodeEntry {
 }
 
 type TimerHandle = ReturnType<typeof setInterval>;
-type TimeoutHandle = ReturnType<typeof setTimeout>;
 type Page = 'home' | 'create' | 'edit';
 
-interface FormPayload {
+interface FormPayload extends OtpSettings {
   secret: string;
   site: string;
   name: string;
@@ -36,7 +40,17 @@ interface FormPayload {
 }
 
 // 基础状态
+const authStore = useAuthStore();
+const locked = ref(true);
+const managementLocked = ref(true);
+const accounts = ref<OtpAccount[]>([]);
+const otpAccessMessage = ref('');
+const unlockPassword = ref('');
+const unlockError = ref('');
+const unlocking = ref(false);
 const secrets = ref<Secret[]>([]);
+let savedState = '[]';
+let editingState = '[]';
 const currentPage = ref<Page>('home');
 const currentUrl = ref('');
 const pendingSecret = ref<PendingSecret | null>(null);
@@ -52,214 +66,82 @@ const isSetupComplete = ref(false);
 // 验证码计时（统一在 App 维护，供 HomePage 渲染）
 const codeData = ref<Map<string, CodeEntry>>(new Map());
 const timers = ref<Map<string, TimerHandle>>(new Map());
-let expectedSecretsSignature: string | null = null;
-let expectedSecretsSignatureTimer: TimeoutHandle | null = null;
-
 onMounted(async () => {
   version.value = chrome.runtime.getManifest().version;
-
-  // 检查设置是否完成，并读取所有相关数据
-  const result = await chrome.storage.local.get<{
-    isSetupComplete?: boolean;
-    secrets?: Secret[];
-    encryptedSecrets?: string;
-    pendingSecret?: PendingSecret;
-  }>(['isSetupComplete', 'secrets', 'encryptedSecrets', 'pendingSecret']);
-  isSetupComplete.value = result.isSetupComplete === true;
-
-  if (!isSetupComplete.value) {
-    return;
-  }
-
-  const sessionKey = await getActiveSessionKey();
-
-  // popup 优先读取明文 secrets，并在有会话时同步加密副本
-  if (Array.isArray(result.secrets)) {
-    // 明文 secrets（含空数组）即为合法数据源，以明文为准
-    secrets.value = normalizeSecrets(result.secrets);
-    repairError.value = '';
-
-    if (sessionKey) {
-      await persistSecrets(result.secrets, sessionKey);
-    }
-    // 无会话时不删除 encryptedSecrets（保留作为备份），避免误判与备份丢失
-  } else if (result.encryptedSecrets) {
-    if (sessionKey) {
-      try {
-        secrets.value = await restoreSecretsFromEncrypted(result.encryptedSecrets, sessionKey);
-        repairError.value = '';
-      } catch (error) {
-        console.warn('[Popup] 无法用当前会话自动同步加密数据', error);
-        secrets.value = [];
-        repairError.value = '检测到加密数据，但当前会话无法自动同步。请打开管理后台重新验证主密码后继续。';
-        showRepairModal.value = true;
-      }
-    } else {
-      console.warn('[Popup] 仅检测到加密数据，等待管理后台同步');
-      secrets.value = [];
-      repairError.value = '检测到当前只有加密数据。请打开管理后台完成解锁后，popup 会自动同步。';
-      showRepairModal.value = true;
-    }
-  } else {
-    secrets.value = [];
-  }
-
-  // 获取当前标签页
+  const setup = await chrome.storage.local.get(['isSetupComplete']);
+  isSetupComplete.value = setup.isSetupComplete === true;
+  await authStore.init();
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.url) {
-      currentUrl.value = tab.url;
-    }
-  } catch {
-    currentUrl.value = '';
-  }
-
-  // 检查待添加密钥（右键菜单 QR 识别写入）
-  if (result.pendingSecret) {
-    pendingSecret.value = result.pendingSecret;
-    await chrome.storage.local.remove(['pendingSecret']);
-    currentPage.value = 'create';
-  }
-
-  // 启动验证码更新
-  startCodeUpdater();
-
-  // 监听 storage 变化，同步密钥数据
+    currentUrl.value = tab?.url || '';
+  } catch { currentUrl.value = ''; }
   chrome.storage.onChanged.addListener(storageChangeListener);
+  await reloadVault();
 });
 
 onUnmounted(() => {
   clearAllTimers();
-  clearExpectedSecretsSync();
   chrome.storage.onChanged.removeListener(storageChangeListener);
 });
 
-function storageChangeListener(changes: Record<string, chrome.storage.StorageChange>) {
-  if (changes.secrets) {
-    const newValue = changes.secrets.newValue;
-    if (!Array.isArray(newValue)) {
-      console.warn('[Popup] 忽略异常的 secrets 变更', newValue);
-      return;
-    }
-
-    const normalizedSecrets = normalizeSecrets(newValue);
-    const nextSignature = getSecretsSignature(normalizedSecrets);
-    const currentSignature = getSecretsSignature(secrets.value);
-
-    if (
-      expectedSecretsSignature &&
-      normalizedSecrets.length === 0 &&
-      currentSignature !== nextSignature
-    ) {
-      console.warn('[Popup] 忽略保存过程中的瞬时空 secrets 同步');
-      return;
-    }
-
-    if (currentSignature === nextSignature) {
-      if (expectedSecretsSignature === nextSignature) {
-        clearExpectedSecretsSync();
-      }
-      showRepairModal.value = false;
-      repairError.value = '';
-      return;
-    }
-
-    secrets.value = normalizedSecrets;
-    showRepairModal.value = false;
-    repairError.value = '';
-    if (expectedSecretsSignature === nextSignature) {
-      clearExpectedSecretsSync();
-    }
-    restartCodeUpdater();
-  }
-}
-
-// 会话与存储自愈逻辑（与 secret store、background 保持一致，勿随意改动写入路径）
-async function getActiveSessionKey() {
-  const [localResult, sessionResult] = await Promise.all([
-    chrome.storage.local.get<{ sessionExpiresAt?: number }>(['sessionExpiresAt']),
-    chrome.storage.session.get<{ sessionKey?: string }>(['sessionKey'])
-  ]);
-
-  if (
-    typeof localResult.sessionExpiresAt === 'number' &&
-    Date.now() > localResult.sessionExpiresAt
-  ) {
-    await chrome.storage.session.remove(['sessionKey']);
-    await chrome.storage.local.remove(['sessionExpiresAt']);
-    return null;
-  }
-
-  return typeof sessionResult.sessionKey === 'string' ? sessionResult.sessionKey : null;
-}
-
-function buildSitesList(nextSecrets: Secret[]) {
-  return nextSecrets.map(secret => ({ site: secret.site }));
-}
-
-function normalizeSecrets(nextSecrets: Secret[]) {
-  return nextSecrets.map(secret => ({ ...secret }));
-}
-
-function getSecretsSignature(nextSecrets: Secret[]) {
-  return JSON.stringify(normalizeSecrets(nextSecrets));
-}
-
-function rememberExpectedSecretsSync(nextSecrets: Secret[]) {
-  expectedSecretsSignature = getSecretsSignature(nextSecrets);
-  if (expectedSecretsSignatureTimer) {
-    clearTimeout(expectedSecretsSignatureTimer);
-  }
-
-  expectedSecretsSignatureTimer = setTimeout(() => {
-    clearExpectedSecretsSync();
-  }, 3000);
-}
-
-function clearExpectedSecretsSync() {
-  expectedSecretsSignature = null;
-  if (expectedSecretsSignatureTimer) {
-    clearTimeout(expectedSecretsSignatureTimer);
-    expectedSecretsSignatureTimer = null;
-  }
-}
-
-async function persistSecrets(nextSecrets: Secret[], sessionKey?: string | null) {
-  const normalizedSecrets = normalizeSecrets(nextSecrets);
-  const activeSessionKey = sessionKey === undefined ? await getActiveSessionKey() : sessionKey;
-  const sitesList = buildSitesList(normalizedSecrets);
-  rememberExpectedSecretsSync(normalizedSecrets);
-
-  if (activeSessionKey) {
-    const encryptedSecrets = await CryptoUtils.encrypt(
-      JSON.stringify(normalizedSecrets),
-      activeSessionKey
-    );
-    await chrome.storage.local.set({
-      secrets: normalizedSecrets,
-      sitesList,
-      encryptedSecrets
-    });
+async function reloadVault() {
+  if (!isSetupComplete.value) return;
+  const key = await getValidSessionKey();
+  managementLocked.value = !key;
+  if (!key) {
+    clearAllTimers(); codeData.value.clear(); secrets.value = [];
+    editingSecret.value = null; pendingSecret.value = null; currentPage.value = 'home';
+    const result = await chrome.runtime.sendMessage({ action: 'getSecrets' });
+    accounts.value = Array.isArray(result?.secrets) ? result.secrets.map(toOtpAccount) : [];
+    locked.value = result?.locked !== false && !result?.otpAvailable;
+    otpAccessMessage.value = result?.message || '';
+    if (!locked.value) restartCodeUpdater();
     return;
   }
-
-  // 无会话：仅更新明文与索引，保留现有 encryptedSecrets（备份），待下次有会话时重加密同步
-  await chrome.storage.local.set({
-    secrets: normalizedSecrets,
-    sitesList
-  });
+  locked.value = false;
+  try {
+    secrets.value = await readVault(key);
+    accounts.value = secrets.value.map(toOtpAccount);
+    savedState = JSON.stringify(secrets.value);
+    const data = await chrome.storage.session.get<{ pendingSecret?: PendingSecret }>(['pendingSecret']);
+    const legacy = await chrome.storage.local.get<{ encryptedPendingSecret?: string }>(['encryptedPendingSecret']);
+    const pending = data.pendingSecret || (legacy.encryptedPendingSecret
+      ? JSON.parse(await CryptoUtils.decrypt(legacy.encryptedPendingSecret, key)) : null);
+    if (pending) {
+      pendingSecret.value = pending; currentPage.value = 'create';
+      await chrome.storage.session.remove(['pendingSecret']);
+      await chrome.storage.local.remove(['encryptedPendingSecret']);
+    }
+    showRepairModal.value = false;
+    restartCodeUpdater();
+  } catch (error) {
+    if (await getValidSessionKey() !== key) { await reloadVault(); return; }
+    secrets.value = []; accounts.value = []; clearAllTimers();
+    repairError.value = (error as Error).message; showRepairModal.value = true;
+  }
 }
 
-async function restoreSecretsFromEncrypted(encryptedSecrets: string, sessionKey: string) {
-  const decrypted = await CryptoUtils.decrypt(encryptedSecrets, sessionKey);
-  const parsed = JSON.parse(decrypted);
+async function unlock() {
+  unlocking.value = true; unlockError.value = '';
+  try {
+    if (!await authStore.login(unlockPassword.value)) {
+      unlockError.value = authStore.isLocked() ? '尝试次数过多，请稍后重试' : '主密码错误';
+      return;
+    }
+    unlockPassword.value = ''; await reloadVault();
+  } catch (error) { unlockError.value = (error as Error).message; }
+  finally { unlocking.value = false; }
+}
 
-  if (!Array.isArray(parsed)) {
-    throw new Error('解密后的数据格式无效');
-  }
+function storageChangeListener(changes: Record<string, chrome.storage.StorageChange>) {
+  if (changes.encryptedSecrets || changes.deviceOtpEnabled || changes.encryptedDeviceOtpSecrets || changes.sessionKey || changes.sessionExpiresAt) void reloadVault();
+}
 
-  await persistSecrets(parsed, sessionKey);
-  return normalizeSecrets(parsed as Secret[]);
+async function persistSecrets(nextSecrets: Secret[], expectedState = savedState) {
+  const result = await chrome.runtime.sendMessage({ action: 'saveVault', expectedSecrets: expectedState, secrets: nextSecrets.map((secret) => ({ ...secret })), triggerSnapshot: true });
+  if (result?.error || !result?.success) throw new Error(result?.error || '保存失败');
+  secrets.value = result.secrets; savedState = JSON.stringify(result.secrets);
+  accounts.value = secrets.value.map(toOtpAccount);
 }
 
 function getDefaultSite() {
@@ -269,21 +151,22 @@ function getDefaultSite() {
 
 // 验证码计时
 function startCodeUpdater() {
-  if (!Array.isArray(secrets.value)) return;
-  secrets.value.forEach(secret => {
+  if (!Array.isArray(accounts.value)) return;
+  accounts.value.forEach(secret => {
     startCardTimer(secret);
   });
 }
 
-function startCardTimer(secret: Secret) {
-  refreshSecretCode(secret);
+function startCardTimer(secret: OtpAccount) {
+  void refreshSecretCode(secret);
+  if (secret.type === 'hotp') return;
   const timerId = setInterval(() => refreshSecretCode(secret), 1000);
   timers.value.set(secret.id, timerId);
 }
 
-async function refreshSecretCode(secret: Secret) {
+async function refreshSecretCode(secret: OtpAccount) {
   try {
-    const result = await TOTP.generateCode(secret.secret, secret.digits || 6);
+    const result = await TOTP.generateCode(secret);
     codeData.value.set(secret.id, result);
   } catch {
     codeData.value.delete(secret.id);
@@ -300,10 +183,11 @@ function restartCodeUpdater() {
   startCodeUpdater();
 }
 
-// 保存密钥（双存储 + 加密一致）
-async function saveSecrets() {
+// 由后台校验版本并写入加密存储。
+async function saveSecrets(expectedState = savedState) {
   if (!Array.isArray(secrets.value)) return;
-  await persistSecrets(secrets.value);
+  try { await persistSecrets(secrets.value, expectedState); return true; }
+  catch (error) { await reloadVault(); showToast((error as Error).message, 'error'); return false; }
 }
 
 // 导航
@@ -315,12 +199,29 @@ function showHomePage() {
 }
 
 function openCreatePage() {
+  if (managementLocked.value) { openOptionsPage(); return; }
   pendingSecret.value = null;
   editingSecret.value = null;
   currentPage.value = 'create';
 }
 
-function showEditPage(secret: Secret) {
+async function scanCurrentPage() {
+  if (managementLocked.value) { openOptionsPage(); return; }
+  try {
+    await chrome.runtime.sendMessage({ action: 'startQrScan' });
+  } catch (error) {
+    showToast('无法扫描当前页面', 'error');
+    console.error('OpenPass: 启动二维码扫描失败', error);
+    return;
+  }
+  window.close();
+}
+
+function showEditPage(account: OtpAccount) {
+  if (managementLocked.value) { openOptionsPage(); return; }
+  const secret = secrets.value.find((entry) => entry.id === account.id);
+  if (!secret) return;
+  editingState = savedState;
   editingSecret.value = { ...secret };
   currentPage.value = 'edit';
   clearAllTimers();
@@ -332,17 +233,17 @@ const createInitial = computed<FormPayload>(() => {
       secret: pendingSecret.value.secret,
       site: pendingSecret.value.site,
       name: pendingSecret.value.name,
-      digits: 6
+      ...normalizeOtpSettings(pendingSecret.value)
     };
   }
-  return { secret: '', site: getDefaultSite(), name: '', digits: 6 };
+  return { secret: '', site: getDefaultSite(), name: '', ...normalizeOtpSettings({}) };
 });
 
 const editInitial = computed<FormPayload>(() => ({
   secret: editingSecret.value?.secret ?? '',
   site: editingSecret.value?.site ?? '',
   name: editingSecret.value?.name ?? '',
-  digits: editingSecret.value?.digits ?? 6
+  ...normalizeOtpSettings(editingSecret.value || {})
 }));
 
 // 创建 / 编辑 / 删除
@@ -350,14 +251,15 @@ async function handleCreateSubmit(data: FormPayload) {
   const newSecret: Secret = {
     id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
     secret: data.secret,
-    digits: data.digits,
+    ...normalizeOtpSettings(data),
     site: data.site,
     name: data.name,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
   };
 
   secrets.value.push(newSecret);
-  await saveSecrets();
+  if (!await saveSecrets()) return;
   showToast('密钥已保存', 'success');
   showHomePage();
 }
@@ -373,11 +275,12 @@ async function handleEditSubmit(data: FormPayload) {
     secrets.value[index] = {
       ...secrets.value[index],
       secret: data.secret,
+      ...normalizeOtpSettings(data),
       site: data.site.toLowerCase(),
       name: data.name,
       updatedAt: new Date().toISOString()
     };
-    await saveSecrets();
+    if (!await saveSecrets(editingState)) return;
     showToast('密钥已更新', 'success');
     showHomePage();
   }
@@ -392,12 +295,13 @@ async function handleDeleteFromEdit() {
 
   const id = editingSecret.value.id;
   secrets.value = Array.isArray(secrets.value) ? secrets.value.filter(s => s.id !== id) : [];
-  await saveSecrets();
+  if (!await saveSecrets(editingState)) return;
   showToast('密钥已删除', 'success');
   showHomePage();
 }
 
-async function deleteSecretFromList(secret: Secret) {
+async function deleteSecretFromList(secret: OtpAccount) {
+  if (managementLocked.value) { openOptionsPage(); return; }
   const name = secret.name || secret.site;
   if (!confirm(`确定要删除 "${name}" 吗？`)) {
     return;
@@ -406,21 +310,21 @@ async function deleteSecretFromList(secret: Secret) {
   secrets.value = Array.isArray(secrets.value)
     ? secrets.value.filter(item => item.id !== secret.id)
     : [];
-  await saveSecrets();
+  if (!await saveSecrets()) return;
   showToast('密钥已删除', 'success');
   restartCodeUpdater();
 }
 
-async function copyCode(secret: Secret) {
-  const data = codeData.value.get(secret.id);
-  if (data) {
-    await TOTP.copyToClipboard(data.code);
+async function copyCode(secret: OtpAccount) {
+  try {
+    const result = await TOTP.generateCode(secret, 6, {}, true);
+    await TOTP.copyToClipboard(result.code);
     showToast('验证码已复制', 'success');
-  }
+  } catch (error) { showToast((error as Error).message, 'error'); }
 }
 
 // 点击名称 / 站点跳转（与 manager 行为一致）
-function openSite(secret: Secret) {
+function openSite(secret: OtpAccount) {
   const trimmed = (secret.site || '').trim();
   if (!trimmed) return;
   const url = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
@@ -450,9 +354,18 @@ function openSetupPage() {
     <!-- 未设置引导 -->
     <PopupSetupPrompt v-if="!isSetupComplete" @setup="openSetupPage" />
 
+    <form v-else-if="locked" class="flex flex-col gap-4 p-6" @submit.prevent="unlock">
+      <h2 class="text-lg font-semibold">解锁 OpenPass</h2>
+      <p v-if="otpAccessMessage" class="text-sm text-gray-500">{{ otpAccessMessage }}</p>
+      <input v-model="unlockPassword" type="password" class="input" autocomplete="current-password" placeholder="主密码" required>
+      <p v-if="unlockError" class="text-red-600">{{ unlockError }}</p>
+      <button class="btn-primary" :disabled="unlocking">{{ unlocking ? '解锁中…' : '解锁' }}</button>
+      <button type="button" class="btn-secondary" @click="openOptionsPage">打开管理页面</button>
+    </form>
     <template v-else>
       <PopupHeader
         @add="openCreatePage"
+        @scan="scanCurrentPage"
         @about="showAboutModal = true"
         @manage="openOptionsPage"
       />
@@ -460,7 +373,7 @@ function openSetupPage() {
       <main class="flex-1 overflow-y-auto p-3">
         <PopupHomePage
           v-if="currentPage === 'home'"
-          :secrets="secrets"
+          :secrets="accounts"
           :code-data="codeData"
           :current-url="currentUrl"
           @add="openCreatePage"

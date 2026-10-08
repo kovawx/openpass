@@ -80,6 +80,8 @@ feature/fix 分支  →  PR 到 develop  →  测试  →  PR 到 main  →  发
 
 ### 环境准备
 
+使用 Node.js 22（与 CI 一致）和 `package.json` 指定的 pnpm 版本。基础开发不需要后端服务、数据库或 `.env` 文件；可选的 S3 云端同步在扩展设置页中配置。
+
 1. 克隆仓库
    ```bash
    git clone https://github.com/kovawx/openpass.git
@@ -88,8 +90,16 @@ feature/fix 分支  →  PR 到 develop  →  测试  →  PR 到 main  →  发
 
 2. 安装依赖
    ```bash
-   pnpm install
+   # 已安装 nvm 时，切换到项目指定的 Node.js 版本
+   nvm install
+   nvm use
+
+   corepack enable
+   pnpm install --frozen-lockfile
+   pnpm compile
    ```
+
+   安装依赖时会自动执行 `wxt prepare`，生成 `.wxt/` 类型配置；`pnpm compile` 会重新生成配置并运行 TypeScript 检查。不要手动修改 `.wxt/` 或 `.output/` 中的生成文件。
 
 3. 开发模式
    ```bash
@@ -100,7 +110,8 @@ feature/fix 分支  →  PR 到 develop  →  测试  →  PR 到 main  →  发
    - 打开 `chrome://extensions/`
    - 开启「开发者模式」
    - 点击「加载已解压的扩展程序」
-   - 选择项目下的 `.output/chrome-mv3` 目录
+   - 开发模式选择项目下的 `.output/chrome-mv3-dev` 目录
+   - 使用 `pnpm build` 构建的生产版本时，选择 `.output/chrome-mv3` 目录
 
 ### 项目结构
 
@@ -133,12 +144,25 @@ openpass/
 | 命令 | 说明 |
 |------|------|
 | `pnpm dev` | 开发模式，自动热重载 |
+| `pnpm dev:firefox` | Firefox 开发模式 |
 | `pnpm build` | 生产构建，输出到 `.output/` |
-| `pnpm lint` | 代码检查 |
+| `pnpm test` | 运行 Vitest 自动化测试 |
+| `pnpm compile` | 生成 WXT 配置并检查 TypeScript 类型 |
+| `pnpm lint:check` | 代码检查，不修改源文件 |
+| `pnpm lint` | 代码检查并自动修复源文件 |
+| `pnpm check` | 依次运行测试、类型检查、代码检查和生产构建 |
 
 ### 测试
 
-目前项目没有自动化测试，请手动测试以下场景：
+提交前运行 `pnpm check`，与 CI 使用相同的验证入口。另可在构建后运行 `pnpm test:cloud-worker`，用真实 Chromium Worker 执行生产后台与 S3 SDK，检查无 DOM 环境下的 XML、OSS 空桶首次同步、原生签名上传与索引追加、重复同步、恢复、历史清理和 409 并发冲突；HTTP fixture 会拒绝 OSS 不支持的条件上传 Header。默认使用 macOS Chrome 或 Linux `/usr/bin/google-chrome`，可通过 `OPENPASS_CHROME_PATH` 指定路径；只使用合成凭据和内存 HTTP 响应，不访问真实云端。`patches/aws-sdk-xml-builder-worker.patch` 让 SDK 选择其内置纯 JavaScript XML 解析器，升级该依赖时需重新验证 Worker 测试。
+
+构建后可运行 `pnpm test:cloud-settings`，使用合成存储与云端响应验证完整管理页面的自动读取历史、30 个版本分页、主密码选项保存与刷新回显，以及读取和锁定错误；同时检查本地快照的确认窗口、取消与焦点恢复、错误重试、重复恢复保护、实时列表更新和窄屏布局。此测试使用独立的无头浏览器，不访问用户配置或真实 Bucket。
+
+该页面测试同时覆盖清理范围默认值、确认文字、清理冲突与单个云端历史删除的失败重试。Worker fixture 验证当前版本保护、原生 OSS 删除、并发清空失败不覆盖本机、空版本提交和仅清本机不发云端请求。共享调度用 `backupSchedule.test.ts` 检查独立开关和频率。
+
+现有 Vitest 测试覆盖域名匹配、OTP 输入与解析、二维码扫描区域、备份配置与加密、S3 备份以及同步合并等工具逻辑。
+
+浏览器扩展交互仍需手动验证以下场景：
 
 - [ ] 添加新密钥
 - [ ] 编辑现有密钥

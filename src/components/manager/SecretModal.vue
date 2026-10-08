@@ -2,6 +2,8 @@
 import { ref, computed, watch } from 'vue';
 import { useSecretStore, type Secret } from '@/stores/secrets';
 import { TOTP } from '@/utils/totp';
+import { normalizeOtpSettings } from '@/utils/otp';
+import OtpFields from '@/components/OtpFields.vue';
 
 interface Props {
   open: boolean;
@@ -20,7 +22,7 @@ const secretStore = useSecretStore();
 const site = ref('');
 const name = ref('');
 const secretKey = ref('');
-const digits = ref(6);
+const otpSettings = ref(normalizeOtpSettings({}));
 const error = ref('');
 const submitting = ref(false);
 
@@ -31,7 +33,7 @@ watch(() => props.editingSecret, (val) => {
     site.value = val.site;
     name.value = val.name || '';
     secretKey.value = val.secret;
-    digits.value = val.digits || 6;
+    otpSettings.value = normalizeOtpSettings(val);
   } else {
     resetForm();
   }
@@ -47,7 +49,7 @@ function resetForm() {
   site.value = '';
   name.value = '';
   secretKey.value = '';
-  digits.value = 6;
+  otpSettings.value = normalizeOtpSettings({});
   error.value = '';
   submitting.value = false;
 }
@@ -83,16 +85,14 @@ async function handleSubmit() {
         site: site.value.toLowerCase(),
         name: name.value,
         secret: secretKey.value,
-        digits: digits.value
-      });
+        ...normalizeOtpSettings(otpSettings.value)
+      }, props.editingSecret);
     } else {
       await secretStore.addSecret({
         site: site.value.toLowerCase(),
         name: name.value,
         secret: secretKey.value,
-        digits: digits.value,
-        period: 30,
-        algorithm: 'SHA1'
+        ...normalizeOtpSettings(otpSettings.value)
       });
     }
 
@@ -165,13 +165,7 @@ function handleClose() {
               </p>
             </div>
 
-            <div class="form-group">
-              <label for="digits" class="form-label">验证码位数</label>
-              <select id="digits" v-model.number="digits" class="input">
-                <option :value="6">6 位</option>
-                <option :value="8">8 位</option>
-              </select>
-            </div>
+            <OtpFields :settings="otpSettings" @update="Object.assign(otpSettings, $event)" />
 
             <p v-if="error" class="text-sm text-red-600 bg-red-50 p-3 rounded">{{ error }}</p>
           </div>

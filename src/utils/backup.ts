@@ -1,4 +1,6 @@
 import CryptoUtils from './crypto';
+import { requireSessionKey } from './session';
+import { getBackupSyncMetadata, type BackupSyncMetadata } from './syncMerge';
 
 export interface BackupSecretLike {
   site?: string;
@@ -23,6 +25,7 @@ export interface BackupData<T = BackupSecretLike> {
   kdfIterations?: number;
   migratedFrom?: string;
   migratedAt?: string;
+  sync?: BackupSyncMetadata;
 }
 
 export interface BackupEncryptionSettings {
@@ -96,6 +99,23 @@ function parseVersion(version: string) {
   };
 }
 
+function normalizeBackupSyncMetadata(value: unknown): BackupSyncMetadata | undefined {
+  if (!isRecord(value) || value.version !== 1 || typeof value.deviceId !== 'string') {
+    return undefined;
+  }
+  const tombstones = Array.isArray(value.tombstones)
+    ? value.tombstones.filter((entry): entry is BackupSyncMetadata['tombstones'][number] =>
+        isRecord(entry) &&
+        typeof entry.id === 'string' &&
+        typeof entry.deletedAt === 'string' &&
+        typeof entry.deviceId === 'string'
+      )
+    : [];
+  const hotpCounters = isRecord(value.hotpCounters) ? Object.fromEntries(Object.entries(value.hotpCounters)
+    .filter(([key, counter]) => /^[a-f0-9]{64}$/.test(key) && typeof counter === 'number' && Number.isSafeInteger(counter) && counter >= 0)) : undefined;
+  return { version: 1, deviceId: value.deviceId, tombstones, hotpCounters: hotpCounters as Record<string, number> | undefined };
+}
+
 function normalizeBackupData<T extends BackupSecretLike>(data: unknown): BackupData<T> | null {
   if (Array.isArray(data)) {
     return {
@@ -136,7 +156,8 @@ function normalizeBackupData<T extends BackupSecretLike>(data: unknown): BackupD
       kdf: typeof data.kdf === 'string' ? data.kdf : undefined,
       kdfIterations: typeof data.kdfIterations === 'number' ? data.kdfIterations : undefined,
       migratedFrom: typeof data.migratedFrom === 'string' ? data.migratedFrom : undefined,
-      migratedAt: typeof data.migratedAt === 'string' ? data.migratedAt : undefined
+      migratedAt: typeof data.migratedAt === 'string' ? data.migratedAt : undefined,
+      sync: normalizeBackupSyncMetadata(data.sync)
     };
   }
 
@@ -358,7 +379,8 @@ export async function createBackupData<T>(
     exportPlatform: typeof navigator !== 'undefined' ? navigator.platform : undefined,
     count: secrets.length,
     encrypted: !!password,
-    secrets: password ? undefined : secrets
+    secrets: password ? undefined : secrets,
+    sync: await getBackupSyncMetadata()
   };
 
   if (password) {
@@ -372,6 +394,12 @@ export async function createBackupData<T>(
 }
 
 export async function saveBackupSnapshot<T>(backupData: BackupData<T>) {
+  if (!backupData.encrypted) {
+    const key = await requireSessionKey();
+    const { secrets, ...metadata } = backupData;
+    backupData = { ...metadata, encrypted: true, encryptionVersion: 1, kdf: 'PBKDF2',
+      kdfIterations: 100000, encryptedData: await CryptoUtils.encrypt(JSON.stringify(secrets ?? []), key) };
+  }
   const result = await chrome.storage.local.get<{
     backupSnapshots?: Array<{ data: BackupData<T>; timestamp: string; count: number }>;
   }>(['backupSnapshots']);

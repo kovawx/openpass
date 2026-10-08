@@ -1,8 +1,12 @@
 import { installGlobalRuntimeErrorListeners } from '@/utils/runtimeErrors';
-import { isSiteMatched, parseUrl } from '@/utils/domainMatch';
+import { matchSecrets } from '@/utils/domainMatch';
+import { isOtpInput, isOtpSplitGroup, isPotentialSplitOtpInput } from '@/utils/otpInput';
 
 interface ContentSecret {
-  secret: string;
+  id?: string;
+  type?: 'totp' | 'hotp';
+  period?: number;
+  secret?: string;
   site: string;
   name?: string;
   digits?: number;
@@ -19,7 +23,6 @@ interface OtpGroup {
 
 interface GroupButtonEntry {
   group: OtpGroup;
-  wrapper: HTMLDivElement;
   button: HTMLDivElement;
 }
 
@@ -28,26 +31,12 @@ interface GenerateCodeResponse {
   remainingSeconds: number;
 }
 
+interface QrScanCandidate {
+  secret: ContentSecret;
+  rect: { x: number; y: number; width: number; height: number };
+}
+
 const CONFIG = {
-  keywords: [
-    'otp',
-    'totp',
-    '2fa',
-    'mfa',
-    'auth',
-    'verification',
-    'verify',
-    'code',
-    'pin',
-    'token',
-    'one-time',
-    'onetime',
-    '验证码',
-    '动态码',
-    '安全码',
-    '一次性密码'
-  ],
-  excludeKeywords: ['password', 'passwd', 'pwd', '密码'],
   targetLengths: [6, 8],
   checkInterval: 1000,
   /** 分位输入框的 maxlength 上限（<= 视为逐位输入） */
@@ -62,6 +51,8 @@ installGlobalRuntimeErrorListeners('content', window, {
 
 export default defineContentScript({
   matches: ['<all_urls>'],
+  allFrames: true,
+  matchAboutBlank: true,
   runAt: 'document_idle',
   main() {
     const groupButtons = new Map<HTMLInputElement, GroupButtonEntry>();
@@ -69,6 +60,8 @@ export default defineContentScript({
     let currentUrl = window.location.href;
     let detectionIntervalId: number | null = null;
     let domObserver: MutationObserver | null = null;
+    let qrOverlay: HTMLDivElement | null = null;
+    let qrOverlayCleanup: (() => void) | null = null;
 
     injectStyles();
 
@@ -100,17 +93,14 @@ export default defineContentScript({
     }
 
     function getMatchingSecrets(): ContentSecret[] {
-      const urlInfo = parseUrl(currentUrl);
-      if (!urlInfo) {
-        return [];
-      }
-      return currentSecrets.filter((secret) => isSiteMatched(urlInfo, secret.site));
+      return matchSecrets(currentUrl, currentSecrets);
     }
 
     async function fetchSecrets() {
       try {
-        const result = await chrome.storage.local.get<{ secrets?: ContentSecret[] }>(['secrets']);
-        currentSecrets = Array.isArray(result.secrets) ? result.secrets : [];
+        const result = await chrome.runtime.sendMessage({ action: 'getSecrets' });
+        currentSecrets = Array.isArray(result?.secrets) ? result.secrets : [];
+        if (!currentSecrets.length) { closeSelector(); removeAllButtons(); }
         updateAllButtons();
       } catch (error) {
         if ((error as Error).message?.includes('Extension context invalidated')) {
@@ -145,7 +135,7 @@ export default defineContentScript({
 
       currentUrl = window.location.href;
       removeAllButtons();
-      detectInputs();
+      void fetchSecrets().then(detectInputs).catch(console.error);
     }
 
     function startDetection() {
@@ -170,44 +160,140 @@ export default defineContentScript({
       }
     }
 
+    function getOtpInputSignals(input: HTMLInputElement) {
+      return {
+        type: input.type,
+        name: input.name,
+        id: input.id,
+        placeholder: input.placeholder,
+        autocomplete: input.autocomplete,
+        ariaLabel: input.getAttribute('aria-label') || '',
+        inputMode: input.getAttribute('inputmode') || '',
+        maxLength: effectiveMaxLength(input),
+        contextText: getInputContext(input)
+      };
+    }
+
     function is2FAInput(input: HTMLInputElement): boolean {
-      const typeValid = ['text', 'tel', 'number', 'password'].includes(input.type);
-      if (!typeValid) return false;
+      return isOtpInput(getOtpInputSignals(input));
+    }
 
-      const name = (input.name || '').toLowerCase();
-      const id = (input.id || '').toLowerCase();
-      const placeholder = (input.placeholder || '').toLowerCase();
-      const autocomplete = (input.autocomplete || '').toLowerCase();
-      const ariaLabel = (input.getAttribute('aria-label') || '').toLowerCase();
-      const inputmode = (input.getAttribute('inputmode') || '').toLowerCase();
-      const allText = `${name} ${id} ${placeholder} ${autocomplete} ${ariaLabel}`;
+    function closeQrOverlay() {
+      qrOverlayCleanup?.();
+      qrOverlayCleanup = null;
+      qrOverlay?.remove();
+      qrOverlay = null;
+    }
 
-      const maxLength = effectiveMaxLength(input);
-      const lengthMatch = (CONFIG.targetLengths as readonly number[]).includes(maxLength);
-      const numericMode =
-        inputmode === 'numeric' ||
-        inputmode === 'tel' ||
-        input.type === 'tel' ||
-        input.type === 'number';
+    function createQrOverlay(message: string) {
+      closeQrOverlay();
+      const overlay = document.createElement('div');
+      overlay.className = 'openpass-qr-overlay';
 
-      // 1) 强信号：W3C 标准 2FA autocomplete，直接认定（优先级最高，不参与排除词过滤）
-      if (autocomplete.includes('one-time-code') || autocomplete.includes('otp')) {
-        return true;
+      const hint = document.createElement('div');
+      hint.className = 'openpass-qr-hint';
+      hint.textContent = `${message}（Esc 取消）`;
+      overlay.appendChild(hint);
+
+      const onKeydown = (event: KeyboardEvent) => {
+        if (event.key === 'Escape') closeQrOverlay();
+      };
+      qrOverlayCleanup = () => document.removeEventListener('keydown', onKeydown);
+      document.addEventListener('keydown', onKeydown);
+      document.body.appendChild(overlay);
+      qrOverlay = overlay;
+      return overlay;
+    }
+
+    function showQrCandidates(candidates: QrScanCandidate[]) {
+      const overlay = createQrOverlay(`识别到 ${candidates.length} 个二维码，请选择要添加的账户`);
+      for (const candidate of candidates) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'openpass-qr-candidate';
+        button.style.left = `${candidate.rect.x * 100}%`;
+        button.style.top = `${candidate.rect.y * 100}%`;
+        button.style.width = `${candidate.rect.width * 100}%`;
+        button.style.height = `${candidate.rect.height * 100}%`;
+        button.title = candidate.secret.name || candidate.secret.site || 'OTP 账户';
+        button.addEventListener('click', () => {
+          closeQrOverlay();
+          void chrome.runtime.sendMessage({
+            action: 'selectQrCandidate',
+            secret: candidate.secret
+          }).catch((error) => showToast((error as Error).message, 'error'));
+        });
+        overlay.appendChild(button);
       }
+    }
 
-      // 2) 排除明显的密码 / 非 2FA 输入框
-      if (CONFIG.excludeKeywords.some((keyword) => allText.includes(keyword))) {
-        return false;
-      }
+    function startQrSelection(message: string) {
+      const overlay = createQrOverlay(message);
+      overlay.classList.add('openpass-qr-selecting');
+      const selection = document.createElement('div');
+      selection.className = 'openpass-qr-selection';
+      overlay.appendChild(selection);
 
-      // 3) 中信号：numeric/tel 输入 + 长度 6/8（主流 2FA 输入框形态）
-      if (numericMode && lengthMatch) {
-        return true;
-      }
+      let startX = 0;
+      let startY = 0;
+      let dragging = false;
 
-      // 4) 弱信号：关键词命中需配合长度约束，避免凭单个泛词（auth/code/token 等）误报
-      const keywordMatch = CONFIG.keywords.some((keyword) => allText.includes(keyword));
-      return keywordMatch && lengthMatch;
+      const updateSelection = (x: number, y: number) => {
+        const left = Math.min(startX, x);
+        const top = Math.min(startY, y);
+        selection.style.left = `${left}px`;
+        selection.style.top = `${top}px`;
+        selection.style.width = `${Math.abs(x - startX)}px`;
+        selection.style.height = `${Math.abs(y - startY)}px`;
+      };
+
+      overlay.addEventListener('pointerdown', (event) => {
+        if (event.button !== 0) return;
+        dragging = true;
+        startX = event.clientX;
+        startY = event.clientY;
+        selection.style.display = 'block';
+        updateSelection(startX, startY);
+        overlay.setPointerCapture(event.pointerId);
+      });
+      overlay.addEventListener('pointermove', (event) => {
+        if (dragging) updateSelection(event.clientX, event.clientY);
+      });
+      overlay.addEventListener('pointerup', (event) => {
+        if (!dragging) return;
+        dragging = false;
+        const left = Math.min(startX, event.clientX);
+        const top = Math.min(startY, event.clientY);
+        const width = Math.abs(event.clientX - startX);
+        const height = Math.abs(event.clientY - startY);
+        if (width < 24 || height < 24) {
+          selection.style.display = 'none';
+          return;
+        }
+
+        closeQrOverlay();
+        void chrome.runtime.sendMessage({
+          action: 'scanQrSelection',
+          rect: {
+            x: left / window.innerWidth,
+            y: top / window.innerHeight,
+            width: width / window.innerWidth,
+            height: height / window.innerHeight
+          }
+        }).catch((error) => showToast((error as Error).message, 'error'));
+      });
+    }
+
+    function getInputContext(input: HTMLInputElement): string {
+      const labels = Array.from(document.querySelectorAll<HTMLLabelElement>('label'))
+        .filter((label) => label.htmlFor === input.id || label.contains(input))
+        .map((label) => label.textContent || '');
+      const labelledBy = (input.getAttribute('aria-labelledby') || '')
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((id) => document.getElementById(id)?.textContent || '');
+      const nearbyText = input.parentElement?.parentElement?.textContent || '';
+      return [...labels, ...labelledBy, nearbyText.slice(0, 300)].join(' ').toLowerCase();
     }
 
     function effectiveMaxLength(input: HTMLInputElement): number {
@@ -224,6 +310,10 @@ export default defineContentScript({
     function isSplitInput(input: HTMLInputElement): boolean {
       const maxLength = effectiveMaxLength(input);
       return maxLength >= 1 && maxLength <= CONFIG.splitMaxLength;
+    }
+
+    function isPotentialSplitInput(input: HTMLInputElement): boolean {
+      return isPotentialSplitOtpInput(getOtpInputSignals(input));
     }
 
     function ancestorChainWithin(el: Element, depth: number): Set<Element> {
@@ -296,26 +386,19 @@ export default defineContentScript({
         }
       }
       flush();
-      return groups;
+      return groups.filter((group) =>
+        group.isMulti
+          ? isOtpSplitGroup(group.inputs.map(getOtpInputSignals))
+          : is2FAInput(group.anchor)
+      );
     }
 
-    function createWrapper(input: HTMLInputElement) {
-      const parent = input.parentNode;
-      if (!(parent instanceof HTMLElement)) {
-        throw new Error('Unable to wrap input without a parent element');
-      }
-
-      const wrapper = document.createElement('div');
-      wrapper.className = 'openpass-input-wrapper';
-      wrapper.style.cssText = `
-        position: relative;
-        display: inline-block;
-        width: ${Math.max(input.getBoundingClientRect().width, input.offsetWidth)}px;
-      `;
-
-      parent.insertBefore(wrapper, input);
-      wrapper.appendChild(input);
-      return wrapper;
+    function positionGroupButton(group: OtpGroup, button: HTMLDivElement) {
+      const rect = group.anchor.getBoundingClientRect();
+      button.style.top = `${rect.top + rect.height / 2}px`;
+      button.style.left = group.isMulti
+        ? `${Math.max(4, rect.left - 32)}px`
+        : `${Math.max(4, rect.right - 30)}px`;
     }
 
     function createGroupButton(group: OtpGroup) {
@@ -347,16 +430,20 @@ export default defineContentScript({
         void fillCode(group.inputs, button);
       });
 
-      // 按钮挂在组的第一个输入框外围（多输入组置于整组左侧）
-      const wrapper = createWrapper(group.inputs[0]);
-      wrapper.appendChild(button);
-      groupButtons.set(group.anchor, { group, wrapper, button });
+      document.body.appendChild(button);
+      positionGroupButton(group, button);
+      groupButtons.set(group.anchor, { group, button });
     }
 
     function detectInputs() {
       const allInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input'));
       const candidates = allInputs.filter(
-        (input) => input.type !== 'hidden' && input.offsetParent !== null && is2FAInput(input)
+        (input) =>
+          input.type !== 'hidden' &&
+          input.offsetParent !== null &&
+          !input.disabled &&
+          !input.readOnly &&
+          (is2FAInput(input) || isPotentialSplitInput(input))
       );
 
       const groups = clusterGroups(candidates);
@@ -369,6 +456,7 @@ export default defineContentScript({
           // DOM 可能增删了分位输入框，同步最新列表
           existing.group.inputs = group.inputs;
           existing.group.isMulti = group.isMulti;
+          positionGroupButton(existing.group, existing.button);
           continue;
         }
         createGroupButton(group);
@@ -394,6 +482,7 @@ export default defineContentScript({
         if (chrome.runtime.lastError) {
           throw new Error(chrome.runtime.lastError.message);
         }
+        if (response?.error) throw new Error(response.error);
 
         return response as GenerateCodeResponse;
       } catch (error) {
@@ -457,6 +546,7 @@ export default defineContentScript({
         let needRefresh = false;
 
         countdownElements.forEach((element) => {
+          if (element.dataset.type === 'hotp') return;
           let remaining = Number.parseInt(element.dataset.remaining || '0', 10) - 1;
           if (remaining <= 0) {
             remaining = 0;
@@ -477,11 +567,11 @@ export default defineContentScript({
 
         const codeValues = selector.querySelectorAll<HTMLElement>('.openpass-code-value');
         for (let index = 0; index < matches.length; index += 1) {
+          if (matches[index].type === 'hotp') continue;
           try {
             const response = await safeSendMessage({
               action: 'generateCode',
-              secret: matches[index].secret,
-              digits: matches[index].digits
+              id: matches[index].id
             });
 
             if (!response) {
@@ -513,9 +603,8 @@ export default defineContentScript({
     ) {
       try {
         const response = await safeSendMessage({
-          action: 'generateCode',
-          secret: secret.secret,
-          digits: secret.digits
+          action: 'consumeCode',
+          id: secret.id
         });
 
         if (!response?.code) {
@@ -563,8 +652,7 @@ export default defineContentScript({
         try {
           const response = await safeSendMessage({
             action: 'generateCode',
-            secret: secret.secret,
-            digits: secret.digits
+            id: secret.id
           });
           codesData.push(response);
         } catch {
@@ -575,18 +663,19 @@ export default defineContentScript({
       matches.forEach((secret, index) => {
         const codeData = codesData[index];
         const code = codeData?.code || '------';
-        const remaining = codeData?.remainingSeconds || 30;
-        const name = secret.name || secret.site;
+        const remaining = codeData?.remainingSeconds ?? 0;
+        const escapeHtml = (value: string) => value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]!));
+        const name = escapeHtml(secret.name || secret.site);
 
         html += `
           <div class="openpass-selector-item" data-index="${index}">
             <div class="openpass-selector-info">
               <div class="openpass-selector-name">${name}</div>
-              <div class="openpass-selector-site">${secret.site}</div>
+              <div class="openpass-selector-site">${escapeHtml(secret.site)}</div>
             </div>
             <div class="openpass-selector-code">
               <span class="openpass-code-value">${formatCode(code)}</span>
-              <span class="openpass-countdown" data-remaining="${remaining}">${remaining}s</span>
+              <span class="openpass-countdown" data-type="${secret.type || 'totp'}" data-remaining="${remaining}">${secret.type === 'hotp' ? 'HOTP' : `${remaining}s`}</span>
             </div>
           </div>
         `;
@@ -653,14 +742,7 @@ export default defineContentScript({
         return;
       }
 
-      const { wrapper, group } = entry;
-      const firstInput = group.inputs[0];
-      const parent = wrapper.parentNode;
-      if (parent instanceof Node && firstInput && wrapper.contains(firstInput)) {
-        parent.insertBefore(firstInput, wrapper);
-      }
-
-      wrapper.remove();
+      entry.button.remove();
       groupButtons.delete(anchor);
     }
 
@@ -684,14 +766,25 @@ export default defineContentScript({
     }
 
     function init() {
-      void fetchSecrets();
+      void fetchSecrets().catch(console.error);
 
-      chrome.storage.onChanged.addListener((changes) => {
-        if (changes.secrets) {
-          void fetchSecrets();
+      chrome.runtime.onMessage.addListener((request) => {
+        if (request.action === 'vaultChanged') {
+          void fetchSecrets().catch(console.error);
+        } else if (request.action === 'showQrCandidates' && Array.isArray(request.candidates)) {
+          showQrCandidates(request.candidates as QrScanCandidate[]);
+        } else if (request.action === 'startQrSelection') {
+          startQrSelection(String(request.message || '请框选二维码区域'));
         }
       });
 
+      chrome.storage.onChanged.addListener((changes) => {
+        if (changes.encryptedSecrets || changes.sessionExpiresAt) {
+          void fetchSecrets().catch(console.error);
+        }
+      });
+
+      window.setInterval(() => { void fetchSecrets().catch(console.error); }, 30000);
       observeUrlChange();
       startDetection();
     }
@@ -705,13 +798,59 @@ export default defineContentScript({
 });
 
 const CONTENT_STYLES = String.raw`
-.openpass-input-wrapper { position: relative; display: inline-block; }
+.openpass-qr-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  background: rgba(15, 23, 42, 0.34);
+  cursor: default;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+.openpass-qr-overlay.openpass-qr-selecting { cursor: crosshair; }
+.openpass-qr-hint {
+  position: fixed;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(560px, calc(100vw - 32px));
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: #111827;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  pointer-events: none;
+}
+.openpass-qr-candidate {
+  position: fixed;
+  min-width: 36px;
+  min-height: 36px;
+  border: 3px solid #6366f1;
+  border-radius: 8px;
+  background: rgba(99, 102, 241, 0.18);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.9), 0 8px 24px rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+}
+.openpass-qr-candidate:hover,
+.openpass-qr-candidate:focus-visible {
+  background: rgba(16, 185, 129, 0.28);
+  border-color: #10b981;
+  outline: none;
+}
+.openpass-qr-selection {
+  display: none;
+  position: fixed;
+  border: 2px solid #818cf8;
+  background: rgba(255, 255, 255, 0.12);
+  box-shadow: 0 0 0 9999px rgba(15, 23, 42, 0.42);
+  pointer-events: none;
+}
 
 /* 浮动填充按钮 */
 .openpass-float-btn {
-  position: absolute;
-  top: 50%;
-  right: 8px;
+  position: fixed;
   transform: translateY(-50%);
   width: 28px;
   height: 28px;
@@ -731,9 +870,6 @@ const CONTENT_STYLES = String.raw`
 .openpass-float-btn:active { transform: translateY(-50%) scale(0.95); }
 .openpass-float-btn svg { width: 16px; height: 16px; pointer-events: none; }
 .openpass-float-btn.openpass-success { background: #10b981; }
-/* 多输入分组：按钮置于整组左侧外围 */
-.openpass-float-btn.openpass-group { right: auto; left: -34px; }
-
 /* 密钥选择弹层 */
 .openpass-selector {
   position: fixed;

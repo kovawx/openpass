@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted } from 'vue';
 
 interface Emits {
   (e: 'add'): void;
+  (e: 'scan'): void;
   (e: 'about'): void;
   (e: 'manage'): void;
 }
@@ -27,6 +28,25 @@ onUnmounted(() => document.removeEventListener('click', handleGlobalClick));
     <h1 class="text-base font-semibold text-gray-900">OpenPass</h1>
 
     <div class="flex gap-1">
+      <!-- 扫描当前页面 -->
+      <button
+        type="button"
+        class="flex items-center justify-center w-9 h-9 rounded-lg text-gray-500 hover:bg-gray-100 hover:text-primary-600 transition-colors"
+        title="扫描当前页面二维码"
+        @click="emit('scan')"
+      >
+        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M3 7V5a2 2 0 0 1 2-2h2" />
+          <path d="M17 3h2a2 2 0 0 1 2 2v2" />
+          <path d="M21 17v2a2 2 0 0 1-2 2h-2" />
+          <path d="M7 21H5a2 2 0 0 1-2-2v-2" />
+          <rect x="7" y="7" width="3" height="3" />
+          <rect x="14" y="7" width="3" height="3" />
+          <rect x="7" y="14" width="3" height="3" />
+          <path d="M14 14h3v3h-3z" />
+        </svg>
+      </button>
+
       <!-- 添加 -->
       <button
         type="button"

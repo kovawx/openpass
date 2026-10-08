@@ -75,5 +75,5 @@ export function formatDateTime(date: string | Date): string {
  * 生成唯一 ID
  */
 export function generateId(): string {
-  return crypto.randomUUID();
+  return globalThis.crypto.randomUUID();
 }

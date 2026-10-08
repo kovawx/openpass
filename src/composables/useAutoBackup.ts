@@ -6,10 +6,10 @@ import {
   type BackupSecretLike
 } from '@/utils/backup';
 import {
-  DEFAULT_BACKUP_LOCATION_LABEL,
+  UNSELECTED_BACKUP_LOCATION_LABEL,
   createBackupFilename,
+  getBackupDirectoryAccessError,
   getCustomBackupLocationLabel,
-  writeBackupToDefaultDownloads,
   type BackupDirectoryWriteResult
 } from '@/utils/backupDestination';
 import { getErrorMessage } from '@/utils/error';
@@ -28,7 +28,6 @@ export interface DirectoryInfo {
   hasHandle: boolean;
   name: string | null;
   permission: 'granted' | 'prompt' | 'denied' | 'no-handle';
-  usesDefaultPath: boolean;
   locationLabel: string;
 }
 
@@ -41,7 +40,6 @@ interface BackupSnapshot<T = BackupSecretLike> {
 const DB_NAME = 'OpenPassBackupDB';
 const DB_VERSION = 1;
 const STORE_NAME = 'handles';
-const ALARM_NAME = 'openpass-auto-backup';
 
 export function useAutoBackup() {
   const settings = ref<BackupSettings>({
@@ -116,24 +114,14 @@ export function useAutoBackup() {
   }
 
   async function setupAlarm() {
-    await chrome.alarms.clear(ALARM_NAME);
-    const nextBackupTime = settings.value.nextBackupTime
-      ? new Date(settings.value.nextBackupTime).getTime()
-      : Number.NaN;
-    const delayInMinutes = Number.isFinite(nextBackupTime)
-      ? Math.max(1, Math.ceil((nextBackupTime - Date.now()) / (60 * 1000)))
-      : 60;
-
-    chrome.alarms.create(ALARM_NAME, {
-      delayInMinutes,
-      periodInMinutes: 60
-    });
+    const result = await chrome.runtime.sendMessage({ action: 'updateBackupSchedule' });
+    if (result?.error) throw new Error(result.error);
   }
 
   async function clearAlarm() {
-    await chrome.alarms.clear(ALARM_NAME);
     settings.value.nextBackupTime = null;
     await saveSettings({ nextBackupTime: null });
+    await setupAlarm();
   }
 
   async function openDB(): Promise<IDBDatabase> {
@@ -201,6 +189,13 @@ export function useAutoBackup() {
         id: 'openpass-backup-dir'
       });
 
+      const permission = (await handle.requestPermission?.({ mode: 'readwrite' })) ??
+        (await handle.queryPermission?.({ mode: 'readwrite' })) ??
+        'denied';
+      if (permission !== 'granted') {
+        return { success: false, error: '未获得目录写入权限' };
+      }
+
       await saveHandle(handle);
       await chrome.storage.local.set({ backupDirectory: handle.name });
       settings.value.backupDirectory = handle.name;
@@ -223,8 +218,7 @@ export function useAutoBackup() {
         hasHandle: false,
         name: null,
         permission: 'no-handle',
-        usesDefaultPath: true,
-        locationLabel: DEFAULT_BACKUP_LOCATION_LABEL
+        locationLabel: UNSELECTED_BACKUP_LOCATION_LABEL
       };
     }
 
@@ -234,7 +228,6 @@ export function useAutoBackup() {
         hasHandle: true,
         name: handle.name,
         permission: permission ?? 'prompt',
-        usesDefaultPath: false,
         locationLabel: getCustomBackupLocationLabel(handle.name)
       };
     } catch {
@@ -242,7 +235,6 @@ export function useAutoBackup() {
         hasHandle: true,
         name: handle.name,
         permission: 'prompt',
-        usesDefaultPath: false,
         locationLabel: getCustomBackupLocationLabel(handle.name)
       };
     }
@@ -256,7 +248,8 @@ export function useAutoBackup() {
 
     try {
       const permission = await handle.requestPermission?.({ mode: 'readwrite' });
-      return { success: permission === 'granted' };
+      if (permission === 'granted') return { success: true };
+      return { success: false, error: '未获得目录写入权限，请重新选择目录并允许写入' };
     } catch (error) {
       return { success: false, error: getErrorMessage(error) };
     }
@@ -269,18 +262,20 @@ export function useAutoBackup() {
       const handle = await getStoredHandle();
 
       if (!handle) {
-        return writeBackupToDefaultDownloads(backupData);
+        return {
+          success: false,
+          error: getBackupDirectoryAccessError('no-handle')!,
+          needAuth: true,
+          locationLabel: UNSELECTED_BACKUP_LOCATION_LABEL
+        };
       }
 
-      let permission = (await handle.queryPermission?.({ mode: 'readwrite' })) ?? 'prompt';
-      if (permission === 'prompt') {
-        permission = (await handle.requestPermission?.({ mode: 'readwrite' })) ?? 'denied';
-      }
+      const permission = (await handle.queryPermission?.({ mode: 'readwrite' })) ?? 'prompt';
 
       if (permission !== 'granted') {
         return {
           success: false,
-          error: permission === 'denied' ? '权限被拒绝，请重新选择目录' : '需要授权写入权限',
+          error: getBackupDirectoryAccessError(permission)!,
           needAuth: true
         };
       }
@@ -294,8 +289,7 @@ export function useAutoBackup() {
       return {
         success: true,
         filename,
-        locationLabel: getCustomBackupLocationLabel(handle.name, filename),
-        usesDefaultPath: false
+        locationLabel: getCustomBackupLocationLabel(handle.name, filename)
       };
     } catch (error) {
       return { success: false, error: getErrorMessage(error) };
@@ -333,22 +327,20 @@ export function useAutoBackup() {
       directory: undefined
     };
 
-    let hasSuccessfulTarget = false;
-
     if (settings.value.enableLocalSnapshot) {
       await saveSnapshot(backupData);
       results.snapshot = true;
-      hasSuccessfulTarget = true;
     }
 
     if (settings.value.enableDirectoryBackup) {
       results.directory = await writeToDirectory(backupData);
-      if (results.directory.success) {
-        hasSuccessfulTarget = true;
-      }
     }
 
-    if (hasSuccessfulTarget) {
+    const allEnabledTargetsSucceeded =
+      (!settings.value.enableLocalSnapshot || results.snapshot) &&
+      (!settings.value.enableDirectoryBackup || results.directory?.success === true);
+
+    if (allEnabledTargetsSucceeded) {
       const now = new Date().toISOString();
       const interval = getBackupInterval(settings.value.backupFrequency);
       const nextBackup = new Date(Date.now() + interval).toISOString();

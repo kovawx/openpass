@@ -20,12 +20,10 @@ export interface RuntimeErrorEntry {
   createdAt: string;
 }
 
-type ErrorEventTarget = {
-  addEventListener: (
-    type: 'error' | 'unhandledrejection',
-    listener: (event: any) => void
-  ) => void;
-};
+export interface ErrorEventTarget {
+  addEventListener(type: 'error', listener: (event: ErrorEvent) => void): void;
+  addEventListener(type: 'unhandledrejection', listener: (event: PromiseRejectionEvent) => void): void;
+}
 
 interface RuntimeErrorListenerOptions {
   ignoreExternalScriptErrors?: boolean;
@@ -60,14 +58,14 @@ function hasExtensionSource(error: unknown, filename?: string) {
   return error instanceof Error && Boolean(error.stack?.includes(extensionUrlPrefix));
 }
 
-function shouldIgnoreErrorEvent(event: any, options: RuntimeErrorListenerOptions) {
+function shouldIgnoreErrorEvent(event: ErrorEvent, options: RuntimeErrorListenerOptions) {
   return (
     options.ignoreExternalScriptErrors === true &&
     !hasExtensionSource(event.error, event.filename)
   );
 }
 
-function shouldIgnoreUnhandledRejection(event: any, options: RuntimeErrorListenerOptions) {
+function shouldIgnoreUnhandledRejection(event: PromiseRejectionEvent, options: RuntimeErrorListenerOptions) {
   if (options.ignoreExternalScriptErrors !== true) {
     return false;
   }

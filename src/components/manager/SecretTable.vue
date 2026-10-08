@@ -47,19 +47,9 @@ watch(
   }
 );
 
-// 监听 secrets 数组长度变化（添加/删除密钥）
 watch(
-  () => secretStore.secrets.length,
-  async (newLength, oldLength) => {
-    if (newLength > (oldLength || 0)) {
-      // 新增密钥，为新增的生成验证码
-      for (const secret of secretStore.secrets) {
-        if (!codeData.value[secret.id]) {
-          await generateCodeForSecret(secret);
-        }
-      }
-    }
-  }
+  () => JSON.stringify(secretStore.secrets),
+  async () => { codeData.value = {}; await initializeCodes(); }
 );
 
 async function initializeCodes() {
@@ -71,12 +61,13 @@ async function initializeCodes() {
 
 async function generateCodeForSecret(secret: Secret) {
   try {
-    const result = await TOTP.generateCode(secret.secret, secret.digits || 6);
+    const result = await TOTP.generateCode(secret);
     codeData.value[secret.id] = {
       code: TOTP.formatCode(result.code),
       remaining: result.remainingSeconds
     };
   } catch (e) {
+    delete codeData.value[secret.id];
     console.error('生成验证码失败:', secret.site, e);
   }
 }
@@ -95,6 +86,7 @@ function stopTimer() {
 async function updateAllCodes() {
   for (const secret of secretStore.secrets) {
     const existing = codeData.value[secret.id];
+    if (secret.type === 'hotp' && existing) continue;
     if (existing && existing.remaining > 1) {
       existing.remaining--;
       continue;
@@ -105,11 +97,11 @@ async function updateAllCodes() {
 }
 
 async function copyCode(secret: Secret) {
-  const code = codeData.value[secret.id];
-  if (code) {
-    await TOTP.copyToClipboard(code.code.replace(' ', ''));
+  try {
+    const result = await TOTP.generateCode(secret, 6, {}, true);
+    await TOTP.copyToClipboard(result.code);
     showToast('验证码已复制', 'success');
-  }
+  } catch (error) { showToast((error as Error).message, 'error'); }
 }
 
 function getProgressClass(remaining: number): string {
@@ -211,9 +203,9 @@ function openSite(site: string) {
                 </span>
                 <span
                   class="text-xs font-mono"
-                  :class="getProgressClass(codeData[secret.id].remaining)"
+                  :class="secret.type === 'hotp' ? 'text-gray-500' : getProgressClass(codeData[secret.id].remaining)"
                 >
-                  {{ codeData[secret.id].remaining }}s
+                  {{ secret.type === 'hotp' ? `HOTP · ${secret.counter ?? 0}` : `${codeData[secret.id].remaining}s` }}
                 </span>
               </div>
               <div v-else class="text-sm text-gray-400">生成中...</div>

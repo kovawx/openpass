@@ -1,146 +1,59 @@
 import { defineStore } from 'pinia';
-import { ref } from 'vue';
+import { ref, watch } from 'vue';
 import { useAuthStore } from './auth';
-import CryptoUtils from '@/utils/crypto';
+import { readVault, type VaultSecret } from '@/utils/vault';
+import { requireSessionKey } from '@/utils/session';
 import { showToast } from '@/utils/ui';
 import {
   buildSecretIdentity,
   checkBackupCompatibility,
   createBackupData,
   decryptBackupData,
-  getBackupEncryptionSettings,
   migrateBackupData,
-  resolveStoredBackupPassword,
-  triggerChangeBackup,
   validateBackupData
 } from '@/utils/backup';
 
-export interface Secret {
-  id: string;
-  secret: string;
-  site: string;
-  name?: string;
-  digits?: number;
-  period?: number;
-  algorithm?: string;
-  createdAt?: string;
-  updatedAt?: string;
-  importedAt?: string;
-}
+export type Secret = VaultSecret;
 
 export const useSecretStore = defineStore('secrets', () => {
   const secrets = ref<Secret[]>([]);
   const loading = ref(false);
+  let savedState = '[]';
   const searchQuery = ref('');
+
+  const authStore = useAuthStore();
+  watch(() => authStore.sessionKey, (key) => { if (!key) secrets.value = []; });
 
   async function loadSecrets() {
     loading.value = true;
-
     try {
-      const authStore = useAuthStore();
-      const result = await chrome.storage.local.get<{
-        encryptedSecrets?: string;
-        secrets?: Secret[];
-      }>(['encryptedSecrets', 'secrets']);
-
-      if (typeof result.encryptedSecrets === 'string' && authStore.sessionKey) {
-        const decrypted = await CryptoUtils.decrypt(result.encryptedSecrets, authStore.sessionKey);
-        const parsed = JSON.parse(decrypted);
-        secrets.value = Array.isArray(parsed) ? parsed : [];
-      } else if (Array.isArray(result.secrets)) {
-        secrets.value = result.secrets;
-      } else {
-        secrets.value = [];
-      }
-
-      // 如果没有 encryptedSecrets 但有 sessionKey，生成一个用于自动备份快速路径
-      if (authStore.sessionKey && typeof result.encryptedSecrets !== 'string' && secrets.value.length > 0) {
-        console.log('[SecretStore] 自动生成 encryptedSecrets 用于自动备份快速路径');
-        await saveSecrets();
-      }
-
-      if (!Array.isArray(result.secrets) && secrets.value.length > 0) {
-        console.warn('[SecretStore] storage 中 secrets 格式异常，正在修复...');
-        const plainSecrets = secrets.value.map((secret) => ({ ...secret }));
-        await chrome.storage.local.set({
-          secrets: plainSecrets,
-          sitesList: plainSecrets.map((secret) => ({ site: secret.site }))
-        });
-      }
+      secrets.value = await authStore.checkSession() ? await readVault() : [];
+      savedState = JSON.stringify(secrets.value);
     } catch (error) {
-      console.error('加载密钥失败:', error);
-      showToast('加载密钥失败', 'error');
       secrets.value = [];
+      showToast((error as Error).message || '加载密钥失败', 'error');
     } finally {
       loading.value = false;
     }
   }
 
   async function saveSecrets(options: { triggerSnapshot?: boolean } = {}) {
-    const authStore = useAuthStore();
-
-    if (!Array.isArray(secrets.value)) {
-      console.error('[SecretStore] secrets 不是数组，强制修复');
-      secrets.value = [];
-    }
-
-    // 脱离 Vue 响应式代理，转为纯数组再写入 storage。
-    // 直接写入 reactive 代理对象会被 chrome.storage 序列化破坏数组结构（变对象），
-    // 进而在 popup / store 间触发"格式异常"自愈循环。
-    const plainSecrets = secrets.value.map((secret) => ({ ...secret }));
-    const sitesList = plainSecrets.map((secret) => ({ site: secret.site }));
-    const data: {
-      secrets: Secret[];
-      sitesList: Array<{ site: string }>;
-      encryptedSecrets?: string;
-      encryptedSecretsForBackup?: string;
-    } = {
-      secrets: plainSecrets,
-      sitesList
-    };
-
-    if (authStore.sessionKey) {
-      data.encryptedSecrets = await CryptoUtils.encrypt(
-        JSON.stringify(plainSecrets),
-        authStore.sessionKey
-      );
-
-      const encryptionSettings = await getBackupEncryptionSettings();
-      if (
-        encryptionSettings.enableBackupEncryption &&
-        !encryptionSettings.useMasterPasswordForBackup &&
-        encryptionSettings.encryptedBackupPassword
-      ) {
-        try {
-          const backupPassword = await CryptoUtils.decrypt(
-            encryptionSettings.encryptedBackupPassword,
-            authStore.sessionKey
-          );
-          data.encryptedSecretsForBackup = await CryptoUtils.encrypt(
-            JSON.stringify(plainSecrets),
-            backupPassword
-          );
-        } catch {
-          console.error('[SecretStore] 无法更新 encryptedSecretsForBackup');
-        }
-      }
-    }
-
-    await chrome.storage.local.set(data);
-
-    if (options.triggerSnapshot) {
-      const encryptionSettings = await getBackupEncryptionSettings();
-      const password = await resolveStoredBackupPassword(authStore.sessionKey, encryptionSettings);
-      void triggerChangeBackup(plainSecrets, password).catch((error) => {
-        console.error('触发本地快照失败:', error);
+    await requireSessionKey();
+    try {
+      const result = await chrome.runtime.sendMessage({
+        action: 'saveVault', secrets: secrets.value.map((secret) => ({ ...secret })), expectedSecrets: savedState,
+        triggerSnapshot: options.triggerSnapshot === true
       });
-    }
+      if (result?.error || !result?.success) throw new Error(result?.error || '保存失败');
+      secrets.value = result.secrets;
+      savedState = JSON.stringify(result.secrets);
+    } catch (error) { await loadSecrets(); throw error; }
   }
 
   async function addSecret(secretData: Omit<Secret, 'id' | 'createdAt' | 'updatedAt'>) {
     const newSecret: Secret = {
       ...secretData,
-      id: crypto.randomUUID(),
+      id: globalThis.crypto.randomUUID(),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
@@ -151,10 +64,14 @@ export const useSecretStore = defineStore('secrets', () => {
     return newSecret;
   }
 
-  async function updateSecret(id: string, updates: Partial<Secret>) {
+  async function updateSecret(id: string, updates: Partial<Secret>, expected?: Secret) {
     const index = secrets.value.findIndex((secret) => secret.id === id);
     if (index === -1) {
-      return;
+      throw new Error('此密钥已被删除，请刷新后重新操作');
+    }
+
+    if (expected && JSON.stringify(expected) !== JSON.stringify(secrets.value[index])) {
+      throw new Error('此密钥已更新，请关闭编辑窗口后重新打开');
     }
 
     secrets.value[index] = {
@@ -251,7 +168,7 @@ export const useSecretStore = defineStore('secrets', () => {
     for (const secret of importedSecrets) {
       const normalizedSecret: Secret = {
         ...secret,
-        id: secret.id || crypto.randomUUID(),
+        id: secret.id || globalThis.crypto.randomUUID(),
         secret: String(secret.secret || '').trim().toUpperCase().replace(/\s/g, ''),
         site: String(secret.site || '').trim().toLowerCase(),
         digits: typeof secret.digits === 'number' ? secret.digits : 6
@@ -259,6 +176,8 @@ export const useSecretStore = defineStore('secrets', () => {
 
       const secretIdentity = buildSecretIdentity(normalizedSecret);
       if (!existingSecrets.has(secretIdentity)) {
+        if (secrets.value.some((entry) => entry.id === normalizedSecret.id)) normalizedSecret.id = globalThis.crypto.randomUUID();
+        normalizedSecret.importedAt = new Date().toISOString();
         secrets.value.push(normalizedSecret);
         existingSecrets.add(secretIdentity);
         count += 1;

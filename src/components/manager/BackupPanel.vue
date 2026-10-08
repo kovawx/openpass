@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue';
 import { useSecretStore, type Secret } from '@/stores/secrets';
 import { useAuthStore } from '@/stores/auth';
 import { getErrorMessage } from '@/utils/error';
+import { restoreBackupInManager } from '@/utils/restoreClient';
+import type { RestoreMode } from '@/utils/restore';
 import { showToast } from '@/utils/ui';
 import {
   type BackupData,
@@ -16,6 +18,52 @@ import {
   validateBackupData
 } from '@/utils/backup';
 
+const snapshots = ref<Array<{ timestamp: string; count: number; data: BackupData<Secret> }>>([]);
+const snapshotMode = ref<RestoreMode>('merge');
+const restoringSnapshot = ref<number | null>(null);
+const loadingSnapshots = ref(false);
+const snapshotReadError = ref('');
+const snapshotDialog = ref<HTMLDialogElement | null>(null);
+const selectedSnapshot = ref<{ snapshot: (typeof snapshots.value)[number]; index: number; mode: RestoreMode } | null>(null);
+const snapshotRestoreError = ref('');
+async function refreshSnapshots() {
+  if (loadingSnapshots.value) return;
+  loadingSnapshots.value = true;
+  snapshotReadError.value = '';
+  try {
+    const result = await chrome.storage.local.get<{ backupSnapshots?: typeof snapshots.value }>(['backupSnapshots']);
+    snapshots.value = Array.isArray(result.backupSnapshots) ? result.backupSnapshots : [];
+  } catch (error) { snapshotReadError.value = `读取快照失败：${getErrorMessage(error)}`; }
+  finally { loadingSnapshots.value = false; }
+}
+async function selectSnapshot(snapshot: (typeof snapshots.value)[number], index: number) {
+  if (restoringSnapshot.value !== null || loadingSnapshots.value) return;
+  selectedSnapshot.value = { snapshot, index, mode: snapshotMode.value };
+  snapshotRestoreError.value = '';
+  await nextTick();
+  snapshotDialog.value?.showModal();
+}
+function closeSnapshotDialog() {
+  if (restoringSnapshot.value === null) snapshotDialog.value?.close();
+}
+function handleSnapshotChange(changes: Record<string, chrome.storage.StorageChange>, area: chrome.storage.AreaName) {
+  if (area === 'local' && changes.backupSnapshots && restoringSnapshot.value === null) void refreshSnapshots();
+}
+async function restoreSnapshot() {
+  if (!selectedSnapshot.value || restoringSnapshot.value !== null) return;
+  const { snapshot, index, mode } = selectedSnapshot.value;
+  restoringSnapshot.value = index;
+  snapshotRestoreError.value = '';
+  try {
+    const result = await restoreBackupInManager(snapshot.data, mode, { confirmed: true });
+    if (result) {
+      await secretStore.loadSecrets(); await refreshSnapshots();
+      snapshotDialog.value?.close();
+      showToast(`恢复完成，当前共 ${result.count} 个密钥`, 'success');
+    }
+  } catch (error) { snapshotRestoreError.value = getErrorMessage(error, '恢复失败'); }
+  finally { restoringSnapshot.value = null; }
+}
 const secretStore = useSecretStore();
 const authStore = useAuthStore();
 
@@ -53,10 +101,13 @@ const backupInfo = computed(() => {
 });
 
 onMounted(async () => {
+  chrome.storage.onChanged.addListener(handleSnapshotChange);
+  await refreshSnapshots();
   const result = await getBackupEncryptionSettings();
   enableBackupEncryption.value = result.enableBackupEncryption;
   useMasterPasswordForBackup.value = result.useMasterPasswordForBackup;
 });
+onUnmounted(() => chrome.storage.onChanged.removeListener(handleSnapshotChange));
 
 async function handleExport() {
   if (secretStore.secrets.length === 0) {
@@ -169,7 +220,7 @@ async function handleFileSelect(event: Event) {
 function normalizeImportedSecret(secret: Secret): Secret {
   return {
     ...secret,
-    id: secret.id || crypto.randomUUID(),
+    id: secret.id || globalThis.crypto.randomUUID(),
     secret: String(secret.secret || '').trim().toUpperCase().replace(/\s/g, ''),
     site: String(secret.site || '').trim().toLowerCase(),
     digits: typeof secret.digits === 'number' ? secret.digits : 6
@@ -293,6 +344,7 @@ async function performImport() {
       );
 
       if (existingIndex === -1) {
+        if (secretStore.secrets.some((entry) => entry.id === secret.id)) secret.id = globalThis.crypto.randomUUID();
         secretStore.secrets.push({
           ...secret,
           importedAt: new Date().toISOString()
@@ -320,8 +372,9 @@ async function performImport() {
 
       secretStore.secrets.push({
         ...secret,
-        id: crypto.randomUUID(),
-        site: `${secret.site}-${crypto.randomUUID().slice(0, 8)}`,
+        id: globalThis.crypto.randomUUID(),
+        duplicateOf: secretStore.secrets[existingIndex].id,
+        name: `${secret.name || secret.site}（导入副本）`,
         importedAt: new Date().toISOString()
       });
       addedCount += 1;
@@ -362,6 +415,73 @@ function resetImport() {
   </header>
 
   <div class="page-content">
+    <section class="backup-section snapshot-section" aria-labelledby="snapshot-heading" :aria-busy="loadingSnapshots || restoringSnapshot !== null">
+      <div class="snapshot-header">
+        <div>
+          <h2 id="snapshot-heading">本地快照恢复</h2>
+          <p>保留最近 5 份加密快照，恢复前会保存当前版本。</p>
+        </div>
+        <button class="btn-secondary" :disabled="loadingSnapshots || restoringSnapshot !== null" @click="refreshSnapshots">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <path d="M20 7v5h-5M4 17v-5h5"></path><path d="M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17"></path>
+          </svg>
+          {{ loadingSnapshots ? '读取中…' : '刷新快照' }}
+        </button>
+      </div>
+      <div class="snapshot-toolbar" :class="{ 'snapshot-toolbar-replace': snapshotMode === 'replace' }">
+        <div class="snapshot-mode-field">
+          <label for="snapshot-mode">恢复方式</label>
+          <select id="snapshot-mode" v-model="snapshotMode" class="form-input" :disabled="restoringSnapshot !== null" aria-describedby="snapshot-mode-hint">
+            <option value="merge">合并到当前密钥</option>
+            <option value="replace">替换为快照版本</option>
+          </select>
+        </div>
+        <p id="snapshot-mode-hint" class="snapshot-mode-hint">
+          {{ snapshotMode === 'merge' ? '保留当前其他密钥，同 ID 记录使用快照内容。' : '将当前密钥替换为快照版本，快照之外的记录会被移除。' }}
+        </p>
+      </div>
+      <div v-if="snapshotReadError" class="snapshot-read-error" role="alert">{{ snapshotReadError }}</div>
+      <div v-if="snapshots.length" class="snapshot-table">
+        <div class="snapshot-table-heading" aria-hidden="true"><span>备份时间</span><span>密钥数量</span><span>存储状态</span><span>操作</span></div>
+        <ul class="snapshot-list">
+          <li v-for="(snapshot, index) in snapshots" :key="`${snapshot.timestamp}-${index}`" class="snapshot-item" :class="{ 'snapshot-item-restoring': restoringSnapshot === index }">
+            <div class="snapshot-item-title">
+              <time :datetime="snapshot.timestamp">{{ new Date(snapshot.timestamp).toLocaleString('zh-CN') }}</time>
+              <span v-if="index === 0" class="snapshot-latest">最新</span>
+            </div>
+            <span class="snapshot-item-count">{{ snapshot.count }} 个密钥</span>
+            <span class="snapshot-item-meta" :class="{ 'snapshot-encrypted': snapshot.data.encrypted }">{{ snapshot.data.encrypted ? '已加密' : '旧版格式' }}</span>
+            <button class="btn-secondary" :disabled="restoringSnapshot !== null || loadingSnapshots" :aria-label="`恢复 ${new Date(snapshot.timestamp).toLocaleString('zh-CN')} 的快照`" @click="selectSnapshot(snapshot, index)">
+              {{ restoringSnapshot === index ? '恢复中…' : '恢复' }}
+            </button>
+          </li>
+        </ul>
+      </div>
+      <div v-else-if="!snapshotReadError" class="snapshot-empty" role="status">
+        <strong>{{ loadingSnapshots ? '正在读取本地快照…' : '暂无本地快照' }}</strong>
+        <span v-if="!loadingSnapshots">添加、编辑或删除密钥后会保存快照，也可在设置中启用自动备份。</span>
+      </div>
+    </section>
+    <dialog ref="snapshotDialog" class="snapshot-dialog" aria-labelledby="snapshot-dialog-title" aria-describedby="snapshot-dialog-impact" @cancel="restoringSnapshot !== null && $event.preventDefault()" @close="selectedSnapshot = null" @click="($event.target === snapshotDialog) && closeSnapshotDialog()">
+      <template v-if="selectedSnapshot">
+        <div class="snapshot-dialog-body">
+          <h2 id="snapshot-dialog-title">{{ selectedSnapshot.mode === 'replace' ? '确认替换恢复' : '确认合并恢复' }}</h2>
+          <p class="snapshot-dialog-subtitle">恢复 {{ new Date(selectedSnapshot.snapshot.timestamp).toLocaleString('zh-CN') }} 的快照</p>
+          <dl class="snapshot-dialog-summary"><div><dt>快照包含</dt><dd>{{ selectedSnapshot.snapshot.count }} 个密钥</dd></div><div><dt>当前已有</dt><dd>{{ secretStore.secrets.length }} 个密钥</dd></div></dl>
+          <p id="snapshot-dialog-impact" class="snapshot-dialog-impact" :class="{ 'snapshot-dialog-danger': selectedSnapshot.mode === 'replace' }">
+            {{ selectedSnapshot.mode === 'merge' ? '保留当前其他密钥，同 ID 记录使用快照内容。' : '当前密钥将替换为快照版本，快照之外的记录会被移除。' }}
+          </p>
+          <p class="snapshot-dialog-note">恢复前会保存当前加密快照，HOTP 计数器不会回退。</p>
+          <p v-if="snapshotRestoreError" class="form-error" role="alert">{{ snapshotRestoreError }}</p>
+        </div>
+        <div class="snapshot-dialog-actions">
+          <button class="btn-secondary" :disabled="restoringSnapshot !== null" autofocus @click="closeSnapshotDialog">取消</button>
+          <button class="btn-primary" :class="{ 'snapshot-replace-button': selectedSnapshot.mode === 'replace' }" :disabled="restoringSnapshot !== null" @click="restoreSnapshot">
+            <span v-if="restoringSnapshot !== null" class="snapshot-spinner" aria-hidden="true"></span>{{ restoringSnapshot !== null ? '恢复中…' : selectedSnapshot.mode === 'replace' ? '确认替换' : '确认合并' }}
+          </button>
+        </div>
+      </template>
+    </dialog>
     <div class="backup-sections">
       <section class="backup-section">
         <div class="section-icon export">
@@ -602,6 +722,242 @@ function resetImport() {
   font-size: 14px;
   color: #64748b;
   margin-bottom: 20px;
+}
+
+.snapshot-section {
+  padding: 24px;
+  margin-bottom: 24px;
+  text-align: left;
+}
+
+.snapshot-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.snapshot-header h2 {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.snapshot-header p {
+  margin: 0;
+  font-size: 13px;
+}
+
+.snapshot-section .btn-secondary {
+  flex-shrink: 0;
+  padding: 8px 14px;
+  white-space: nowrap;
+}
+
+.snapshot-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  margin: 20px 0 16px;
+  padding: 14px 16px;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.snapshot-toolbar-replace { background: #fff7ed; }
+.snapshot-toolbar-replace .snapshot-mode-hint { color: #9a3412; }
+
+.snapshot-mode-field {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 12px;
+}
+
+.snapshot-mode-field label {
+  font-size: 13px;
+  font-weight: 500;
+  color: #475569;
+  white-space: nowrap;
+}
+
+.snapshot-mode-field .form-input {
+  width: 220px;
+  height: 40px;
+  padding: 8px 38px 8px 12px;
+  appearance: none;
+  background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") no-repeat right 12px center;
+  cursor: pointer;
+}
+
+.snapshot-section .snapshot-mode-hint {
+  margin: 0;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.snapshot-table {
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.snapshot-table-heading,
+.snapshot-item {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 96px 96px 76px;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+}
+
+.snapshot-table-heading {
+  background: #f8fafc;
+  color: #64748b;
+  font-size: 12px;
+}
+.snapshot-table-heading > :last-child { text-align: right; }
+
+.snapshot-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.snapshot-item {
+  border-top: 1px solid #e2e8f0;
+  transition: background-color 160ms ease;
+}
+.snapshot-item:hover, .snapshot-item:focus-within { background: #f8fafc; }
+.snapshot-item-restoring { background: #eef2ff; }
+.snapshot-item .btn-secondary { justify-self: end; min-width: 76px; }
+
+.snapshot-item-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: #1e293b;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.snapshot-latest {
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: #eef2ff;
+  color: #4f46e5;
+  font-size: 11px;
+}
+
+.snapshot-item-meta {
+  color: #64748b;
+  font-size: 12px;
+}
+.snapshot-item-count { color: #475569; font-size: 13px; }
+.snapshot-encrypted { color: #047857; }
+.snapshot-read-error { margin-bottom: 12px; color: #dc2626; font-size: 13px; }
+
+.snapshot-dialog {
+  width: min(480px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  margin: auto;
+  padding: 0;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  color: #1e293b;
+  box-shadow: 0 20px 60px #0f172a33;
+}
+.snapshot-dialog::backdrop { background: #0f172a66; }
+.snapshot-dialog-body { padding: 24px; }
+.snapshot-dialog h2 { margin: 0 0 8px; font-size: 18px; font-weight: 600; }
+.snapshot-dialog-subtitle, .snapshot-dialog-note { color: #64748b; font-size: 13px; line-height: 1.6; }
+.snapshot-dialog-summary {
+  display: flex;
+  gap: 40px;
+  margin: 20px 0;
+  padding: 16px;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+.snapshot-dialog-summary dt { color: #64748b; font-size: 12px; margin-bottom: 6px; }
+.snapshot-dialog-summary dd { margin: 0; font-size: 16px; font-weight: 600; }
+.snapshot-dialog-impact { color: #4338ca; font-size: 13px; line-height: 1.7; }
+.snapshot-dialog-danger { color: #b91c1c; }
+.snapshot-dialog-note { margin-top: 12px; }
+.snapshot-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 16px 24px;
+  background: #f8fafc;
+  border-top: 1px solid #e2e8f0;
+}
+.snapshot-dialog .snapshot-replace-button { background: #dc2626; }
+.snapshot-dialog .snapshot-replace-button:hover { background: #b91c1c; }
+.snapshot-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid #ffffff66;
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: snapshot-spin 800ms linear infinite;
+}
+@keyframes snapshot-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .snapshot-item { transition: none; }
+  .snapshot-spinner { animation: none; }
+}
+
+.snapshot-empty {
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+  gap: 6px;
+  padding: 28px 16px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  color: #64748b;
+  font-size: 12px;
+  text-align: center;
+}
+
+.snapshot-empty strong {
+  color: #475569;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+@media (max-width: 900px) {
+  .snapshot-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .snapshot-table-heading { display: none; }
+  .snapshot-item { grid-template-columns: 1fr auto; gap: 6px 16px; }
+  .snapshot-item-title { grid-column: 1; }
+  .snapshot-item-count { grid-column: 1; }
+  .snapshot-item-meta { grid-column: 1; }
+  .snapshot-item .btn-secondary { grid-column: 2; grid-row: 1 / 4; }
+  .snapshot-item:first-child { border-top: 0; }
+}
+
+@media (max-width: 640px) {
+  .snapshot-header {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  .snapshot-mode-field {
+    width: 100%;
+  }
+
+  .snapshot-mode-field .form-input {
+    width: 100%;
+    min-width: 0;
+  }
+
 }
 
 .export-password-input {

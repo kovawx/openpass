@@ -1,3 +1,7 @@
+import { parseOtpAuth } from './otpAuth';
+import type { OtpAccount } from './vault';
+import type { OtpSettings } from './otp';
+
 /**
  * TOTP (Time-based One-Time Password) 生成工具
  * 基于 RFC 6238 实现
@@ -17,35 +21,23 @@ class TOTPUtils {
    * 生成 TOTP 验证码
    * 调用 background service worker 生成（需要访问 totp.js 库）
    */
-  async generateCode(secret: string, digits: number = 6): Promise<{
-    code: string;
-    remainingSeconds: number;
+  async generateCode(secret: string | OtpAccount, digits = 6, options: OtpSettings = {}, consume = false): Promise<{
+    code: string; remainingSeconds: number; period: number; type: 'totp' | 'hotp'; counter: number;
   }> {
-    return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage(
-        { action: 'generateCode', secret, digits },
-        (response) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-            return;
-          }
-          if (response?.error) {
-            reject(new Error(response.error));
-            return;
-          }
-          resolve({
-            code: response.code,
-            remainingSeconds: response.remainingSeconds
-          });
-        }
-      );
-    });
+    const request = typeof secret === 'string'
+      ? { action: 'generateCode', secret, digits, ...options }
+      : { action: consume ? 'consumeCode' : 'generateCode', id: secret.id };
+    const response = await chrome.runtime.sendMessage(request);
+    if (response?.error) throw new Error(response.error);
+    if (!response?.code) throw new Error('无法生成验证码');
+    return response;
   }
 
   /**
    * 格式化验证码（每 3 位加空格）
    */
   formatCode(code: string): string {
+    if (code?.length === 8) return code.slice(0, 4) + ' ' + code.slice(4);
     if (!code || code.length !== 6) return code;
     return code.slice(0, 3) + ' ' + code.slice(3);
   }
@@ -72,49 +64,8 @@ class TOTPUtils {
   /**
    * 解析 otpauth:// URL
    */
-  parseOTPAuthUrl(data: string): {
-    secret: string;
-    site: string;
-    name: string;
-  } | null {
-    // 直接是密钥（纯文本）
-    if (/^[A-Z2-7]+=*$/i.test(data.trim())) {
-      return {
-        secret: data.trim().toUpperCase().replace(/\s/g, ''),
-        site: '',
-        name: ''
-      };
-    }
-
-    // otpauth:// URL 格式
-    if (data.startsWith('otpauth://')) {
-      try {
-        const url = new URL(data);
-        const params = new URLSearchParams(url.search);
-
-        const secret = params.get('secret');
-        if (!secret) return null;
-
-        const issuer = params.get('issuer') || '';
-        const account = decodeURIComponent(url.pathname.split('/').pop() || '');
-        const label = params.get('label') || '';
-
-        let site = issuer;
-        if (!site && account.includes(':')) {
-          site = account.split(':')[0];
-        }
-
-        return {
-          secret: secret.toUpperCase(),
-          site: site.toLowerCase(),
-          name: issuer || label || account.replace(/.*:/, '')
-        };
-      } catch {
-        return null;
-      }
-    }
-
-    return null;
+  parseOTPAuthUrl(data: string) {
+    return parseOtpAuth(data);
   }
 }
 

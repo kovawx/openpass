@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { ref, reactive, watch, onUnmounted } from 'vue';
 import { TOTP } from '@/utils/totp';
+import { normalizeOtpSettings, type OtpSettings } from '@/utils/otp';
+import OtpFields from '@/components/OtpFields.vue';
 
 type TimerHandle = ReturnType<typeof setInterval>;
 
-interface InitialData {
+interface InitialData extends OtpSettings {
   secret: string;
   site: string;
   name: string;
@@ -53,14 +55,15 @@ async function updatePreview() {
   }
 
   try {
-    const result = await TOTP.generateCode(secret, form.digits);
+    const result = await TOTP.generateCode(secret, form.digits, form);
     previewCode.value = formatCode(result.code);
     previewRemaining.value = result.remainingSeconds;
 
     stopPreviewTimer();
+    if (form.type === 'hotp') return;
     previewTimer = setInterval(async () => {
       try {
-        const r = await TOTP.generateCode(secret, form.digits);
+        const r = await TOTP.generateCode(secret, form.digits, form);
         previewCode.value = formatCode(r.code);
         previewRemaining.value = r.remainingSeconds;
       } catch {
@@ -104,12 +107,13 @@ function handleSubmit() {
   }
 
   error.value = '';
-  emit('submit', { secret, site, name, digits: form.digits });
+  try { emit('submit', { secret, site, name, ...normalizeOtpSettings(form) }); }
+  catch (err) { error.value = (err as Error).message; }
 }
 
 if (isCreate) {
-  watch(() => form.secret, updatePreview);
-  watch(() => form.digits, updatePreview);
+  watch(() => form.secret, updatePreview, { immediate: true });
+  watch(() => [form.digits, form.algorithm, form.period, form.type, form.counter], updatePreview);
 }
 
 onUnmounted(stopPreviewTimer);
@@ -171,7 +175,7 @@ onUnmounted(stopPreviewTimer);
         <div class="flex items-center justify-between">
           <span class="text-xl font-bold font-mono text-primary-600">{{ previewCode }}</span>
           <span class="text-xs font-semibold text-primary-600 bg-primary-100 px-2 py-0.5 rounded-full">
-            {{ previewRemaining }}s
+            {{ form.type === 'hotp' ? `计数器 ${form.counter ?? 0}` : `${previewRemaining}s` }}
           </span>
         </div>
       </div>
@@ -210,6 +214,8 @@ onUnmounted(stopPreviewTimer);
         >
       </div>
 
+      <OtpFields :settings="form" @update="Object.assign(form, $event)" />
+      <p v-if="form.type === 'hotp'" class="text-xs text-gray-500">预览不递增计数器；复制或填充后自动递增。</p>
       <button type="submit" class="btn-primary w-full">
         {{ isCreate ? '保存密钥' : '保存修改' }}
       </button>
