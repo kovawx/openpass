@@ -3,6 +3,7 @@ import { ref, reactive, watch, onUnmounted } from 'vue';
 import { TOTP } from '@/utils/totp';
 import { normalizeOtpSettings, type OtpSettings } from '@/utils/otp';
 import OtpFields from '@/components/OtpFields.vue';
+import AccountGroupField from '@/components/AccountGroupField.vue';
 
 type TimerHandle = ReturnType<typeof setInterval>;
 
@@ -11,11 +12,13 @@ interface InitialData extends OtpSettings {
   site: string;
   name: string;
   digits: number;
+  group?: string;
 }
 
 interface Props {
   mode: 'create' | 'edit';
   initial: InitialData;
+  groups: string[];
 }
 
 interface Emits {
@@ -107,7 +110,7 @@ function handleSubmit() {
   }
 
   error.value = '';
-  try { emit('submit', { secret, site, name, ...normalizeOtpSettings(form) }); }
+  try { emit('submit', { secret, site, name, group: (form.group || '').trim(), ...normalizeOtpSettings(form) }); }
   catch (err) { error.value = (err as Error).message; }
 }
 
@@ -214,6 +217,7 @@ onUnmounted(stopPreviewTimer);
         >
       </div>
 
+      <AccountGroupField v-model="form.group" :groups="groups" />
       <OtpFields :settings="form" @update="Object.assign(form, $event)" />
       <p v-if="form.type === 'hotp'" class="text-xs text-gray-500">预览不递增计数器；复制或填充后自动递增。</p>
       <button type="submit" class="btn-primary w-full">

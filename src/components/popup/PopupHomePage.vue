@@ -3,6 +3,8 @@ import { ref, computed } from 'vue';
 import { matchSecrets } from '@/utils/domainMatch';
 import type { OtpAccount as Secret } from '@/utils/vault';
 import PopupSecretCard from './PopupSecretCard.vue';
+import AccountFilters from '@/components/AccountFilters.vue';
+import { filterAccounts, getAccountGroups } from '@/utils/accountOrganization';
 
 interface CodeEntry {
   code: string;
@@ -13,6 +15,7 @@ interface Props {
   secrets: Secret[];
   codeData: Map<string, CodeEntry>;
   currentUrl: string;
+  organizing?: boolean;
 }
 
 interface Emits {
@@ -22,12 +25,18 @@ interface Emits {
   (e: 'edit', secret: Secret): void;
   (e: 'delete', secret: Secret): void;
   (e: 'open-site', secret: Secret): void;
+  (e: 'favorite', secret: Secret): void;
+  (e: 'delete-group', group: string): void;
 }
 
 const props = defineProps<Props>();
 const emit = defineEmits<Emits>();
 
 const searchQuery = ref('');
+const selectedGroup = ref<string | null>(null);
+const favoritesOnly = ref(false);
+const groups = computed(() => getAccountGroups(props.secrets));
+const hasFilters = computed(() => !!searchQuery.value.trim() || selectedGroup.value !== null || favoritesOnly.value);
 
 const currentSiteMatches = computed(() => {
   if (!props.currentUrl || !Array.isArray(props.secrets)) return [];
@@ -35,12 +44,9 @@ const currentSiteMatches = computed(() => {
 });
 
 const searchResults = computed(() => {
-  if (!searchQuery.value || !Array.isArray(props.secrets)) return [];
-  const query = searchQuery.value.toLowerCase();
-  return props.secrets.filter(s =>
-    s.name?.toLowerCase().includes(query) ||
-    s.site.toLowerCase().includes(query)
-  );
+  return filterAccounts(props.secrets, {
+    query: searchQuery.value, group: selectedGroup.value, favoritesOnly: favoritesOnly.value
+  });
 });
 
 function formatCode(code: string): string {
@@ -73,13 +79,22 @@ function getRemaining(secretId: string): number {
         v-model="searchQuery"
         type="text"
         class="w-full pl-9 pr-3 py-2.5 text-sm border border-gray-300 rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all placeholder:text-gray-400"
-        placeholder="搜索站点或名称..."
+        placeholder="搜索站点、名称或分组..."
       >
     </div>
 
+    <AccountFilters
+      v-model:group="selectedGroup"
+      v-model:favorites-only="favoritesOnly"
+      :groups="groups"
+      :disabled="organizing"
+      class="mb-3"
+      @delete-group="emit('delete-group', $event)"
+    />
+
     <!-- 当前站点匹配 -->
     <div
-      v-if="currentSiteMatches.length > 0"
+      v-if="!hasFilters && currentSiteMatches.length > 0"
       class="bg-primary-50 border border-primary-200 rounded-lg p-3 mb-3"
     >
       <div class="flex items-center gap-1.5 text-xs font-medium text-primary-700 mb-2.5">
@@ -97,6 +112,8 @@ function getRemaining(secretId: string): number {
           :secret="secret"
           :code="getCode(secret.id)"
           :remaining="getRemaining(secret.id)"
+          :organizing="organizing"
+          @favorite="emit('favorite', $event)"
           @copy="emit('copy', $event)"
           @edit="emit('edit', $event)"
           @open-site="emit('open-site', $event)"
@@ -105,9 +122,9 @@ function getRemaining(secretId: string): number {
     </div>
 
     <!-- 搜索结果 -->
-    <div v-if="searchQuery" class="mt-2">
+    <div v-if="hasFilters" class="mt-2">
       <div class="flex items-center gap-2 text-[13px] font-medium text-gray-500 mb-2.5 px-1">
-        <span>搜索结果</span>
+        <span>{{ searchQuery.trim() ? '搜索结果' : '筛选结果' }}</span>
         <span class="bg-gray-200 text-gray-500 text-[11px] px-2 py-0.5 rounded-full">
           {{ searchResults.length }}
         </span>
@@ -120,7 +137,9 @@ function getRemaining(secretId: string): number {
           :secret="secret"
           :code="getCode(secret.id)"
           :remaining="getRemaining(secret.id)"
+          :organizing="organizing"
           show-delete
+          @favorite="emit('favorite', $event)"
           @copy="emit('copy', $event)"
           @edit="emit('edit', $event)"
           @delete="emit('delete', $event)"
@@ -138,7 +157,7 @@ function getRemaining(secretId: string): number {
     </div>
 
     <!-- 默认状态 -->
-    <div v-if="!searchQuery" class="py-3">
+    <div v-if="!hasFilters" class="py-3">
       <!-- 统计卡片 -->
       <div
         class="flex items-center gap-3 p-4 rounded-lg mb-4 text-white"
@@ -216,7 +235,7 @@ function getRemaining(secretId: string): number {
 
     <!-- 空状态 -->
     <div
-      v-if="secrets.length === 0 && !searchQuery"
+      v-if="secrets.length === 0 && !hasFilters"
       class="flex flex-col items-center justify-center text-center py-8 px-5"
     >
       <div class="mb-3 text-gray-400 opacity-40 flex justify-center">

@@ -1,7 +1,23 @@
 import { describe, expect, it } from 'vitest';
 import { createScanRegions, getQrScanErrorMessage, normalizeQrBounds } from './qrScan';
+import jsQR from 'jsqr';
+import { parseOtpAuth } from './otpAuth';
+import fixture from './fixtures/github-otp-qr.json';
 
 describe('QR scan geometry', () => {
+  it('decodes a dense synthetic GitHub TOTP QR using the real decoder and URI parser', () => {
+    // Public synthetic key only; generated with qrcode 8.2, error correction M, four-module border.
+    const width = fixture.rows.length * 4;
+    const pixels = new Uint8ClampedArray(width * width * 4);
+    for (let y = 0; y < width; y++) for (let x = 0; x < width; x++) {
+      const offset = (y * width + x) * 4;
+      const value = fixture.rows[Math.floor(y / 4)][Math.floor(x / 4)] === '1' ? 0 : 255;
+      pixels.set([value, value, value, 255], offset);
+    }
+    const code = jsQR(pixels, width, width, { inversionAttempts: 'attemptBoth' });
+    expect(code?.data).toBe(fixture.uri);
+    expect(parseOtpAuth(code!.data)).toMatchObject({ type: 'totp', site: 'github', name: 'GitHub', digits: 6, algorithm: 'SHA1' });
+  });
   it('scans the full screenshot plus overlapping tiles', () => {
     const regions = createScanRegions(1000, 800);
     expect(regions).toHaveLength(10);

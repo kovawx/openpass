@@ -4,6 +4,8 @@ import { useSecretStore, type Secret } from '@/stores/secrets';
 import { TOTP } from '@/utils/totp';
 import { normalizeOtpSettings } from '@/utils/otp';
 import OtpFields from '@/components/OtpFields.vue';
+import AccountGroupField from '@/components/AccountGroupField.vue';
+import { getAccountGroups } from '@/utils/accountOrganization';
 
 interface Props {
   open: boolean;
@@ -21,6 +23,8 @@ const secretStore = useSecretStore();
 
 const site = ref('');
 const name = ref('');
+const group = ref('');
+const groups = computed(() => getAccountGroups(secretStore.secrets));
 const secretKey = ref('');
 const otpSettings = ref(normalizeOtpSettings({}));
 const error = ref('');
@@ -32,6 +36,7 @@ watch(() => props.editingSecret, (val) => {
   if (val) {
     site.value = val.site;
     name.value = val.name || '';
+    group.value = val.group || '';
     secretKey.value = val.secret;
     otpSettings.value = normalizeOtpSettings(val);
   } else {
@@ -48,6 +53,7 @@ watch(() => props.open, (val) => {
 function resetForm() {
   site.value = '';
   name.value = '';
+  group.value = '';
   secretKey.value = '';
   otpSettings.value = normalizeOtpSettings({});
   error.value = '';
@@ -84,6 +90,7 @@ async function handleSubmit() {
       await secretStore.updateSecret(props.editingSecret.id, {
         site: site.value.toLowerCase(),
         name: name.value,
+        group: group.value.trim(),
         secret: secretKey.value,
         ...normalizeOtpSettings(otpSettings.value)
       }, props.editingSecret);
@@ -91,6 +98,7 @@ async function handleSubmit() {
       await secretStore.addSecret({
         site: site.value.toLowerCase(),
         name: name.value,
+        group: group.value.trim(),
         secret: secretKey.value,
         ...normalizeOtpSettings(otpSettings.value)
       });
@@ -165,6 +173,7 @@ function handleClose() {
               </p>
             </div>
 
+            <AccountGroupField v-model="group" :groups="groups" />
             <OtpFields :settings="otpSettings" @update="Object.assign(otpSettings, $event)" />
 
             <p v-if="error" class="text-sm text-red-600 bg-red-50 p-3 rounded">{{ error }}</p>

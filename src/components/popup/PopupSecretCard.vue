@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import type { OtpAccount as Secret } from '@/utils/vault';
+import FavoriteButton from '@/components/FavoriteButton.vue';
 
 interface Props {
   secret: Secret;
@@ -10,6 +11,7 @@ interface Props {
   remaining: number;
   /** 是否显示删除按钮（搜索结果列表用） */
   showDelete?: boolean;
+  organizing?: boolean;
 }
 
 interface Emits {
@@ -17,6 +19,7 @@ interface Emits {
   (e: 'edit', secret: Secret): void;
   (e: 'delete', secret: Secret): void;
   (e: 'open-site', secret: Secret): void;
+  (e: 'favorite', secret: Secret): void;
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -47,8 +50,10 @@ const isDanger = computed(() => props.secret.type !== 'hotp' && props.remaining 
           :title="secret.site"
           @click.stop="emit('open-site', secret)"
         >{{ secret.site }}</div>
+        <div class="text-xs text-gray-400 truncate" :title="secret.group || '未分组'">{{ secret.group || '未分组' }}</div>
       </div>
 
+      <FavoriteButton :favorite="secret.favorite" :disabled="organizing" @toggle="emit('favorite', secret)" />
       <div class="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
         <button
           type="button"

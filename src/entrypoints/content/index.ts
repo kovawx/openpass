@@ -1,6 +1,7 @@
 import { installGlobalRuntimeErrorListeners } from '@/utils/runtimeErrors';
 import { matchSecrets } from '@/utils/domainMatch';
-import { isOtpInput, isOtpSplitGroup, isPotentialSplitOtpInput } from '@/utils/otpInput';
+import { detectOtpInputGroups } from '@/utils/otpInputDom';
+import { readQrImageSource, readPageQrSources } from '@/utils/qrImage';
 
 interface ContentSecret {
   id?: string;
@@ -36,14 +37,7 @@ interface QrScanCandidate {
   rect: { x: number; y: number; width: number; height: number };
 }
 
-const CONFIG = {
-  targetLengths: [6, 8],
-  checkInterval: 1000,
-  /** 分位输入框的 maxlength 上限（<= 视为逐位输入） */
-  splitMaxLength: 2,
-  /** 判定同组时向上查找共同祖先的层数 */
-  groupAncestorDepth: 4
-} as const;
+const CONFIG = { checkInterval: 1000 } as const;
 
 installGlobalRuntimeErrorListeners('content', window, {
   ignoreExternalScriptErrors: true
@@ -160,24 +154,6 @@ export default defineContentScript({
       }
     }
 
-    function getOtpInputSignals(input: HTMLInputElement) {
-      return {
-        type: input.type,
-        name: input.name,
-        id: input.id,
-        placeholder: input.placeholder,
-        autocomplete: input.autocomplete,
-        ariaLabel: input.getAttribute('aria-label') || '',
-        inputMode: input.getAttribute('inputmode') || '',
-        maxLength: effectiveMaxLength(input),
-        contextText: getInputContext(input)
-      };
-    }
-
-    function is2FAInput(input: HTMLInputElement): boolean {
-      return isOtpInput(getOtpInputSignals(input));
-    }
-
     function closeQrOverlay() {
       qrOverlayCleanup?.();
       qrOverlayCleanup = null;
@@ -284,115 +260,6 @@ export default defineContentScript({
       });
     }
 
-    function getInputContext(input: HTMLInputElement): string {
-      const labels = Array.from(document.querySelectorAll<HTMLLabelElement>('label'))
-        .filter((label) => label.htmlFor === input.id || label.contains(input))
-        .map((label) => label.textContent || '');
-      const labelledBy = (input.getAttribute('aria-labelledby') || '')
-        .split(/\s+/)
-        .filter(Boolean)
-        .map((id) => document.getElementById(id)?.textContent || '');
-      const nearbyText = input.parentElement?.parentElement?.textContent || '';
-      return [...labels, ...labelledBy, nearbyText.slice(0, 300)].join(' ').toLowerCase();
-    }
-
-    function effectiveMaxLength(input: HTMLInputElement): number {
-      const attr = input.getAttribute('maxlength');
-      if (attr) {
-        const parsed = Number.parseInt(attr, 10);
-        if (!Number.isNaN(parsed) && parsed > 0) {
-          return parsed;
-        }
-      }
-      return input.maxLength > 0 ? input.maxLength : 0;
-    }
-
-    function isSplitInput(input: HTMLInputElement): boolean {
-      const maxLength = effectiveMaxLength(input);
-      return maxLength >= 1 && maxLength <= CONFIG.splitMaxLength;
-    }
-
-    function isPotentialSplitInput(input: HTMLInputElement): boolean {
-      return isPotentialSplitOtpInput(getOtpInputSignals(input));
-    }
-
-    function ancestorChainWithin(el: Element, depth: number): Set<Element> {
-      const set = new Set<Element>();
-      let cur: Element | null = el.parentElement;
-      let d = 0;
-      while (cur && d < depth) {
-        set.add(cur);
-        cur = cur.parentElement;
-        d += 1;
-      }
-      return set;
-    }
-
-    /** 两个元素是否在 depth 层内有共同祖先（用于判定分位输入框是否同组） */
-    function shareCloseAncestor(a: Element, b: Element, depth: number): boolean {
-      const chainA = ancestorChainWithin(a, depth);
-      let cur: Element | null = b.parentElement;
-      let d = 0;
-      while (cur && d < depth) {
-        if (chainA.has(cur)) {
-          return true;
-        }
-        cur = cur.parentElement;
-        d += 1;
-      }
-      return false;
-    }
-
-    /**
-     * 将页面上所有 2FA 输入框（DOM 顺序）聚类成组：
-     * - 单个整码输入框（maxlength 6/8）→ 独立一组
-     * - 相邻的分位输入框（maxlength<=2 且共同祖先相近）→ 合成一组
-     */
-    function clusterGroups(inputs: HTMLInputElement[]): OtpGroup[] {
-      const groups: OtpGroup[] = [];
-      let current: HTMLInputElement[] = [];
-
-      const flush = () => {
-        if (current.length === 0) {
-          return;
-        }
-        groups.push({
-          inputs: current,
-          anchor: current[0],
-          isMulti: current.length > 1
-        });
-        current = [];
-      };
-
-      const maxGroupSize = Math.max(...CONFIG.targetLengths);
-
-      for (const input of inputs) {
-        if (current.length === 0) {
-          current.push(input);
-          continue;
-        }
-
-        const prev = current[current.length - 1];
-        if (
-          current.length < maxGroupSize &&
-          isSplitInput(input) &&
-          isSplitInput(prev) &&
-          shareCloseAncestor(prev, input, CONFIG.groupAncestorDepth)
-        ) {
-          current.push(input);
-        } else {
-          flush();
-          current = [input];
-        }
-      }
-      flush();
-      return groups.filter((group) =>
-        group.isMulti
-          ? isOtpSplitGroup(group.inputs.map(getOtpInputSignals))
-          : is2FAInput(group.anchor)
-      );
-    }
-
     function positionGroupButton(group: OtpGroup, button: HTMLDivElement) {
       const rect = group.anchor.getBoundingClientRect();
       button.style.top = `${rect.top + rect.height / 2}px`;
@@ -442,11 +309,10 @@ export default defineContentScript({
           input.type !== 'hidden' &&
           input.offsetParent !== null &&
           !input.disabled &&
-          !input.readOnly &&
-          (is2FAInput(input) || isPotentialSplitInput(input))
+          !input.readOnly
       );
 
-      const groups = clusterGroups(candidates);
+      const groups = detectOtpInputGroups(candidates);
       const liveAnchors = new Set<HTMLInputElement>();
 
       for (const group of groups) {
@@ -768,7 +634,15 @@ export default defineContentScript({
     function init() {
       void fetchSecrets().catch(console.error);
 
-      chrome.runtime.onMessage.addListener((request) => {
+      chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+        if (request.action === 'getPageQrSources' && sender.id === chrome.runtime.id) {
+          void readPageQrSources().then(sendResponse, () => sendResponse([]));
+          return true;
+        }
+        if (request.action === 'getQrImage' && sender.id === chrome.runtime.id && typeof request.srcUrl === 'string') {
+          void readQrImageSource(request.srcUrl).then(sendResponse, () => sendResponse(null));
+          return true;
+        }
         if (request.action === 'vaultChanged') {
           void fetchSecrets().catch(console.error);
         } else if (request.action === 'showQrCandidates' && Array.isArray(request.candidates)) {

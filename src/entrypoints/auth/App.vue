@@ -6,6 +6,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Eye, EyeOff } from 'lucide-vue-next';
+import { getErrorMessage } from '@/utils/error';
 
 const authStore = useAuthStore();
 
@@ -61,6 +62,7 @@ onUnmounted(() => {
 });
 
 async function handleSubmit() {
+  if (submitting.value) return;
   if (!password.value) {
     error.value = '请输入主密码';
     return;
@@ -92,7 +94,7 @@ async function handleSubmit() {
       password.value = '';
     }
   } catch (err) {
-    error.value = '验证失败，请重试';
+    error.value = getErrorMessage(err, '验证失败，请重试');
     console.error('验证失败:', err);
   } finally {
     submitting.value = false;
@@ -141,7 +143,7 @@ async function handleSubmit() {
             </div>
           </div>
 
-           <p v-if="error" class="text-sm text-destructive bg-destructive/10 px-3 py-2 rounded-md">
+           <p v-if="error" role="alert" class="text-sm text-destructive bg-destructive/10 px-3 py-2 rounded-md">
              {{ error }}
            </p>
 

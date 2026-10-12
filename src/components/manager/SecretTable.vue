@@ -1,8 +1,11 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch } from 'vue';
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useSecretStore, type Secret } from '@/stores/secrets';
 import { TOTP } from '@/utils/totp';
 import { showToast } from '@/utils/ui';
+import { getAccountGroups } from '@/utils/accountOrganization';
+import AccountFilters from '@/components/AccountFilters.vue';
+import FavoriteButton from '@/components/FavoriteButton.vue';
 
 interface Props {
   selectedIndex?: number;
@@ -19,6 +22,25 @@ withDefaults(defineProps<Props>(), {
   selectedIndex: -1
 });
 const emit = defineEmits<Emits>();
+const groups = computed(() => getAccountGroups(secretStore.secrets));
+const filteredSecrets = computed(() => secretStore.getFilteredSecrets());
+const organizing = ref(false);
+
+async function toggleFavorite(secret: Secret) {
+  if (organizing.value) return;
+  organizing.value = true;
+  try { await secretStore.toggleFavorite(secret); }
+  catch (error) { showToast((error as Error).message, 'error'); }
+  finally { organizing.value = false; }
+}
+
+async function deleteGroup(group: string) {
+  if (organizing.value || !confirm(`删除分组“${group}”？组内账户将保留并移至未分组。`)) return;
+  organizing.value = true;
+  try { await secretStore.deleteGroup(group); }
+  catch (error) { showToast((error as Error).message, 'error'); }
+  finally { organizing.value = false; }
+}
 
 const codeData = ref<Record<string, { code: string; remaining: number }>>({});
 let timerInterval: number | null = null;
@@ -137,10 +159,20 @@ function openSite(site: string) {
     <div class="mb-4">
       <input
         v-model="secretStore.searchQuery"
-        placeholder="搜索密钥..."
+        data-account-search
+        placeholder="搜索站点、名称或分组..."
         class="input"
       />
     </div>
+
+    <AccountFilters
+      v-model:group="secretStore.selectedGroup"
+      v-model:favorites-only="secretStore.favoritesOnly"
+      :groups="groups"
+      :disabled="organizing"
+      class="mb-4"
+      @delete-group="deleteGroup"
+    />
 
     <!-- Table -->
     <div class="bg-white rounded-lg shadow overflow-x-auto">
@@ -160,30 +192,36 @@ function openSite(site: string) {
           </tr>
         </thead>
         <tbody class="bg-white divide-y divide-gray-200">
-          <tr v-if="secretStore.getFilteredSecrets().length === 0">
+          <tr v-if="filteredSecrets.length === 0">
             <td colspan="4" class="px-6 py-12 text-center text-gray-500">
               <svg class="mx-auto w-12 h-12 mb-3 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                 <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
                 <path d="M7 11V7a5 5 0 0 1 10 0v4" />
               </svg>
-              <p>暂无密钥</p>
-              <button class="mt-3 text-primary-600 hover:text-primary-700 text-sm font-medium" @click="emit('add')">
+              <p>{{ secretStore.secrets.length ? '未找到匹配结果' : '暂无密钥' }}</p>
+              <button v-if="!secretStore.secrets.length" class="mt-3 text-primary-600 hover:text-primary-700 text-sm font-medium" @click="emit('add')">
                 添加第一个密钥 →
               </button>
             </td>
           </tr>
           <tr
-            v-for="(secret, index) in secretStore.getFilteredSecrets()"
+            v-for="(secret, index) in filteredSecrets"
             :key="secret.id"
             class="cursor-pointer transition-colors"
             :class="index === selectedIndex ? 'bg-primary-50 ring-1 ring-inset ring-primary-200' : 'hover:bg-gray-50'"
           >
             <td class="px-6 py-4 max-w-0">
-              <div
-                class="text-sm font-medium text-gray-900 truncate cursor-pointer hover:text-primary-600 transition-colors"
-                :title="secret.name || '未命名'"
-                @click="openSite(secret.site)"
-              >{{ secret.name || '未命名' }}</div>
+              <div class="flex items-center gap-1">
+                <FavoriteButton :favorite="secret.favorite" :disabled="organizing" @toggle="toggleFavorite(secret)" />
+                <div class="min-w-0 flex-1">
+                  <div
+                    class="text-sm font-medium text-gray-900 truncate cursor-pointer hover:text-primary-600 transition-colors"
+                    :title="secret.name || '未命名'"
+                    @click="openSite(secret.site)"
+                  >{{ secret.name || '未命名' }}</div>
+                  <div class="text-xs text-gray-400 truncate" :title="secret.group || '未分组'">{{ secret.group || '未分组' }}</div>
+                </div>
+              </div>
             </td>
             <td class="px-6 py-4 max-w-0">
               <div

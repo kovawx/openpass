@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import CryptoUtils from './crypto';
 import { getValidSessionKey } from './session';
-import { migrateLegacyVault, readVault, writeVault } from './vault';
+import { migrateLegacyVault, readVault, readDeviceOtpVault, writeVault } from './vault';
 import { saveBackupSnapshot, createBackupData } from './backup';
+import { decodeRestoreBackup } from './restore';
 
 const local = new Map<string, unknown>();
 const session = new Map<string, unknown>();
@@ -20,6 +21,19 @@ beforeEach(() => {
   vi.stubGlobal('chrome', { runtime: { getManifest: () => ({ version: '0.2.1' }) }, storage: { local: area(local), session: area(session) } });
 });
 describe('vault and session boundaries', () => {
+  it('preserves organization through encryption, everyday access and plain/encrypted backups', async () => {
+    const organized = { ...secret, group: '工作', favorite: true };
+    await writeVault([organized], 'password');
+    expect(await readVault()).toMatchObject([organized]);
+    expect((await readDeviceOtpVault()).secrets).toMatchObject([organized]);
+    expect(JSON.stringify(Object.fromEntries(local))).not.toContain('工作');
+    for (const password of [undefined, 'backup-password']) {
+      const backup = await createBackupData(await readVault(), password);
+      expect(backup.formatVersion).toBe(1);
+      expect(await decodeRestoreBackup(backup, password ? [password] : [])).toMatchObject([organized]);
+    }
+    expect(await decodeRestoreBackup([secret], [])).toMatchObject([{ ...secret, group: '', favorite: false }]);
+  });
   it('rejects expired and orphan sessions and removes pending plaintext', async () => {
     local.set('sessionExpiresAt', Date.now() - 1); session.set('pendingSecret', secret);
     expect(await getValidSessionKey()).toBeNull();

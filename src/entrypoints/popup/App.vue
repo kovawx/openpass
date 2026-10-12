@@ -9,6 +9,7 @@ import { normalizeOtpSettings, type OtpSettings } from '@/utils/otp';
 import { parseUrl } from '@/utils/domainMatch';
 import { showToast } from '@/utils/ui';
 import type { Secret } from '@/stores/secrets';
+import { getAccountGroups, removeAccountGroup } from '@/utils/accountOrganization';
 
 import PopupHeader from '@/components/popup/PopupHeader.vue';
 import PopupHomePage from '@/components/popup/PopupHomePage.vue';
@@ -37,6 +38,7 @@ interface FormPayload extends OtpSettings {
   site: string;
   name: string;
   digits: number;
+  group?: string;
 }
 
 // 基础状态
@@ -55,6 +57,8 @@ const currentPage = ref<Page>('home');
 const currentUrl = ref('');
 const pendingSecret = ref<PendingSecret | null>(null);
 const editingSecret = ref<Secret | null>(null);
+const groups = computed(() => getAccountGroups(accounts.value));
+const organizing = ref(false);
 
 // 弹窗 / 引导
 const showAboutModal = ref(false);
@@ -206,11 +210,11 @@ function openCreatePage() {
 }
 
 async function scanCurrentPage() {
-  if (managementLocked.value) { openOptionsPage(); return; }
   try {
-    await chrome.runtime.sendMessage({ action: 'startQrScan' });
+    const result = await chrome.runtime.sendMessage({ action: 'startQrScan' });
+    if (result?.error || !result?.success) throw new Error(result?.error || '无法扫描当前页面');
   } catch (error) {
-    showToast('无法扫描当前页面', 'error');
+    showToast((error as Error).message, 'error');
     console.error('OpenPass: 启动二维码扫描失败', error);
     return;
   }
@@ -243,6 +247,7 @@ const editInitial = computed<FormPayload>(() => ({
   secret: editingSecret.value?.secret ?? '',
   site: editingSecret.value?.site ?? '',
   name: editingSecret.value?.name ?? '',
+  group: editingSecret.value?.group ?? '',
   ...normalizeOtpSettings(editingSecret.value || {})
 }));
 
@@ -254,6 +259,7 @@ async function handleCreateSubmit(data: FormPayload) {
     ...normalizeOtpSettings(data),
     site: data.site,
     name: data.name,
+    group: data.group || '',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
@@ -278,6 +284,7 @@ async function handleEditSubmit(data: FormPayload) {
       ...normalizeOtpSettings(data),
       site: data.site.toLowerCase(),
       name: data.name,
+      group: data.group || '',
       updatedAt: new Date().toISOString()
     };
     if (!await saveSecrets(editingState)) return;
@@ -313,6 +320,29 @@ async function deleteSecretFromList(secret: OtpAccount) {
   if (!await saveSecrets()) return;
   showToast('密钥已删除', 'success');
   restartCodeUpdater();
+}
+
+async function toggleFavorite(account: OtpAccount) {
+  if (managementLocked.value) { openOptionsPage(); return; }
+  if (organizing.value) return;
+  organizing.value = true;
+  try {
+    const next = secrets.value.map((secret) => secret.id === account.id
+      ? { ...secret, favorite: secret.favorite !== true } : secret);
+    await persistSecrets(next);
+  } catch (error) { await reloadVault(); showToast((error as Error).message, 'error'); }
+  finally { organizing.value = false; }
+}
+
+async function deleteGroup(group: string) {
+  if (managementLocked.value) { openOptionsPage(); return; }
+  if (organizing.value || !confirm(`删除分组“${group}”？组内账户将保留并移至未分组。`)) return;
+  organizing.value = true;
+  try {
+    await persistSecrets(removeAccountGroup(secrets.value, group));
+    showToast('分组已删除，账户已保留', 'success');
+  } catch (error) { await reloadVault(); showToast((error as Error).message, 'error'); }
+  finally { organizing.value = false; }
 }
 
 async function copyCode(secret: OtpAccount) {
@@ -376,18 +406,22 @@ function openSetupPage() {
           :secrets="accounts"
           :code-data="codeData"
           :current-url="currentUrl"
+          :organizing="organizing"
           @add="openCreatePage"
           @manage="openOptionsPage"
           @copy="copyCode"
           @edit="showEditPage"
           @delete="deleteSecretFromList"
           @open-site="openSite"
+          @favorite="toggleFavorite"
+          @delete-group="deleteGroup"
         />
 
         <PopupSecretForm
           v-else-if="currentPage === 'create'"
           mode="create"
           :initial="createInitial"
+          :groups="groups"
           @submit="handleCreateSubmit"
           @back="showHomePage"
         />
@@ -396,6 +430,7 @@ function openSetupPage() {
           v-else-if="currentPage === 'edit'"
           mode="edit"
           :initial="editInitial"
+          :groups="groups"
           @submit="handleEditSubmit"
           @back="showHomePage"
           @delete="handleDeleteFromEdit"

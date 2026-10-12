@@ -125,7 +125,7 @@ async function handleStorageChange(
 // 键盘快捷键
 const shortcuts = useKeyboardShortcuts({
   onSearch: () => {
-    const input = document.querySelector('input[placeholder="搜索密钥..."]') as HTMLInputElement;
+    const input = document.querySelector('[data-account-search]') as HTMLInputElement;
     input?.focus();
   },
   onAdd: () => {
@@ -268,7 +268,8 @@ watch(showWelcome, (visible) => {
 });
 
 watch(
-  () => [currentPage.value, secretStore.searchQuery, secretStore.secrets.length],
+  () => [currentPage.value, secretStore.searchQuery, secretStore.selectedGroup, secretStore.favoritesOnly,
+    JSON.stringify(secretStore.secrets)],
   () => {
     if (currentPage.value !== 'secrets') {
       shortcuts.setTotal(0);
@@ -277,6 +278,7 @@ watch(
     }
 
     shortcuts.setTotal(secretStore.getFilteredSecrets().length);
+    shortcuts.clearSelection();
   }
 );
 </script>
