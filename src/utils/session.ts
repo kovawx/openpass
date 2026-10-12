@@ -1,25 +1,40 @@
 export const SESSION_TIMEOUT = 15 * 60 * 1000;
 export const SESSION_ALARM = 'openpass-session-expiry';
 
+export interface ActiveSession {
+  key: string;
+  expiresAt: number;
+}
+
 export async function clearSessionStorage() {
-  await chrome.storage.session.remove(['sessionKey', 'pendingSecret']);
+  await chrome.storage.session.remove(['sessionKey', 'sessionExpiresAt', 'pendingSecret']);
   await chrome.storage.local.remove(['sessionExpiresAt']);
 }
 
-export async function getValidSessionKey(): Promise<string | null> {
+export async function getValidSession(): Promise<ActiveSession | null> {
   const [local, session] = await Promise.all([
     chrome.storage.local.get<{ sessionExpiresAt?: number }>(['sessionExpiresAt']),
-    chrome.storage.session.get<{ sessionKey?: string }>(['sessionKey'])
+    chrome.storage.session.get<{ sessionKey?: string; sessionExpiresAt?: number }>(['sessionKey', 'sessionExpiresAt'])
   ]);
+  // 新会话在 session 中一次发布密钥和到期时间；local 字段仅兼容旧会话及界面通知。
+  const expiresAt = session.sessionExpiresAt === undefined ? local.sessionExpiresAt : session.sessionExpiresAt;
   if (
     typeof session.sessionKey !== 'string' || !session.sessionKey ||
-    typeof local.sessionExpiresAt !== 'number' || !Number.isFinite(local.sessionExpiresAt) ||
-    local.sessionExpiresAt <= Date.now()
+    typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= Date.now()
   ) {
-    if (session.sessionKey || local.sessionExpiresAt) await clearSessionStorage();
+    if (session.sessionKey || expiresAt) {
+      // 读取过程中可能已有页面完成解锁，不清除这次读取之后发布的新会话。
+      const latest = await chrome.storage.session.get(['sessionKey', 'sessionExpiresAt']);
+      if (latest.sessionKey !== session.sessionKey || latest.sessionExpiresAt !== session.sessionExpiresAt) return getValidSession();
+      await clearSessionStorage();
+    }
     return null;
   }
-  return session.sessionKey;
+  return { key: session.sessionKey, expiresAt };
+}
+
+export async function getValidSessionKey(): Promise<string | null> {
+  return (await getValidSession())?.key ?? null;
 }
 
 export async function requireSessionKey() {

@@ -1,11 +1,11 @@
-import jsQR from 'jsqr';
+import { decodeOtpQrPixels } from '@/utils/qrDecode';
 import CryptoUtils from '@/utils/crypto';
 import { getBackupSchedule } from '@/utils/backupSchedule';
 import { decodeRestoreBackup, planRestore, type RestoreMode } from '@/utils/restore';
 import { generateOtp, normalizeOtpSettings } from '@/utils/otp';
 import { readVault, writeVault, normalizeVaultSecrets, mergeHotpCounters, applyHotpCounters,
   prepareDeviceOtpState, readDeviceOtpVault, writeDeviceOtpCounters, assertDeviceOtpAccess, toOtpAccount, migrateLegacyVault, type VaultSecret } from '@/utils/vault';
-import { getValidSessionKey, requireSessionKey, assertSessionKey, SESSION_ALARM } from '@/utils/session';
+import { getValidSession, getValidSessionKey, requireSessionKey, assertSessionKey, SESSION_ALARM } from '@/utils/session';
 import {
   type BackupData,
   createBackupData,
@@ -42,7 +42,7 @@ import {
   uploadBackupToS3
 } from '@/utils/s3CloudBackup';
 import { isSiteMatched, parseUrl, matchSecrets } from '@/utils/domainMatch';
-import { parseOtpAuth } from '@/utils/otpAuth';
+import type { QrImageSource } from '@/utils/qrImage';
 import {
   createScanRegions,
   getQrScanErrorMessage,
@@ -58,6 +58,11 @@ type PendingSecret = Omit<VaultSecret, 'id'>;
 interface QrCandidate {
   secret: PendingSecret;
   rect: NormalizedRect;
+}
+
+interface ClickedQrImage {
+  srcUrl: string;
+  frameId: number;
 }
 
 interface SiteListItem {
@@ -126,9 +131,9 @@ export default defineBackground(() => {
 
   async function syncSessionAlarm() {
     await chrome.alarms.clear(SESSION_ALARM);
-    if (!await getValidSessionKey()) return;
-    const { sessionExpiresAt } = await chrome.storage.local.get<{ sessionExpiresAt: number }>(['sessionExpiresAt']);
-    await chrome.alarms.create(SESSION_ALARM, { when: sessionExpiresAt });
+    const session = await getValidSession();
+    if (!session) return;
+    await chrome.alarms.create(SESSION_ALARM, { when: session.expiresAt });
   }
   void syncSessionAlarm().catch(console.error);
   void syncAutoBackupAlarm().catch(console.error);
@@ -158,7 +163,9 @@ export default defineBackground(() => {
     if (info.menuItemId !== 'parseQRCode') {
       return;
     }
-    void startQrScan(tab);
+    const image = info.mediaType === 'image' && info.srcUrl
+      ? { srcUrl: info.srcUrl, frameId: info.frameId ?? 0 } : undefined;
+    void startQrScan(tab, undefined, image, info.frameId ?? 0).catch(reportQrScanFailure);
   });
 
   /** 若 secret.site 不是域名（含点+TLD），则替换为页面主域名。 */
@@ -253,15 +260,18 @@ export default defineBackground(() => {
     }
   }
 
-  async function scanQrImage(imageUrl: string, crop?: NormalizedRect): Promise<QrCandidate[]> {
+  async function scanQrImage(imageUrl: string, crop?: NormalizedRect, maxPixels = Number.POSITIVE_INFINITY): Promise<QrCandidate[]> {
     const response = await fetch(imageUrl);
     if (!response.ok) throw new Error(`Screenshot decode failed: ${response.status}`);
     const imageBitmap = await createImageBitmap(await response.blob());
 
     try {
+      if (imageBitmap.width * imageBitmap.height > maxPixels) return [];
       const canvas = new OffscreenCanvas(imageBitmap.width, imageBitmap.height);
       const ctx = canvas.getContext('2d');
       if (!ctx) throw new Error('2D canvas context unavailable');
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(imageBitmap, 0, 0);
 
       const candidates = new Map<string, QrCandidate>();
@@ -271,15 +281,12 @@ export default defineBackground(() => {
         if (safeWidth <= 0 || safeHeight <= 0) continue;
 
         const imageData = ctx.getImageData(x, y, safeWidth, safeHeight);
-        const code = jsQR(imageData.data, imageData.width, imageData.height, {
-          inversionAttempts: 'attemptBoth'
-        });
-        const secret = code?.data ? parseOtpAuth(code.data) : null;
-        if (!code || !secret || candidates.has(secret.secret)) continue;
+        const decoded = decodeOtpQrPixels(imageData.data, imageData.width, imageData.height);
+        if (!decoded || candidates.has(decoded.secret.secret)) continue;
 
-        const points = Object.values(code.location);
-        candidates.set(secret.secret, {
-          secret,
+        const points = Object.values(decoded.code.location);
+        candidates.set(decoded.secret.secret, {
+          secret: decoded.secret,
           rect: normalizeQrBounds(points, x, y, canvas.width, canvas.height)
         });
       }
@@ -294,9 +301,9 @@ export default defineBackground(() => {
     return chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
   }
 
-  async function sendToTab(tab: chrome.tabs.Tab, message: Record<string, unknown>) {
+  async function sendToTab(tab: chrome.tabs.Tab, message: Record<string, unknown>, frameId = 0) {
     if (typeof tab.id !== 'number') throw new Error('无法确定当前标签页');
-    return chrome.tabs.sendMessage(tab.id, message);
+    return chrome.tabs.sendMessage(tab.id, message, { frameId });
   }
 
   async function acceptQrSecret(secret: PendingSecret, tab: chrome.tabs.Tab) {
@@ -305,41 +312,114 @@ export default defineBackground(() => {
     await chrome.action.openPopup();
   }
 
-  async function startQrScan(tab?: chrome.tabs.Tab, crop?: NormalizedRect) {
-    try {
-      const setupComplete = await checkSetupComplete();
-      if (!setupComplete) {
-        showNotification('请先设置主密码', '点击扩展图标开始设置');
-        return;
-      }
-
-      if (!tab) {
-        [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      }
-      if (!tab) {
-        throw new Error('未找到可扫描的浏览器窗口，请先切换到要扫描的普通网页后重试');
-      }
-
-      await requireSessionKey();
-      const candidates = await scanQrImage(await captureTab(tab), crop);
-      if (candidates.length === 1) {
-        await acceptQrSecret(candidates[0].secret, tab);
-        return;
-      }
-
-      if (candidates.length > 1) {
-        await sendToTab(tab, { action: 'showQrCandidates', candidates });
-        return;
-      }
-
-      await sendToTab(tab, {
-        action: 'startQrSelection',
-        message: crop ? '选区内未识别到 OTP 二维码，请重新框选' : '未自动识别到二维码，请框选二维码区域'
-      });
-    } catch (error) {
-      console.error('OpenPass: 页面二维码扫描失败', error);
-      showNotification('二维码扫描失败', getQrScanErrorMessage(error));
+  async function startQrScan(tab?: chrome.tabs.Tab, crop?: NormalizedRect, clickedImage?: ClickedQrImage, sourceFrameId = 0) {
+    const setupComplete = await checkSetupComplete();
+    if (!setupComplete) {
+      showNotification('请先设置主密码', '点击扩展图标开始设置');
+      return { error: '请先设置主密码' };
     }
+
+    if (!tab) {
+      [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    }
+    if (!tab) {
+      throw new Error('未找到可扫描的浏览器窗口，请先切换到要扫描的普通网页后重试');
+    }
+
+    if (!await getValidSessionKey()) {
+      showNotification('请先解锁 OpenPass', '扫描并添加账户需要解锁。解锁后请回到原网页重新扫描。');
+      await chrome.tabs.create({ url: chrome.runtime.getURL('auth.html?redirect=options.html') });
+      return { success: true, requiresUnlock: true };
+    }
+    let screenshot: string | undefined;
+    if (!crop && clickedImage) {
+      let source: QrImageSource | null = null;
+      try {
+        source = await sendToTab(tab, { action: 'getQrImage', srcUrl: clickedImage.srcUrl }, clickedImage.frameId);
+      } catch { /* 已打开的页面可能尚未注入内容脚本，尝试直接读取原图。 */ }
+      let imageCandidates: QrCandidate[] = [];
+      const sourceUrl = source?.dataUrl?.startsWith('data:image/png;base64,')
+        ? source.dataUrl : clickedImage.srcUrl;
+      if (/^(data:image\/|https?:\/\/|blob:)/i.test(sourceUrl)) {
+        try { imageCandidates = await scanQrImage(sourceUrl, undefined, 4194304); }
+        catch { /* 无原图访问权限时回退到可见图片区域。 */ }
+      }
+      if (imageCandidates.length === 1) {
+        await acceptQrSecret(imageCandidates[0].secret, tab);
+        return { success: true };
+      }
+      if (imageCandidates.length > 1 && source?.rect) {
+        const rect = source.rect;
+        await sendToTab(tab, { action: 'showQrCandidates', candidates: imageCandidates.map(candidate => ({
+          ...candidate, rect: { x: rect.x + candidate.rect.x * rect.width, y: rect.y + candidate.rect.y * rect.height,
+            width: candidate.rect.width * rect.width, height: candidate.rect.height * rect.height }
+        })) }, clickedImage.frameId);
+        return { success: true };
+      }
+      // 图片位置属于该 frame；顶层图片可直接裁剪截图，iframe 中由用户框选。
+      if (source?.rect && clickedImage.frameId === 0) {
+        screenshot = await captureTab(tab);
+        const candidates = await scanQrImage(screenshot, source.rect);
+        if (candidates.length === 1) {
+          await acceptQrSecret(candidates[0].secret, tab);
+          return { success: true };
+        }
+        if (candidates.length > 1) {
+          await sendToTab(tab, { action: 'showQrCandidates', candidates });
+          return { success: true };
+        }
+      }
+    } else if (!crop) {
+      let sources: QrImageSource[] = [];
+      try {
+        const result = await sendToTab(tab, { action: 'getPageQrSources' }, sourceFrameId);
+        if (Array.isArray(result)) sources = result;
+      } catch { /* 无法读取页面图像时继续网页截图扫描。 */ }
+      const candidates = new Map<string, QrCandidate>();
+      for (const source of sources) {
+        if (!source.dataUrl?.startsWith('data:image/png;base64,')) continue;
+        try {
+          for (const candidate of await scanQrImage(source.dataUrl, undefined, 4194304)) {
+            if (candidates.has(candidate.secret.secret)) continue;
+            const rect = source.rect;
+            candidates.set(candidate.secret.secret, { ...candidate, rect: {
+              x: rect.x + candidate.rect.x * rect.width, y: rect.y + candidate.rect.y * rect.height,
+              width: candidate.rect.width * rect.width, height: candidate.rect.height * rect.height
+            } });
+          }
+        } catch { /* 单张图片损坏不影响其他图像及截图回退。 */ }
+      }
+      if (candidates.size === 1) {
+        await acceptQrSecret([...candidates.values()][0].secret, tab);
+        return { success: true };
+      }
+      if (candidates.size > 1) {
+        await sendToTab(tab, { action: 'showQrCandidates', candidates: [...candidates.values()] }, sourceFrameId);
+        return { success: true };
+      }
+    }
+    // 原始图像没有识别结果时才扫描网页；已有框选始终只扫描该选区。
+    const candidates = await scanQrImage(screenshot ?? await captureTab(tab), crop);
+    if (candidates.length === 1) {
+      await acceptQrSecret(candidates[0].secret, tab);
+      return { success: true };
+    }
+
+    if (candidates.length > 1) {
+      await sendToTab(tab, { action: 'showQrCandidates', candidates });
+      return { success: true };
+    }
+
+    await sendToTab(tab, {
+      action: 'startQrSelection',
+      message: crop ? '选区内未识别到 OTP 二维码，请重新框选' : '未自动识别到二维码，请框选二维码区域'
+    });
+    return { success: true };
+  }
+
+  function reportQrScanFailure(error: unknown) {
+    console.error('OpenPass: 页面二维码扫描失败', error);
+    showNotification('二维码扫描失败', getQrScanErrorMessage(error));
   }
 
   async function storePendingSecret(secret: PendingSecret, tab?: chrome.tabs.Tab) {
@@ -510,17 +590,17 @@ export default defineBackground(() => {
     }
 
     if (request.action === 'startQrScan') {
-      void startQrScan(sender.tab).then(
-        () => sendResponse({ success: true }),
-        (error) => sendResponse({ error: (error as Error).message })
+      void startQrScan(sender.tab, undefined, undefined, sender.frameId ?? 0).then(
+        (result) => sendResponse(result),
+        (error) => { reportQrScanFailure(error); sendResponse({ error: getQrScanErrorMessage(error) }); }
       );
       return true;
     }
 
     if (request.action === 'scanQrSelection' && sender.tab) {
       void startQrScan(sender.tab, request.rect as NormalizedRect).then(
-        () => sendResponse({ success: true }),
-        (error) => sendResponse({ error: (error as Error).message })
+        (result) => sendResponse(result),
+        (error) => { reportQrScanFailure(error); sendResponse({ error: getQrScanErrorMessage(error) }); }
       );
       return true;
     }
@@ -731,7 +811,7 @@ export default defineBackground(() => {
         (namespace === 'session' && changes.sessionKey)) {
       void notifyVaultChanged().catch(console.error);
     }
-    if (namespace === 'local' && changes.sessionExpiresAt) void syncSessionAlarm().catch(console.error);
+    if ((namespace === 'local' || namespace === 'session') && changes.sessionExpiresAt) void syncSessionAlarm().catch(console.error);
 
     if (namespace === 'local' && (changes.secrets || changes.encryptedSecrets || changes.sitesList)) {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {

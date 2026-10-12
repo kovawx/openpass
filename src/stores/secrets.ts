@@ -4,6 +4,7 @@ import { useAuthStore } from './auth';
 import { readVault, type VaultSecret } from '@/utils/vault';
 import { requireSessionKey } from '@/utils/session';
 import { showToast } from '@/utils/ui';
+import { filterAccounts, removeAccountGroup } from '@/utils/accountOrganization';
 import {
   buildSecretIdentity,
   checkBackupCompatibility,
@@ -20,6 +21,8 @@ export const useSecretStore = defineStore('secrets', () => {
   const loading = ref(false);
   let savedState = '[]';
   const searchQuery = ref('');
+  const selectedGroup = ref<string | null>(null);
+  const favoritesOnly = ref(false);
 
   const authStore = useAuthStore();
   watch(() => authStore.sessionKey, (key) => { if (!key) secrets.value = []; });
@@ -91,16 +94,20 @@ export const useSecretStore = defineStore('secrets', () => {
   }
 
   function getFilteredSecrets() {
-    if (!searchQuery.value) {
-      return secrets.value;
-    }
+    return filterAccounts(secrets.value, {
+      query: searchQuery.value, group: selectedGroup.value, favoritesOnly: favoritesOnly.value
+    }, true);
+  }
 
-    const query = searchQuery.value.toLowerCase();
-    return secrets.value.filter((secret) =>
-      secret.site.toLowerCase().includes(query) ||
-      secret.name?.toLowerCase().includes(query) ||
-      secret.secret.toLowerCase().includes(query)
-    );
+  async function toggleFavorite(secret: Secret) {
+    await updateSecret(secret.id, { favorite: secret.favorite !== true }, secret);
+  }
+
+  async function deleteGroup(group: string) {
+    secrets.value = removeAccountGroup(secrets.value, group);
+    await saveSecrets({ triggerSnapshot: true });
+    selectedGroup.value = null;
+    showToast('分组已删除，账户已保留', 'success');
   }
 
   function searchSecrets(query: string) {
@@ -195,11 +202,15 @@ export const useSecretStore = defineStore('secrets', () => {
     secrets,
     loading,
     searchQuery,
+    selectedGroup,
+    favoritesOnly,
     loadSecrets,
     saveSecrets,
     addSecret,
     updateSecret,
     deleteSecret,
+    toggleFavorite,
+    deleteGroup,
     getFilteredSecrets,
     searchSecrets,
     getSecretById,

@@ -2,8 +2,9 @@ import CryptoUtils from './crypto';
 import { assertSessionKey, requireSessionKey } from './session';
 import { getBackupEncryptionSettings } from './backup';
 import { normalizeOtpSettings, type OtpSettings } from './otp';
+import { normalizeAccountOrganization, type AccountOrganization } from './accountOrganization';
 
-export interface VaultSecret extends OtpSettings {
+export interface VaultSecret extends OtpSettings, AccountOrganization {
   id: string;
   duplicateOf?: string;
   secret: string;
@@ -15,10 +16,11 @@ export interface VaultSecret extends OtpSettings {
 }
 
 /** 日常验证码界面只接收账户信息，不接收 OTP 原始密钥。 */
-export type OtpAccount = Pick<VaultSecret, 'id' | 'site' | 'name' | 'type' | 'digits' | 'period' | 'algorithm' | 'counter'>;
+export type OtpAccount = Pick<VaultSecret, 'id' | 'site' | 'name' | 'type' | 'digits' | 'period' | 'algorithm' | 'counter' | 'group' | 'favorite'>;
 
-export function toOtpAccount({ id, site, name, type, digits, period, algorithm, counter }: OtpAccount): OtpAccount {
-  return { id, site, name, type, digits, period, algorithm, counter };
+export function toOtpAccount(account: OtpAccount): OtpAccount {
+  const { id, site, name, type, digits, period, algorithm, counter } = account;
+  return { id, site, name, type, digits, period, algorithm, counter, ...normalizeAccountOrganization(account) };
 }
 
 interface DeviceOtpContext {
@@ -112,7 +114,7 @@ export function normalizeVaultSecrets(value: unknown): VaultSecret[] {
     const id = typeof entry.id === 'string' && entry.id ? entry.id : globalThis.crypto.randomUUID();
     if (ids.has(id)) throw new Error('密钥记录 ID 重复');
     ids.add(id);
-    return { ...entry, ...normalizeOtpSettings(entry), id, secret, site: entry.site.trim().toLowerCase() };
+    return { ...entry, ...normalizeOtpSettings(entry), ...normalizeAccountOrganization(entry), id, secret, site: entry.site.trim().toLowerCase() };
   });
 }
 

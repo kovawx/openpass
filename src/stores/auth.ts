@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia';
 import { ref } from 'vue';
 import CryptoUtils from '@/utils/crypto';
-import { getValidSessionKey, clearSessionStorage, SESSION_TIMEOUT } from '@/utils/session';
+import { getValidSession, requireSessionKey, clearSessionStorage, SESSION_TIMEOUT } from '@/utils/session';
 
 export interface SessionData {
   sessionKey: string | null;
@@ -66,10 +66,9 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function checkSession(): Promise<boolean> {
-    const key = await getValidSessionKey();
-    const result = await chrome.storage.local.get<{ sessionExpiresAt?: number }>(['sessionExpiresAt']);
-    applySession(key, key ? result.sessionExpiresAt ?? null : null);
-    return !!key;
+    const session = await getValidSession();
+    applySession(session?.key ?? null, session?.expiresAt ?? null);
+    return !!session;
   }
 
   async function init() {
@@ -146,8 +145,9 @@ export const useAuthStore = defineStore('auth', () => {
     if (migration?.error || !migration?.success) throw new Error(migration?.error || '解锁迁移失败');
     const nextExpiresAt = Date.now() + SESSION_TIMEOUT;
 
-    await chrome.storage.session.set({ sessionKey: password });
+    await chrome.storage.session.set({ sessionKey: password, sessionExpiresAt: nextExpiresAt });
     await chrome.storage.local.set({ sessionExpiresAt: nextExpiresAt });
+    if (await requireSessionKey() !== password) throw new Error('会话已变更，请重新解锁');
     applySession(password, nextExpiresAt);
 
     // 通知 background 缓存 sessionKey（用于自动备份）
@@ -175,6 +175,7 @@ export const useAuthStore = defineStore('auth', () => {
     if (await checkSession()) {
       const nextExpiresAt = Date.now() + SESSION_TIMEOUT;
       applySession(sessionKey.value, nextExpiresAt);
+      await chrome.storage.session.set({ sessionExpiresAt: nextExpiresAt });
       await chrome.storage.local.set({ sessionExpiresAt: nextExpiresAt });
     }
   }

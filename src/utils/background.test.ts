@@ -3,6 +3,7 @@ import CryptoUtils from './crypto';
 import { normalizeVaultSecrets, readVault, writeVault } from './vault';
 import type { VaultSecret } from './vault';
 import { mergeSyncState } from './syncMerge';
+import { removeAccountGroup } from './accountOrganization';
 
 const transport = vi.hoisted(() => ({ download: vi.fn(), upload: vi.fn(), retention: vi.fn(), versions: vi.fn(), deleteVersions: vi.fn() }));
 vi.mock('./s3CloudBackup', () => ({
@@ -24,7 +25,7 @@ function area(values: Map<string, unknown>) {
     setAccessLevel: vi.fn().mockResolvedValue(undefined)
   };
 }
-interface TestResponse { error?: string; success?: boolean; count?: number; code?: string; locked?: boolean; otpAvailable?: boolean; message?: string; token?: string; secrets?: Array<Record<string, unknown>> }
+interface TestResponse { error?: string; success?: boolean; requiresUnlock?: boolean; count?: number; code?: string; locked?: boolean; otpAvailable?: boolean; message?: string; token?: string; secrets?: Array<Record<string, unknown>> }
 let listener: (message: Record<string, unknown>, sender: chrome.runtime.MessageSender, respond: (result: TestResponse) => void) => unknown;
 const trusted = { id: 'test-extension', url: 'chrome-extension://test-extension/options.html' };
 const page = { id: 'test-extension', url: 'https://example.com/login' };
@@ -52,7 +53,8 @@ beforeEach(async () => {
       getManifest: () => ({ version: '0.2.1' }), onInstalled: event(), onStartup: event(), onMessage: { addListener: (value: typeof listener) => { listener = value; } } },
     storage: { local: area(local), session: area(session), onChanged: event() },
     contextMenus: { onClicked: event() },
-    tabs: { query: vi.fn().mockResolvedValue([]), onUpdated: event(), onActivated: event() },
+    tabs: { query: vi.fn().mockResolvedValue([]), create: vi.fn().mockResolvedValue({}), captureVisibleTab: vi.fn(), onUpdated: event(), onActivated: event() },
+    notifications: { create: vi.fn().mockResolvedValue('fixture-notification') },
     alarms: { clear: vi.fn().mockResolvedValue(true), create: vi.fn().mockResolvedValue(undefined), onAlarm: event() }
   });
   const background = await import('../entrypoints/background');
@@ -60,6 +62,46 @@ beforeEach(async () => {
   await putSecrets([secret]);
 });
 describe('background authorization and writes', () => {
+  it('opens authentication for a locked QR request without capturing the page or logging a scan failure', async () => {
+    local.set('isSetupComplete', true); session.clear(); local.delete('sessionExpiresAt');
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(await message({ action: 'startQrScan' }, { ...page, tab: { id: 7, windowId: 1 } as chrome.tabs.Tab }))
+        .toMatchObject({ success: true, requiresUnlock: true });
+      expect(chrome.tabs.captureVisibleTab).not.toHaveBeenCalled();
+      expect(chrome.tabs.create).toHaveBeenCalledWith({ url: 'chrome-extension://test-extension/auth.html?redirect=options.html' });
+      expect(chrome.notifications.create).toHaveBeenCalledWith(expect.objectContaining({ title: '请先解锁 OpenPass' }));
+      expect(errorLog).not.toHaveBeenCalled();
+    } finally { errorLog.mockRestore(); }
+  });
+  it('returns an actual QR capture failure to the caller instead of reporting success', async () => {
+    local.set('isSetupComplete', true);
+    vi.mocked(chrome.tabs.captureVisibleTab).mockRejectedValue(new Error('Cannot access contents of url chrome://settings'));
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = await message({ action: 'scanQrSelection', rect: { x: 0, y: 0, width: 1, height: 1 } },
+        { ...page, tab: { id: 7, windowId: 1 } as chrome.tabs.Tab });
+      expect(result.error).toContain('浏览器保护'); expect(result.success).toBeUndefined();
+      expect(chrome.tabs.create).not.toHaveBeenCalled();
+    } finally { errorLog.mockRestore(); }
+  });
+  it('saves group deletion and favorites through the authorized vault path with a portable snapshot', async () => {
+    const organized = { ...secret, group: '工作', favorite: true, updatedAt: '2030-01-01T00:00:00Z' };
+    await writeVault([organized], 'password');
+    let current = await readVault();
+    const result = await message({ action: 'saveVault', secrets: removeAccountGroup(current, '工作'),
+      expectedSecrets: JSON.stringify(current), triggerSnapshot: true });
+    expect(result.success).toBe(true);
+    current = await readVault();
+    expect(current).toMatchObject([{ ...secret, group: '', favorite: true }]);
+    expect(local.get('secretTombstones')).toEqual([]);
+    expect(mergeSyncState(current, [], [organized], []).secrets).toMatchObject([{ group: '', favorite: true }]);
+    const snapshots = local.get('backupSnapshots') as Array<{ data: { encryptedData: string } }>;
+    expect(JSON.parse(await CryptoUtils.decrypt(snapshots[0].data.encryptedData, 'password'))).toMatchObject([{ group: '', favorite: true }]);
+    session.clear();
+    expect((await message({ action: 'getSecrets' })).secrets).toMatchObject([{ group: '', favorite: true }]);
+    expect((await message({ action: 'saveVault', secrets: current, expectedSecrets: JSON.stringify(current) })).error).toContain('锁定');
+  });
   it('uses the shared alarm for cloud-only work and preserves it when local scheduling is disabled', async () => {
     local.set('enableAutoBackup', false); local.set('cloudBackupSettings', { enabled: true });
     expect(await message({ action: 'updateBackupSchedule' })).toMatchObject({ success: true });
@@ -229,6 +271,16 @@ describe('background authorization and writes', () => {
 });
 describe('conditional cloud synchronization', () => {
   beforeEach(() => { local.set('cloudBackupSettings', { enabled: true }); });
+  it('pulls and uploads organization with ordinary cloud sync without changing format', async () => {
+    const organized = { ...secret, group: '个人', favorite: true, updatedAt: '2030-01-01T00:00:00Z' };
+    transport.download.mockResolvedValue({ etag: 'organization-etag', backupData: backup([organized]) });
+    transport.upload.mockResolvedValue({ etag: 'next-etag', snapshotKey: 'next-key' });
+    expect((await message({ action: 'syncLatestCloudBackup' })).success).toBe(true);
+    expect(await readVault()).toMatchObject([organized]);
+    const uploaded = transport.upload.mock.calls.at(-1)![0];
+    expect(uploaded.formatVersion).toBe(1);
+    expect(JSON.parse(await CryptoUtils.decrypt(uploaded.encryptedData, 'password'))).toMatchObject([organized]);
+  });
   it('preserves local data and history on a concurrent cloud clear, then reports partial deletion accurately', async () => {
     transport.download.mockResolvedValue({ etag: 'review-etag', backupData: backup([{ ...secret, id: 'remote' }]) });
     transport.versions.mockResolvedValue([{ key: 'history-one' }, { key: 'history-two' }]);

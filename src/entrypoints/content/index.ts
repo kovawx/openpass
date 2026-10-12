@@ -1,6 +1,7 @@
 import { installGlobalRuntimeErrorListeners } from '@/utils/runtimeErrors';
 import { matchSecrets } from '@/utils/domainMatch';
 import { detectOtpInputGroups } from '@/utils/otpInputDom';
+import { readQrImageSource, readPageQrSources } from '@/utils/qrImage';
 
 interface ContentSecret {
   id?: string;
@@ -633,7 +634,15 @@ export default defineContentScript({
     function init() {
       void fetchSecrets().catch(console.error);
 
-      chrome.runtime.onMessage.addListener((request) => {
+      chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+        if (request.action === 'getPageQrSources' && sender.id === chrome.runtime.id) {
+          void readPageQrSources().then(sendResponse, () => sendResponse([]));
+          return true;
+        }
+        if (request.action === 'getQrImage' && sender.id === chrome.runtime.id && typeof request.srcUrl === 'string') {
+          void readQrImageSource(request.srcUrl).then(sendResponse, () => sendResponse(null));
+          return true;
+        }
         if (request.action === 'vaultChanged') {
           void fetchSecrets().catch(console.error);
         } else if (request.action === 'showQrCandidates' && Array.isArray(request.candidates)) {
