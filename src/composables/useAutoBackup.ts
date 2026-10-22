@@ -10,9 +10,13 @@ import {
   createBackupFilename,
   getBackupDirectoryAccessError,
   getCustomBackupLocationLabel,
+  getBackupFileSettings,
+  writeBackupToDownloads,
+  type BackupFileDestination,
   type BackupDirectoryWriteResult
 } from '@/utils/backupDestination';
 import { getErrorMessage } from '@/utils/error';
+import { recordLocalBackupResult } from '@/utils/localBackupStatus';
 
 export interface BackupSettings {
   enableAutoBackup: boolean;
@@ -20,6 +24,8 @@ export interface BackupSettings {
   enableLocalSnapshot: boolean;
   enableDirectoryBackup: boolean;
   backupDirectory: string;
+  backupFileDestination: BackupFileDestination;
+  backupDownloadDirectory: string;
   lastBackupTime: string | null;
   nextBackupTime: string | null;
 }
@@ -42,12 +48,16 @@ const DB_VERSION = 1;
 const STORE_NAME = 'handles';
 
 export function useAutoBackup() {
+  // Load the handle when displaying directory status so a later click can request
+  // permission immediately, without waiting for IndexedDB and losing activation.
+  let directoryHandle: FileSystemDirectoryHandle | null = null;
   const settings = ref<BackupSettings>({
     enableAutoBackup: false,
     backupFrequency: 'weekly',
     enableLocalSnapshot: true,
     enableDirectoryBackup: false,
     backupDirectory: '',
+    ...getBackupFileSettings({}),
     lastBackupTime: null,
     nextBackupTime: null
   });
@@ -59,6 +69,8 @@ export function useAutoBackup() {
       enableLocalSnapshot?: boolean;
       enableDirectoryBackup?: boolean;
       backupDirectory?: string;
+      backupFileDestination?: string;
+      backupDownloadDirectory?: string;
       lastBackupTime?: string;
       nextBackupTime?: string;
     }>([
@@ -67,6 +79,7 @@ export function useAutoBackup() {
       'enableLocalSnapshot',
       'enableDirectoryBackup',
       'backupDirectory',
+      'backupFileDestination', 'backupDownloadDirectory',
       'lastBackupTime',
       'nextBackupTime'
     ]);
@@ -77,6 +90,7 @@ export function useAutoBackup() {
       enableLocalSnapshot: result.enableLocalSnapshot !== false,
       enableDirectoryBackup: result.enableDirectoryBackup === true,
       backupDirectory: typeof result.backupDirectory === 'string' ? result.backupDirectory : '',
+      ...getBackupFileSettings(result),
       lastBackupTime: typeof result.lastBackupTime === 'string' ? result.lastBackupTime : null,
       nextBackupTime: typeof result.nextBackupTime === 'string' ? result.nextBackupTime : null
     };
@@ -93,6 +107,8 @@ export function useAutoBackup() {
       enableLocalSnapshot: settings.value.enableLocalSnapshot,
       enableDirectoryBackup: settings.value.enableDirectoryBackup,
       backupDirectory: settings.value.backupDirectory,
+      backupFileDestination: settings.value.backupFileDestination,
+      backupDownloadDirectory: settings.value.backupDownloadDirectory,
       lastBackupTime: settings.value.lastBackupTime,
       nextBackupTime: settings.value.nextBackupTime
     });
@@ -147,7 +163,15 @@ export function useAutoBackup() {
       const request = store.put(handle, 'backupDirectory');
 
       request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
+      transaction.oncomplete = () => {
+        directoryHandle = handle;
+        db.close();
+        resolve();
+      };
+      transaction.onabort = () => {
+        db.close();
+        reject(transaction.error ?? new Error('保存备份目录失败'));
+      };
     });
   }
 
@@ -159,7 +183,11 @@ export function useAutoBackup() {
       const request = store.get('backupDirectory');
 
       request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result || null);
+      request.onsuccess = () => {
+        directoryHandle = request.result || null;
+        resolve(directoryHandle);
+      };
+      transaction.oncomplete = () => db.close();
     });
   }
 
@@ -171,11 +199,20 @@ export function useAutoBackup() {
       const request = store.delete('backupDirectory');
 
       request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
+      transaction.oncomplete = () => {
+        directoryHandle = null;
+        db.close();
+        resolve();
+      };
+      transaction.onabort = () => {
+        db.close();
+        reject(transaction.error ?? new Error('移除备份目录失败'));
+      };
     });
   }
 
   async function selectDirectory(): Promise<{ success: boolean; name?: string; error?: string }> {
+    let directorySelected = false;
     try {
       if (!('showDirectoryPicker' in window)) {
         return {
@@ -188,6 +225,7 @@ export function useAutoBackup() {
         mode: 'readwrite',
         id: 'openpass-backup-dir'
       });
+      directorySelected = true;
 
       const permission = (await handle.requestPermission?.({ mode: 'readwrite' })) ??
         (await handle.queryPermission?.({ mode: 'readwrite' })) ??
@@ -202,7 +240,7 @@ export function useAutoBackup() {
 
       return { success: true, name: handle.name };
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
+      if (!directorySelected && error instanceof Error && error.name === 'AbortError') {
         return { success: false, error: '已取消选择' };
       }
 
@@ -241,12 +279,11 @@ export function useAutoBackup() {
   }
 
   async function requestPermission(): Promise<{ success: boolean; error?: string }> {
-    const handle = await getStoredHandle();
-    if (!handle) {
-      return { success: false, error: '未选择备份目录' };
-    }
-
     try {
+      const handle = directoryHandle ?? await getStoredHandle();
+      if (!handle) {
+        return { success: false, error: '未选择备份目录' };
+      }
       const permission = await handle.requestPermission?.({ mode: 'readwrite' });
       if (permission === 'granted') return { success: true };
       return { success: false, error: '未获得目录写入权限，请重新选择目录并允许写入' };
@@ -321,6 +358,7 @@ export function useAutoBackup() {
     const backupData = await createBackup(secrets, options);
     const results: {
       snapshot: boolean;
+      snapshotError?: string;
       directory?: BackupDirectoryWriteResult;
     } = {
       snapshot: false,
@@ -328,17 +366,29 @@ export function useAutoBackup() {
     };
 
     if (settings.value.enableLocalSnapshot) {
-      await saveSnapshot(backupData);
-      results.snapshot = true;
+      try {
+        await saveSnapshot(backupData);
+        results.snapshot = true;
+      } catch (error) { results.snapshotError = getErrorMessage(error, '保存快照失败'); }
     }
 
     if (settings.value.enableDirectoryBackup) {
-      results.directory = await writeToDirectory(backupData);
+      results.directory = settings.value.backupFileDestination === 'downloads'
+        ? await writeBackupToDownloads(backupData, settings.value.backupDownloadDirectory)
+        : await writeToDirectory(backupData);
     }
 
-    const allEnabledTargetsSucceeded =
+    const allEnabledTargetsSucceeded = (settings.value.enableLocalSnapshot || settings.value.enableDirectoryBackup) &&
       (!settings.value.enableLocalSnapshot || results.snapshot) &&
       (!settings.value.enableDirectoryBackup || results.directory?.success === true);
+    await recordLocalBackupResult({
+      success: allEnabledTargetsSucceeded, snapshot: results.snapshot,
+      fileEnabled: settings.value.enableDirectoryBackup, fileSuccess: results.directory?.success,
+      needAuth: results.directory?.needAuth || results.directory?.needDownloadPermission,
+      error: [results.snapshotError ? `本地快照失败：${results.snapshotError}` : '', results.directory?.error || ''].filter(Boolean).join('；') ||
+        (!allEnabledTargetsSucceeded ? '请至少启用一个备份目标' : undefined),
+      locationLabel: results.directory?.locationLabel
+    }, settings.value.backupFrequency);
 
     if (allEnabledTargetsSucceeded) {
       const now = new Date().toISOString();

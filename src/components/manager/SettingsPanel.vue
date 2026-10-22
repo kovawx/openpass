@@ -13,7 +13,9 @@ import {
   getBackupEncryptionSettings,
   resolveStoredBackupPassword
 } from '@/utils/backup';
-import { getBackupDirectoryAuthorizationAction } from '@/utils/backupDestination';
+import { getBackupDirectoryAuthorizationAction, normalizeBackupDownloadDirectory,
+  getDownloadBackupLocationLabel, type BackupFileDestination } from '@/utils/backupDestination';
+import { DEFAULT_LOCAL_BACKUP_STATUS, clearLocalBackupRetry, loadLocalBackupStatus, type LocalBackupStatus } from '@/utils/localBackupStatus';
 import {
   DEFAULT_CLOUD_BACKUP_SETTINGS,
   DEFAULT_CLOUD_BACKUP_STATUS,
@@ -39,6 +41,9 @@ const enableAutoBackup = ref(false);
 const backupFrequency = ref<'every5min' | 'daily' | 'weekly' | 'monthly'>('weekly');
 const enableLocalSnapshot = ref(true);
 const enableDirectoryBackup = ref(false);
+const backupFileDestination = ref<BackupFileDestination>('downloads');
+const backupDownloadDirectory = ref('OpenPass');
+const localBackupStatus = ref<LocalBackupStatus>({ ...DEFAULT_LOCAL_BACKUP_STATUS });
 const lastBackupTime = ref<string | null>(null);
 const nextBackupTime = ref<string | null>(null);
 
@@ -114,6 +119,12 @@ const visibleCloudVersions = computed(() => cloudVersions.value.slice(
 const cloudBusy = computed(() => savingCloud.value || syncingCloud.value || testingCloud.value || togglingCloud.value || clearingVault.value || deletingCloudVersionKey.value !== null);
 
 function handleCloudStatusChange(changes: Record<string, chrome.storage.StorageChange>, area: chrome.storage.AreaName) {
+  if (area === 'local' && changes.localBackupStatus) {
+    const status = changes.localBackupStatus.newValue;
+    localBackupStatus.value = { ...DEFAULT_LOCAL_BACKUP_STATUS, ...(typeof status === 'object' && status !== null ? status : {}) };
+  }
+  if (area === 'local' && changes.lastBackupTime) lastBackupTime.value = typeof changes.lastBackupTime.newValue === 'string' ? changes.lastBackupTime.newValue : null;
+  if (area === 'local' && changes.nextBackupTime) nextBackupTime.value = typeof changes.nextBackupTime.newValue === 'string' ? changes.nextBackupTime.newValue : null;
   if (area === 'local' && changes.cloudBackupStatus) {
     const next = changes.cloudBackupStatus.newValue;
     cloudStatus.value = { ...DEFAULT_CLOUD_BACKUP_STATUS, ...(typeof next === 'object' && next !== null ? next : {}) };
@@ -142,14 +153,13 @@ async function loadAllSettings() {
   backupFrequency.value = autoBackup.settings.value.backupFrequency;
   enableLocalSnapshot.value = autoBackup.settings.value.enableLocalSnapshot;
   enableDirectoryBackup.value = autoBackup.settings.value.enableDirectoryBackup;
+  backupFileDestination.value = autoBackup.settings.value.backupFileDestination;
+  backupDownloadDirectory.value = autoBackup.settings.value.backupDownloadDirectory;
+  localBackupStatus.value = await loadLocalBackupStatus();
   lastBackupTime.value = autoBackup.settings.value.lastBackupTime;
   nextBackupTime.value = autoBackup.settings.value.nextBackupTime;
 
   directoryInfo.value = await autoBackup.getDirectoryInfo();
-  if (enableDirectoryBackup.value && directoryInfo.value.permission !== 'granted') {
-    enableDirectoryBackup.value = false;
-    await autoBackup.saveSettings({ enableDirectoryBackup: false });
-  }
 
   const encryptionResult = await getBackupEncryptionSettings();
   enableBackupEncryption.value = encryptionResult.enableBackupEncryption;
@@ -216,7 +226,9 @@ async function saveBackupSettings() {
     enableAutoBackup: enableAutoBackup.value,
     backupFrequency: backupFrequency.value,
     enableLocalSnapshot: enableLocalSnapshot.value,
-    enableDirectoryBackup: enableDirectoryBackup.value
+    enableDirectoryBackup: enableDirectoryBackup.value,
+    backupFileDestination: backupFileDestination.value,
+    backupDownloadDirectory: backupDownloadDirectory.value
   });
 
   if (!enableAutoBackup.value) {
@@ -255,13 +267,24 @@ async function handleDirectoryBackupToggle() {
   authorizingDirectory.value = true;
 
   try {
+    if (backupFileDestination.value === 'downloads') {
+      backupDownloadDirectory.value = normalizeBackupDownloadDirectory(backupDownloadDirectory.value);
+      const permission = chrome.permissions.request({ permissions: ['downloads'] });
+      if (!await permission) throw new Error('下载备份权限未授予，文件备份未启用');
+      await saveBackupSettings();
+      await clearLocalBackupRetry();
+      showToast(`已启用文件备份：${getDownloadBackupLocationLabel(backupDownloadDirectory.value)}`, 'success');
+      return;
+    }
     const action = getBackupDirectoryAuthorizationAction(
       directoryInfo.value.hasHandle,
       directoryInfo.value.permission
     );
 
     if (action !== 'ready') {
-      const result = await autoBackup.selectDirectory();
+      const result = action === 'request-permission'
+        ? await autoBackup.requestPermission()
+        : await autoBackup.selectDirectory();
 
       directoryInfo.value = await autoBackup.getDirectoryInfo();
 
@@ -278,6 +301,7 @@ async function handleDirectoryBackupToggle() {
     }
 
     await saveBackupSettings();
+    await clearLocalBackupRetry();
     showToast(`已授权 ${directoryInfo.value.locationLabel}，目录备份已启用`, 'success');
   } catch (error) {
     enableDirectoryBackup.value = false;
@@ -286,6 +310,31 @@ async function handleDirectoryBackupToggle() {
   } finally {
     authorizingDirectory.value = false;
   }
+}
+
+async function saveFileBackupTarget() {
+  if (authorizingDirectory.value) return;
+  authorizingDirectory.value = true;
+  try {
+    if (backupFileDestination.value === 'downloads') {
+      backupDownloadDirectory.value = normalizeBackupDownloadDirectory(backupDownloadDirectory.value);
+      const permission = enableDirectoryBackup.value
+        ? chrome.permissions.request({ permissions: ['downloads'] }) : Promise.resolve(true);
+      if (!await permission) throw new Error('未获得下载备份权限，保留原保存方式');
+    } else if (enableDirectoryBackup.value && directoryInfo.value.permission !== 'granted') {
+      const result = directoryInfo.value.hasHandle && directoryInfo.value.permission === 'prompt'
+        ? await autoBackup.requestPermission() : await autoBackup.selectDirectory();
+      directoryInfo.value = await autoBackup.getDirectoryInfo();
+      if (!result.success || directoryInfo.value.permission !== 'granted') throw new Error(result.error || '未获得目录写入权限');
+    }
+    await saveBackupSettings();
+    await clearLocalBackupRetry();
+    showToast('备份文件保存位置已更新，请点击立即备份验证', 'success');
+  } catch (error) {
+    backupFileDestination.value = autoBackup.settings.value.backupFileDestination;
+    backupDownloadDirectory.value = autoBackup.settings.value.backupDownloadDirectory;
+    showToast(getErrorMessage(error, '保存备份位置失败'), 'error');
+  } finally { authorizingDirectory.value = false; }
 }
 
 async function saveEncryptionSettings() {
@@ -374,13 +423,21 @@ async function handleSelectDirectory() {
 }
 
 async function handleRequestPermission() {
-  const result = await autoBackup.requestPermission();
-
-  if (result.success) {
+  if (authorizingDirectory.value) return;
+  authorizingDirectory.value = true;
+  try {
+    const result = await autoBackup.requestPermission();
     directoryInfo.value = await autoBackup.getDirectoryInfo();
-    showToast('授权成功', 'success');
-  } else if (result.error) {
-    showToast(result.error, 'error');
+    if (result.success && directoryInfo.value.permission === 'granted') {
+      await clearLocalBackupRetry();
+      showToast('目录授权已恢复，可点击立即备份验证写入', 'success');
+    } else {
+      showToast(result.error || '目录写入权限尚未恢复', 'error');
+    }
+  } catch (error) {
+    showToast(getErrorMessage(error, '授权失败'), 'error');
+  } finally {
+    authorizingDirectory.value = false;
   }
 }
 
@@ -415,11 +472,14 @@ async function handleBackupNow() {
 
     const messages = [];
     if (results.snapshot) messages.push('本地快照已保存');
-    if (results.directory?.success) messages.push('目录备份成功');
+    if (results.directory?.success) messages.push('文件备份成功');
     if (messages.length > 0) showToast(messages.join('，'), 'success');
     if (results.directory && !results.directory.success) {
-      showToast(`目录备份失败：${results.directory.error || '未生成备份文件'}`, 'error');
+      showToast(`文件备份失败：${results.directory.error || '未生成备份文件'}`, 'error');
     }
+    if (results.snapshotError) showToast(`本地快照失败：${results.snapshotError}`, 'error');
+  } catch (error) {
+    showToast(getErrorMessage(error, '备份失败'), 'error');
   } finally {
     backingUp.value = false;
   }
@@ -887,7 +947,7 @@ async function resetAllData() {
             <span class="settings-item-desc">距离上次备份超过设定间隔时自动创建备份</span>
           </div>
           <label class="toggle">
-            <input v-model="enableAutoBackup" type="checkbox" @change="saveBackupSettings">
+            <input v-model="enableAutoBackup" type="checkbox" :disabled="backingUp" @change="saveBackupSettings">
             <span class="toggle-slider"></span>
           </label>
         </div>
@@ -896,7 +956,7 @@ async function resetAllData() {
           <!-- 备份频率 -->
           <div class="form-group">
             <label>备份频率</label>
-            <select v-model="backupFrequency" class="form-select" @change="saveBackupSettings">
+            <select v-model="backupFrequency" class="form-select" :disabled="backingUp" @change="saveBackupSettings">
               <option value="every5min">每 5 分钟 (测试)</option>
               <option value="daily">每天</option>
               <option value="weekly">每周</option>
@@ -911,7 +971,7 @@ async function resetAllData() {
               <span class="settings-item-desc">在浏览器中保留最近 5 个备份版本</span>
             </div>
             <label class="toggle">
-              <input v-model="enableLocalSnapshot" type="checkbox" @change="saveBackupSettings">
+              <input v-model="enableLocalSnapshot" type="checkbox" :disabled="backingUp" @change="saveBackupSettings">
               <span class="toggle-slider"></span>
             </label>
           </div>
@@ -920,21 +980,35 @@ async function resetAllData() {
           <div class="settings-item">
             <div class="settings-item-info">
               <span class="settings-item-label">自动保存到本地目录</span>
-              <span class="settings-item-desc">开启时会立即要求选择目录并授权，授权成功后才会启用</span>
+              <span class="settings-item-desc">下载目录支持持续后台备份；自选目录受浏览器目录授权限制</span>
             </div>
             <label class="toggle">
               <input
                 v-model="enableDirectoryBackup"
                 type="checkbox"
-                :disabled="authorizingDirectory"
+                :disabled="authorizingDirectory || backingUp"
                 @change="handleDirectoryBackupToggle"
               >
               <span class="toggle-slider"></span>
             </label>
           </div>
 
-          <!-- 目录状态和选择 -->
-          <div v-if="enableDirectoryBackup" class="directory-section">
+          <div v-if="enableDirectoryBackup || directoryInfo.hasHandle" class="form-group">
+            <label for="backup-file-destination">文件保存方式</label>
+            <select id="backup-file-destination" v-model="backupFileDestination" class="form-select" :disabled="authorizingDirectory || backingUp" @change="saveFileBackupTarget">
+              <option value="downloads">浏览器下载目录（推荐，适合长期自动备份）</option>
+              <option value="directory">自选目录（临时授权可能在关闭页面后失效）</option>
+            </select>
+          </div>
+          <div v-if="enableDirectoryBackup && backupFileDestination === 'downloads'" class="form-group">
+            <label for="backup-download-directory">下载目录下的备份子目录</label>
+            <input id="backup-download-directory" v-model="backupDownloadDirectory" class="form-input" :disabled="authorizingDirectory || backingUp" @change="saveFileBackupTarget">
+            <p class="settings-desc">保存到：{{ getDownloadBackupLocationLabel(backupDownloadDirectory) }}。首次启用时申请扩展下载权限，之后无需重复授权目录。</p>
+          </div>
+
+          <!-- Legacy directories remain explicit; never silently redirect their files. -->
+          <div v-if="backupFileDestination === 'directory' && (enableDirectoryBackup || directoryInfo.hasHandle)" class="directory-section">
+            <p class="settings-desc">关闭扩展页面后，临时目录授权可能失效。长期自动备份建议选择下载目录，切换前请核对新位置。</p>
             <div class="directory-status">
               <div class="directory-info">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -942,7 +1016,7 @@ async function resetAllData() {
                 </svg>
                 <span>{{ directoryInfo.hasHandle ? `已选择: ${directoryInfo.locationLabel}` : directoryInfo.locationLabel }}</span>
               </div>
-              <button class="btn-secondary btn-sm" @click="handleSelectDirectory">
+              <button class="btn-secondary btn-sm" :disabled="authorizingDirectory || backingUp" @click="handleSelectDirectory">
                 {{ directoryInfo.hasHandle ? '更换目录' : '选择备份目录并授权' }}
               </button>
             </div>
@@ -953,7 +1027,7 @@ async function resetAllData() {
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-green-500">
                   <polyline points="20 6 9 17 4 12"></polyline>
                 </svg>
-                <span class="text-green-600">已授权，可自动写入</span>
+                <span class="text-green-600">已获得目录写入权限</span>
               </template>
               <template v-else-if="directoryInfo.permission === 'prompt'">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-yellow-500">
@@ -961,8 +1035,8 @@ async function resetAllData() {
                   <line x1="12" y1="9" x2="12" y2="13"></line>
                   <line x1="12" y1="17" x2="12.01" y2="17"></line>
                 </svg>
-                <span class="text-yellow-600">需要授权才能写入</span>
-                <button class="btn-secondary btn-sm" @click="handleRequestPermission">授权</button>
+                <span class="text-yellow-600">目录已保存，需重新确认写入权限；确认前无法生成目录备份</span>
+                <button class="btn-secondary btn-sm" :disabled="authorizingDirectory || backingUp" @click="handleRequestPermission">重新授权</button>
               </template>
               <template v-else-if="directoryInfo.permission === 'denied'">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-red-500">
@@ -976,6 +1050,15 @@ async function resetAllData() {
             <div v-else class="permission-status">
               <span class="text-yellow-600">尚未授权目录，自动备份不会生成文件</span>
             </div>
+          </div>
+
+          <div v-if="localBackupStatus.lastAttemptAt" class="backup-info backup-status" role="status">
+            <div>最近执行：{{ new Date(localBackupStatus.lastAttemptAt).toLocaleString('zh-CN') }}</div>
+            <div>执行结果：{{ { idle: '等待执行', success: '所有已启用目标成功', partial: '部分完成', error: '失败' }[localBackupStatus.state] }}</div>
+            <div v-if="localBackupStatus.error" class="text-yellow-600">{{ localBackupStatus.error }}</div>
+            <div v-if="localBackupStatus.locationLabel">本次文件目标：{{ localBackupStatus.locationLabel }}</div>
+            <div v-if="localBackupStatus.nextRetryAt">下次重试：{{ new Date(localBackupStatus.nextRetryAt).toLocaleString('zh-CN') }}</div>
+            <div v-if="localBackupStatus.lastFileAt">最近文件备份成功：{{ new Date(localBackupStatus.lastFileAt).toLocaleString('zh-CN') }}</div>
           </div>
 
           <!-- 备份时间信息 -->
@@ -1696,6 +1779,12 @@ async function resetAllData() {
   background: #f8fafc;
   border-radius: 8px;
   margin-top: 16px;
+}
+
+.backup-status {
+  flex-direction: column;
+  gap: 6px;
+  overflow-wrap: anywhere;
 }
 
 .info-item {

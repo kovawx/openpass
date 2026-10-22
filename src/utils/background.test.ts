@@ -16,6 +16,9 @@ vi.mock('./s3CloudBackup', () => ({
 }));
 const local = new Map<string, unknown>();
 const session = new Map<string, unknown>();
+const download = vi.fn();
+const downloadSearch = vi.fn();
+const downloadListeners = new Set<(delta: chrome.downloads.DownloadDelta) => void>();
 function area(values: Map<string, unknown>) {
   return {
     get: async (keys: string[]) => Object.fromEntries(keys.map((key) => [key, values.get(key)])),
@@ -44,6 +47,9 @@ beforeEach(async () => {
   vi.resetModules(); local.clear(); session.clear();
   transport.download.mockReset(); transport.upload.mockReset(); transport.retention.mockReset();
   transport.versions.mockReset(); transport.deleteVersions.mockReset();
+  download.mockReset().mockResolvedValue(41);
+  downloadSearch.mockReset().mockResolvedValue([{ id: 41, state: 'complete' }]);
+  downloadListeners.clear();
   local.set('sessionExpiresAt', Date.now() + 60000); session.set('sessionKey', 'password');
   const event = () => ({ addListener: vi.fn() });
   vi.stubGlobal('self', { addEventListener: vi.fn() });
@@ -55,6 +61,11 @@ beforeEach(async () => {
     contextMenus: { onClicked: event() },
     tabs: { query: vi.fn().mockResolvedValue([]), create: vi.fn().mockResolvedValue({}), captureVisibleTab: vi.fn(), onUpdated: event(), onActivated: event() },
     notifications: { create: vi.fn().mockResolvedValue('fixture-notification') },
+    permissions: { contains: vi.fn().mockResolvedValue(true) },
+    downloads: { download, search: downloadSearch, onChanged: {
+      addListener: (listener: (delta: chrome.downloads.DownloadDelta) => void) => downloadListeners.add(listener),
+      removeListener: (listener: (delta: chrome.downloads.DownloadDelta) => void) => downloadListeners.delete(listener)
+    } },
     alarms: { clear: vi.fn().mockResolvedValue(true), create: vi.fn().mockResolvedValue(undefined), onAlarm: event() }
   });
   const background = await import('../entrypoints/background');
@@ -62,6 +73,73 @@ beforeEach(async () => {
   await putSecrets([secret]);
 });
 describe('background authorization and writes', () => {
+  it('backs up encrypted records while locked and marks success only after the file completes', async () => {
+    local.set('enableAutoBackup', true); local.set('enableDirectoryBackup', true);
+    local.set('backupFileDestination', 'downloads');
+    local.set('enableBackupEncryption', true); local.set('sitesList', [{ site: secret.site }]);
+    session.clear(); local.delete('sessionExpiresAt');
+    downloadSearch.mockResolvedValue([{ id: 41, state: 'in_progress' }]);
+    const result = message({ action: 'testAutoBackup' });
+    await vi.waitFor(() => expect(downloadSearch).toHaveBeenCalled());
+    expect(local.get('lastBackupTime')).toBeUndefined();
+    let retryCleared = false;
+    const clearRetry = message({ action: 'clearLocalBackupRetry' }).then(() => { retryCleared = true; });
+    await Promise.resolve(); expect(retryCleared).toBe(false);
+    for (const listener of downloadListeners) listener({ id: 41, state: { current: 'complete' } });
+    expect(await result).toMatchObject({ success: true });
+    await clearRetry;
+    const payload = JSON.parse(decodeURIComponent(download.mock.calls[0][0].url.split(',')[1]));
+    expect(payload.encrypted).toBe(true); expect(payload.secrets).toBeUndefined();
+    expect(JSON.parse(await CryptoUtils.decrypt(payload.encryptedData, 'password'))[0].secret).toBe(secret.secret);
+    expect(local.get('localBackupStatus')).toMatchObject({ state: 'success', needAuth: false, nextRetryAt: null });
+    expect(local.get('lastBackupTime')).toBeTruthy();
+  });
+  it('keeps the last full success and historical snapshots on failure, backs off and suppresses repeated alerts', async () => {
+    local.set('enableAutoBackup', true); local.set('enableDirectoryBackup', true);
+    local.set('backupFileDestination', 'downloads');
+    local.set('enableBackupEncryption', true); local.set('backupFrequency', 'daily');
+    local.set('lastBackupTime', '2026-10-01T00:00:00Z');
+    local.set('nextBackupTime', '2026-10-02T00:00:00Z');
+    download.mockRejectedValue(new Error('fixture disk failure'));
+    expect(await message({ action: 'testAutoBackup' })).toMatchObject({ success: false });
+    expect(local.get('lastBackupTime')).toBe('2026-10-01T00:00:00Z');
+    expect(local.get('nextBackupTime')).toBe('2026-10-02T00:00:00Z');
+    const status = local.get('localBackupStatus') as { nextRetryAt: string };
+    expect(Date.parse(status.nextRetryAt)).toBeGreaterThan(Date.now() + 14 * 60000);
+    expect(local.get('backupSnapshots')).toHaveLength(1);
+    const notices = vi.mocked(chrome.notifications.create).mock.calls.length;
+    await message({ action: 'testAutoBackup' });
+    expect(local.get('backupSnapshots')).toHaveLength(1);
+    expect(vi.mocked(chrome.notifications.create).mock.calls.length).toBe(notices);
+    const alarm = vi.mocked(chrome.alarms.onAlarm.addListener).mock.calls[0][0];
+    const attempts = download.mock.calls.length;
+    await alarm({ name: 'openpass-auto-backup', scheduledTime: Date.now() });
+    expect(download).toHaveBeenCalledTimes(attempts);
+    download.mockResolvedValue(41);
+    expect(await message({ action: 'testAutoBackup' })).toMatchObject({ success: true });
+    expect(local.get('localBackupStatus')).toMatchObject({ state: 'success', nextRetryAt: null });
+  });
+  it('rejects empty target configuration and does not silently migrate legacy directories', async () => {
+    local.set('enableAutoBackup', true); local.set('enableLocalSnapshot', false);
+    expect(await message({ action: 'testAutoBackup' })).toMatchObject({ success: false, error: '请至少启用一个备份目标' });
+    local.set('enableDirectoryBackup', true); local.set('backupDirectory', 'legacy-backup');
+    expect(await message({ action: 'testAutoBackup' })).toMatchObject({ success: false });
+    expect(download).not.toHaveBeenCalled();
+  });
+  it('still writes the encrypted file when snapshot storage fails and reports partial completion', async () => {
+    local.set('enableAutoBackup', true); local.set('enableDirectoryBackup', true);
+    local.set('backupFileDestination', 'downloads'); local.set('enableBackupEncryption', true);
+    const set = chrome.storage.local.set;
+    vi.spyOn(chrome.storage.local, 'set').mockImplementation(async updates => {
+      if ('backupSnapshots' in updates) throw new Error('fixture snapshot quota');
+      return set(updates);
+    });
+    expect(await message({ action: 'testAutoBackup' })).toMatchObject({ success: false, error: expect.stringContaining('文件已保存') });
+    expect(download).toHaveBeenCalledOnce();
+    expect(local.get('lastBackupTime')).toBeUndefined();
+    expect(local.get('localBackupStatus')).toMatchObject({ state: 'partial', lastSnapshotAt: null, lastFileAt: expect.any(String) });
+    expect(chrome.notifications.create).toHaveBeenCalledWith(expect.objectContaining({ title: '自动备份部分完成' }));
+  });
   it('opens authentication for a locked QR request without capturing the page or logging a scan failure', async () => {
     local.set('isSetupComplete', true); session.clear(); local.delete('sessionExpiresAt');
     const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});

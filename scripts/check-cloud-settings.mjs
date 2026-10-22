@@ -17,6 +17,8 @@ const encrypted = await webcrypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, n
   accessKeyId: 'fixture-access', secretAccessKey: 'fixture-secret', cloudPassword: password, cloudPasswordMode: 'custom'
 })));
 const fixture = {
+  enableAutoBackup: true, enableDirectoryBackup: true, enableLocalSnapshot: true,
+  backupDirectory: 'fixture-backups', backupFrequency: 'daily',
   masterPasswordHash: 'fixture-hash', masterPasswordSalt: 'fixture-salt', isSetupComplete: true, welcomeCompleted: true,
   sessionExpiresAt: Date.now() + 900000,
   encryptedCloudBackupSecrets: Buffer.concat([salt, iv, Buffer.from(encrypted)]).toString('base64'),
@@ -55,8 +57,45 @@ try {
     const actions = [];
     const control = { values, actions, restores: [], historyFailure: false, syncLocked: false,
       restoreFailure: false, holdRestore: false, finishRestore: null, deleted: [], deleteFailure: false,
-      clears: [], clearScope: null, clearFailure: false };
+      clears: [], clearScope: null, clearFailure: false,
+      directoryPermission: 'prompt', permissionRequests: 0, pickerCalls: 0, denyDirectoryPermission: false,
+      denyDownloadPermission: false, downloadPermissionRequests: 0 };
     window.openpassFixture = control;
+    const directory = {
+      name: 'fixture-backups', kind: 'directory',
+      queryPermission: async () => control.directoryPermission,
+      requestPermission: async () => {
+        if (!navigator.userActivation.isActive) throw Error('Directory recovery lost user activation');
+        control.permissionRequests++;
+        control.directoryPermission = control.denyDirectoryPermission ? 'denied' : 'granted';
+        return control.directoryPermission;
+      }
+    };
+    window.showDirectoryPicker = async () => { control.pickerCalls++; throw Error('Unexpected directory picker'); };
+    Object.defineProperty(window, 'indexedDB', { configurable: true, value: {
+      open: () => {
+        const request = {};
+        queueMicrotask(() => {
+          request.result = {
+            close() {},
+            transaction: () => {
+              const transaction = { objectStore: () => ({ get: () => {
+                const read = {};
+                queueMicrotask(() => {
+                  read.result = directory;
+                  read.onsuccess?.();
+                  queueMicrotask(() => transaction.oncomplete?.());
+                });
+                return read;
+              } }) };
+              return transaction;
+            }
+          };
+          request.onsuccess?.();
+        });
+        return request;
+      }
+    } });
     const area = (map, name) => ({
       get: async keys => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map(key => [key, map[key]])),
       set: async updates => {
@@ -110,7 +149,12 @@ try {
       storage: { local, session: area(session, 'session'), onChanged: {
         addListener: listener => listeners.add(listener), removeListener: listener => listeners.delete(listener)
       } },
-      permissions: { request: async () => true, contains: async () => true },
+      permissions: { request: async details => {
+        if (details.permissions?.includes('downloads')) {
+          control.downloadPermissionRequests++; return !control.denyDownloadPermission;
+        }
+        return true;
+      }, contains: async () => true },
       alarms: { clear: async () => true, create: async () => {} }
     } });
   }, fixture, password);
@@ -126,6 +170,49 @@ try {
     await page.waitForFunction(() => document.querySelectorAll('.cloud-history-item').length === 5);
   };
   await openSettings();
+  assert.equal(await page.evaluate(() => window.openpassFixture.values.enableDirectoryBackup), true);
+  assert.match(await page.$eval('.directory-section', el => el.textContent), /fixture-backups/);
+  await clickText('重新授权');
+  await page.waitForFunction(() => document.querySelector('.directory-section').textContent.includes('已获得目录写入权限'));
+  assert.equal(await page.evaluate(() => window.openpassFixture.permissionRequests), 1);
+  assert.equal(await page.evaluate(() => window.openpassFixture.pickerCalls), 0);
+  await openSettings();
+  await page.evaluate(() => { window.openpassFixture.denyDirectoryPermission = true; });
+  await clickText('重新授权');
+  await page.waitForFunction(() => document.querySelector('.directory-section').textContent.includes('权限被拒绝'));
+  assert.equal(await page.evaluate(() => window.openpassFixture.values.enableDirectoryBackup), true);
+  await openSettings();
+  // Disabling directory backup must leave its saved directory and recovery button visible.
+  await page.evaluate(() => {
+    [...document.querySelectorAll('.settings-item')].find(el => el.textContent.includes('自动保存到本地目录')).querySelector('input').click();
+  });
+  await page.waitForFunction(() => window.openpassFixture.values.enableDirectoryBackup === false);
+  await clickText('重新授权');
+  await page.waitForFunction(() => document.querySelector('.directory-section').textContent.includes('已获得目录写入权限'));
+  assert.equal(await page.evaluate(() => window.openpassFixture.values.enableDirectoryBackup), false);
+  assert.equal(await page.evaluate(() => window.openpassFixture.pickerCalls), 0);
+  await page.evaluate(() => {
+    [...document.querySelectorAll('.settings-item')].find(el => el.textContent.includes('自动保存到本地目录')).querySelector('input').click();
+  });
+  await page.waitForFunction(() => window.openpassFixture.values.enableDirectoryBackup === true);
+  await page.evaluate(() => { window.openpassFixture.denyDownloadPermission = true; });
+  await page.select('#backup-file-destination', 'downloads');
+  await page.waitForFunction(() => document.querySelector('#backup-file-destination').value === 'directory');
+  assert.equal(await page.evaluate(() => window.openpassFixture.values.backupFileDestination), 'directory');
+  assert.equal(await page.evaluate(() => window.openpassFixture.values.backupDirectory), 'fixture-backups');
+  await page.evaluate(() => { window.openpassFixture.denyDownloadPermission = false; });
+  await page.select('#backup-file-destination', 'downloads');
+  await page.waitForFunction(() => window.openpassFixture.values.backupFileDestination === 'downloads');
+  await page.waitForFunction(() => !document.querySelector('#backup-file-destination').disabled);
+  assert.equal(await page.$eval('#backup-download-directory', el => el.value), 'OpenPass');
+  await page.evaluate(() => chrome.storage.local.set({ localBackupStatus: {
+    state: 'partial', lastAttemptAt: '2026-10-19T00:00:00Z', error: 'fixture file failure',
+    nextRetryAt: '2026-10-19T00:15:00Z'
+  } }));
+  await page.waitForFunction(() => document.querySelector('.backup-status')?.textContent.includes('fixture file failure'));
+  assert.match(await page.$eval('.backup-status', el => el.textContent), /部分完成/);
+  await page.$eval('#backup-file-destination', el => el.scrollIntoView());
+  await page.screenshot({ path: '/tmp/openpass-download-backup-settings.png' });
   assert.equal(await page.$eval('.cloud-config-toggle', el => el.getAttribute('aria-expanded')), 'false');
   assert.ok((await page.evaluate(() => window.openpassFixture.actions)).includes('listCloudBackupVersions'));
   assert.match(await page.$eval('.cloud-pagination', el => el.textContent), /1 \/ 6/);
@@ -250,7 +337,7 @@ try {
   assert.equal(await page.evaluate(() => window.openpassFixture.values.cloudBackupSettings.enabled), false);
   assert.equal(await page.evaluate(() => window.openpassFixture.deleted.length), 1);
   assert.deepEqual(errors, []);
-  console.log('PASS: management UI history/paging, password persistence, restore confirmation, explicit clear scope and typed consent, cloud deletion retry, protected current version, local-only cleanup and narrow layouts.');
+  console.log('PASS: saved directory permission recovery and switch preservation; management UI history/paging, password persistence, restore confirmation, explicit clear scope and typed consent, cloud deletion retry, protected current version, local-only cleanup and narrow layouts.');
 } finally {
   await browser.close();
   await new Promise(resolve => server.close(resolve));

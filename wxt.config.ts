@@ -15,7 +15,7 @@ export default defineConfig({
   }),
   manifest: {
     name: 'OpenPass',
-    version: '0.3.1',
+    version: '0.3.2',
     description: '开源的 2FA 认证工具，本地存储密钥，一键生成验证码',
     homepage_url: 'https://github.com/kovawx/openpass',
     permissions: [
@@ -26,6 +26,7 @@ export default defineConfig({
       'notifications',
       'alarms'
     ],
+    optional_permissions: ['downloads'],
     optional_host_permissions: ['https://*/*', 'http://localhost/*', 'http://127.0.0.1/*'],
     icons: {
       '16': 'icons/icon16.png',

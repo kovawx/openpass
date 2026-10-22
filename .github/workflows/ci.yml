@@ -31,3 +31,9 @@ jobs:
 
       - name: Verify source and production build
         run: pnpm check
+
+      - name: Verify real browser backup lifecycle
+        run: pnpm test:backup-directory
+
+      - name: Verify backup settings and permission recovery
+        run: pnpm test:cloud-settings

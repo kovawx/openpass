@@ -17,4 +17,10 @@ describe('shared backup scheduling', () => {
       nextBackupTime: '2026-10-08T00:04:00Z' }, now)).toEqual({ delayInMinutes: 4, periodInMinutes: 5 });
     expect(getBackupSchedule({ enableAutoBackup: true, nextBackupTime: 'invalid' }, now)?.delayInMinutes).toBe(1);
   });
+  it('waits for a failed local backup retry while continuing independent cloud work', () => {
+    const local = { enableAutoBackup: true, nextBackupTime: '2026-10-07T00:00:00Z',
+      localBackupStatus: { nextRetryAt: '2026-10-08T00:15:00Z' } };
+    expect(getBackupSchedule(local, now)?.delayInMinutes).toBe(15);
+    expect(getBackupSchedule({ ...local, cloudBackupSettings: { enabled: true } }, now)?.delayInMinutes).toBe(1);
+  });
 });
