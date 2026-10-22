@@ -2,7 +2,7 @@
 
 > 开源、本地、安全的两步验证管理器
 
-当前版本：v0.3.1
+当前版本：v0.3.2
 
 [![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=google-chrome&logoColor=white)](https://chromewebstore.google.com/detail/ejokhmkfamhdcopmfockefjfgdiginpp?utm_source=item-share-cb)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)

@@ -19,8 +19,11 @@ import {
   createBackupFilename,
   getBackupDirectoryAccessError,
   getCustomBackupLocationLabel,
+  getBackupFileSettings,
+  writeBackupToDownloads,
   type BackupDirectoryWriteResult
 } from '@/utils/backupDestination';
+import { recordLocalBackupResult, resetLocalBackupRetry } from '@/utils/localBackupStatus';
 import { installGlobalRuntimeErrorListeners, type ErrorEventTarget } from '@/utils/runtimeErrors';
 import {
   getBackupSyncMetadata,
@@ -212,6 +215,8 @@ export default defineBackground(() => {
 
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve(request.result || null);
+      transaction.oncomplete = () => db.close();
+      transaction.onabort = () => { db.close(); reject(transaction.error ?? new Error('读取备份目录失败')); };
     });
   }
 
@@ -233,7 +238,8 @@ export default defineBackground(() => {
         return {
           success: false,
           error: getBackupDirectoryAccessError(permission)!,
-          needAuth: true
+          needAuth: true,
+          locationLabel: getCustomBackupLocationLabel(handle.name)
         };
       }
 
@@ -662,6 +668,11 @@ export default defineBackground(() => {
         (error) => sendResponse({ error: error.message }));
       return true;
     }
+    if (request.action === 'clearLocalBackupRetry') {
+      void withVaultLock(resetLocalBackupRetry).then(() => sendResponse({ success: true }),
+        error => sendResponse({ error: error instanceof Error ? error.message : '重置重试失败' }));
+      return true;
+    }
     if (request.action === 'testAutoBackup') {
       (async () => {
         sendResponse(await withVaultLock(() => handleAutoBackup(true)));
@@ -825,7 +836,7 @@ export default defineBackground(() => {
 
     if (
       namespace === 'local' &&
-      (changes.enableAutoBackup || changes.backupFrequency || changes.nextBackupTime)
+      (changes.enableAutoBackup || changes.backupFrequency || changes.nextBackupTime || changes.localBackupStatus)
     ) {
       void syncAutoBackupAlarm().catch((error) => {
         console.error('OpenPass: 同步自动备份定时器失败', error);
@@ -880,7 +891,8 @@ export default defineBackground(() => {
       nextBackupTime?: string;
       backupFrequency?: string;
       cloudBackupSettings?: { enabled?: boolean };
-    }>(['enableAutoBackup', 'nextBackupTime', 'backupFrequency', 'cloudBackupSettings']);
+      localBackupStatus?: { nextRetryAt?: string | null };
+    }>(['enableAutoBackup', 'nextBackupTime', 'backupFrequency', 'cloudBackupSettings', 'localBackupStatus']);
     await chrome.alarms.clear(AUTO_BACKUP_ALARM_NAME);
     await chrome.alarms.clear(CLOUD_BACKUP_PULL_ALARM_NAME);
     const schedule = getBackupSchedule(settings);
@@ -1290,6 +1302,20 @@ export default defineBackground(() => {
     message?: string;
     error?: string;
   }> {
+    let savedSnapshot = false;
+    let snapshotAt: string | undefined;
+    let snapshotError: string | undefined;
+    let fileEnabled = false;
+    let frequency = 'weekly';
+    const report = async (success: boolean, message: string, directory?: BackupDirectoryWriteResult) => {
+      const { notify } = await recordLocalBackupResult({
+        success, snapshot: savedSnapshot, snapshotAt, fileEnabled, fileSuccess: directory?.success,
+        needAuth: directory?.needAuth || directory?.needDownloadPermission,
+        error: success ? undefined : message, locationLabel: directory?.locationLabel
+      }, frequency);
+      if (notify) showNotification(success ? '自动备份完成' : savedSnapshot || directory?.success ? '自动备份部分完成' : '自动备份失败', message);
+      return success ? { success: true, message } : { success: false, error: message };
+    };
     try {
       if (!force) {
         const checkResult = await checkBackupNeeded();
@@ -1307,6 +1333,9 @@ export default defineBackground(() => {
         encryptedSecretsForBackup?: string;
         secrets?: StoredSecret[];
         sitesList?: SiteListItem[];
+        backupDirectory?: string;
+        backupFileDestination?: string;
+        backupDownloadDirectory?: string;
       }>([
         'enableAutoBackup',
         'backupFrequency',
@@ -1315,12 +1344,15 @@ export default defineBackground(() => {
         'encryptedSecrets',
         'encryptedSecretsForBackup',
         'secrets',
-        'sitesList'
+        'sitesList', 'backupDirectory', 'backupFileDestination', 'backupDownloadDirectory'
       ]);
 
       if (settings.enableAutoBackup !== true) {
         return { success: false, error: '自动备份未启用' };
       }
+      frequency = settings.backupFrequency ?? 'weekly';
+      fileEnabled = settings.enableDirectoryBackup === true;
+      if (settings.enableLocalSnapshot === false && !fileEnabled) return report(false, '请至少启用一个备份目标');
 
        const sessionKey = await getValidSessionKey();
        const encryptionSettings = await getBackupEncryptionSettings();
@@ -1352,7 +1384,7 @@ export default defineBackground(() => {
         } else {
           const secrets = await resolveAutoBackupSecrets(settings, sessionKey);
           if (secrets.length === 0) {
-            return { success: false, error: '没有可备份的密钥' };
+            return report(false, '当前没有可备份的解锁数据，请先解锁 OpenPass');
           }
 
           const backupPassword = await resolveStoredBackupPassword(
@@ -1362,46 +1394,51 @@ export default defineBackground(() => {
 
           if (encryptionSettings.enableBackupEncryption && !backupPassword) {
             console.warn('[AutoBackup] 缺少备份密码，跳过');
-            showNotification('自动备份跳过', '请先解锁 OpenPass 或检查备份加密设置');
-            return { success: false, error: '请先解锁 OpenPass 或检查备份加密设置' };
+            return report(false, '请先解锁 OpenPass 或检查备份加密设置');
           }
 
           backupCount = secrets.length;
           backupData = await createBackupData(secrets, backupPassword);
         }
 
-       let savedSnapshot = false;
        let directoryResult: BackupDirectoryWriteResult | undefined;
 
        if (settings.enableLocalSnapshot !== false) {
-         await saveBackupSnapshot(backupData);
+         try {
+         const previous = await chrome.storage.local.get<{
+           localBackupStatus?: { state?: string };
+           backupSnapshots?: Array<{ data: BackupData<StoredSecret>; timestamp: string }>;
+         }>(['localBackupStatus', 'backupSnapshots']);
+         const latest = previous.backupSnapshots?.[0];
+         const retrying = previous.localBackupStatus?.state === 'partial' || previous.localBackupStatus?.state === 'error';
+         if (retrying && latest?.data.encrypted && backupData.encrypted &&
+             latest.data.encryptedData === backupData.encryptedData && JSON.stringify(latest.data.sync) === JSON.stringify(backupData.sync)) {
+           snapshotAt = latest.timestamp;
+         } else {
+           snapshotAt = (await saveBackupSnapshot(backupData))[0]?.timestamp;
+         }
          savedSnapshot = true;
+         } catch (error) {
+           snapshotError = error instanceof Error ? error.message : '保存快照失败';
+         }
        }
 
        if (settings.enableDirectoryBackup) {
-         directoryResult = await writeBackupToDirectory(backupData);
+         const destination = getBackupFileSettings(settings);
+         directoryResult = destination.backupFileDestination === 'downloads'
+           ? await writeBackupToDownloads(backupData, destination.backupDownloadDirectory)
+           : await writeBackupToDirectory(backupData);
        }
 
-       // 如果快速路径备份计数为0，仍然需要更新下一次备份时间
        const hasAnySuccess = savedSnapshot || (directoryResult?.success === true);
-       const isFastPathWithZeroCount = 
-         (isMasterPasswordFastPath || isCustomPasswordFastPath) && backupCount === 0;
-       
-       if (!hasAnySuccess && !isFastPathWithZeroCount) {
-         if (directoryResult?.error) {
-           showNotification('自动备份失败', directoryResult.error);
-         }
-         return { success: false, error: directoryResult?.error || '没有可用的备份目标' };
-       }
-
-       if (settings.enableDirectoryBackup && directoryResult?.success !== true) {
-         const error = directoryResult?.error || '未生成目录备份文件';
-         showNotification(
-           savedSnapshot ? '自动备份部分完成' : '自动备份失败',
-           savedSnapshot ? `本地快照已保存；目录备份失败：${error}` : error
-         );
-         return { success: false, error: `目录备份失败：${error}` };
-       }
+       const errors = [
+         ...(snapshotError ? [`本地快照失败：${snapshotError}`] : []),
+         ...(settings.enableDirectoryBackup && directoryResult?.success !== true
+           ? [`文件备份失败：${directoryResult?.error || '未生成备份文件'}`] : [])
+       ];
+       if (errors.length) return report(false,
+         (savedSnapshot ? '本地快照已保存；' : directoryResult?.success ? '文件已保存；' : '') + errors.join('；'), directoryResult);
+       if (!hasAnySuccess) return report(false, '没有可用的备份目标', directoryResult);
 
        const interval = getBackupInterval(settings.backupFrequency);
        const now = new Date();
@@ -1422,14 +1459,10 @@ export default defineBackground(() => {
          messages.push(`已写入 ${directoryResult.locationLabel ?? directoryResult.filename}`);
        }
 
-      if (messages.length > 0) {
-        showNotification('自动备份完成', messages.join('；'));
-      }
-      return { success: true, message: messages.join('；') || '自动备份完成' };
+      return report(true, messages.join('；') || '自动备份完成', directoryResult);
     } catch (error) {
       console.error('OpenPass: 自动备份失败', error);
-      showNotification('自动备份失败', (error as Error).message);
-      return { success: false, error: (error as Error).message };
+      return report(false, error instanceof Error ? error.message : '自动备份失败');
     }
   }
 
@@ -1439,16 +1472,19 @@ export default defineBackground(() => {
       backupFrequency?: BackupFrequency;
       lastBackupTime?: string;
       nextBackupTime?: string;
+      localBackupStatus?: { nextRetryAt?: string | null };
     }>([
       'enableAutoBackup',
       'backupFrequency',
       'lastBackupTime',
-      'nextBackupTime'
+      'nextBackupTime', 'localBackupStatus'
     ]);
 
     if (settings.enableAutoBackup !== true) {
       return { needed: false, reason: 'disabled' };
     }
+    const retryAt = Date.parse(settings.localBackupStatus?.nextRetryAt || '');
+    if (Number.isFinite(retryAt) && Date.now() < retryAt) return { needed: false, reason: 'retry_wait' };
 
     if (settings.nextBackupTime) {
       const nextBackupTime = new Date(settings.nextBackupTime).getTime();
