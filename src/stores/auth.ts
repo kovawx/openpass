@@ -1,7 +1,6 @@
 import { defineStore } from 'pinia';
 import { ref } from 'vue';
-import CryptoUtils from '@/utils/crypto';
-import { getValidSession, requireSessionKey, clearSessionStorage, SESSION_TIMEOUT } from '@/utils/session';
+import { getValidSession, clearSessionStorage, SESSION_TIMEOUT } from '@/utils/session';
 
 export interface SessionData {
   sessionKey: string | null;
@@ -102,26 +101,7 @@ export const useAuthStore = defineStore('auth', () => {
       return false;
     }
 
-    const result = await chrome.storage.local.get<{
-      masterPasswordHash?: string;
-      masterPasswordSalt?: string;
-    }>(['masterPasswordHash', 'masterPasswordSalt']);
-    if (!result.masterPasswordHash || !result.masterPasswordSalt) {
-      throw new Error('系统错误，请重新设置');
-    }
-
-    const isValid = await CryptoUtils.verifyMasterPassword(
-      password,
-      result.masterPasswordHash,
-      result.masterPasswordSalt
-    );
-
-    if (isValid) {
-      if (!result.masterPasswordHash.startsWith('pbkdf2-sha256$')) {
-        const upgraded = await CryptoUtils.createMasterPasswordHash(password);
-        await chrome.storage.local.set({ masterPasswordHash: upgraded.hash, masterPasswordSalt: upgraded.salt });
-      }
-      await createSession(password);
+    if (await unlockSession(password)) {
       await clearAuthLock();
       return true;
     }
@@ -140,22 +120,16 @@ export const useAuthStore = defineStore('auth', () => {
     return false;
   }
 
-  async function createSession(password: string) {
-    const migration = await chrome.runtime.sendMessage({ action: 'migrateVaultForUnlock', password });
+  async function initializeVault(password: string) {
+    await unlockSession(password, 'initializeVault');
+  }
+
+  async function unlockSession(password: string, action = 'migrateVaultForUnlock') {
+    const migration = await chrome.runtime.sendMessage({ action, password });
+    if (migration?.incorrectPassword) return false;
     if (migration?.error || !migration?.success) throw new Error(migration?.error || '解锁迁移失败');
-    const nextExpiresAt = Date.now() + SESSION_TIMEOUT;
-
-    await chrome.storage.session.set({ sessionKey: password, sessionExpiresAt: nextExpiresAt });
-    await chrome.storage.local.set({ sessionExpiresAt: nextExpiresAt });
-    if (await requireSessionKey() !== password) throw new Error('会话已变更，请重新解锁');
-    applySession(password, nextExpiresAt);
-
-    // 通知 background 缓存 sessionKey（用于自动备份）
-    try {
-      await chrome.runtime.sendMessage({ action: 'sessionChanged' });
-    } catch (error) {
-      console.warn('Failed to cache session key in background:', error);
-    }
+    if (!await checkSession() || sessionKey.value !== password) throw new Error('会话已变更，请重新解锁');
+    return true;
   }
 
   async function clearSession() {
@@ -200,7 +174,7 @@ export const useAuthStore = defineStore('auth', () => {
     init,
     checkSession,
     login,
-    createSession,
+    initializeVault,
     clearSession,
     updateActivity,
     getRemainingAttempts,

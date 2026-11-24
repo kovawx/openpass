@@ -55,9 +55,10 @@ class TOTPUtils {
       textarea.style.position = 'fixed';
       textarea.style.opacity = '0';
       document.body.appendChild(textarea);
-      textarea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textarea);
+      try {
+        textarea.select();
+        if (!document.execCommand('copy')) throw new Error('无法复制验证码');
+      } finally { textarea.remove(); }
     }
   }
 

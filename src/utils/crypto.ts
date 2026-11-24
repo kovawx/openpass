@@ -3,6 +3,17 @@
  * 使用 Web Crypto API 实现 AES-GCM 加密
  */
 
+const VAULT_PREFIX = 'openpass-v2:';
+// Keep KDF parameters fixed per envelope version so old backups remain readable.
+export const VAULT_KDF_ITERATIONS = 300000;
+export const LEGACY_KDF_ITERATIONS = 100000;
+const vaultHeader = new TextEncoder().encode(VAULT_PREFIX);
+
+export interface VaultKey {
+  salt: string;
+  value: string;
+}
+
 class CryptoUtils {
   static toArrayBuffer(buffer: ArrayBufferLike): ArrayBuffer {
     if (buffer instanceof ArrayBuffer) {
@@ -24,7 +35,7 @@ class CryptoUtils {
    * 从密码派生密钥
    * 使用 PBKDF2 算法
    */
-  static async deriveKey(password: string, salt: Uint8Array) {
+  static async deriveKey(password: string, salt: Uint8Array, usages: KeyUsage[] = ['encrypt', 'decrypt']) {
     const encoder = new TextEncoder();
     const passwordBuffer = encoder.encode(password);
     const normalizedSalt = this.normalizeBytes(salt);
@@ -41,13 +52,13 @@ class CryptoUtils {
       {
         name: 'PBKDF2',
         salt: normalizedSalt,
-        iterations: 100000,
+        iterations: LEGACY_KDF_ITERATIONS,
         hash: 'SHA-256'
       },
       baseKey,
       { name: 'AES-GCM', length: 256 },
       false,
-      ['encrypt', 'decrypt']
+      usages
     );
   }
 
@@ -55,18 +66,17 @@ class CryptoUtils {
    * 加密数据
    */
   static async encrypt(plaintext: string, password: string): Promise<string> {
-    const encoder = new TextEncoder();
-    const data = encoder.encode(plaintext);
-
     const salt = globalThis.crypto.getRandomValues(new Uint8Array(16));
-    const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
-
     const key = await this.deriveKey(password, salt);
+    return this.seal(plaintext, key, salt, false);
+  }
 
+  static async seal(plaintext: string, key: CryptoKey, salt: Uint8Array<ArrayBuffer>, vaultFormat: boolean) {
+    const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
     const encrypted = await globalThis.crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv: iv },
+      { name: 'AES-GCM', iv, ...(vaultFormat ? { additionalData: vaultHeader } : {}) },
       key,
-      data
+      new TextEncoder().encode(plaintext)
     );
 
     const combined = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
@@ -74,29 +84,72 @@ class CryptoUtils {
     combined.set(iv, salt.length);
     combined.set(new Uint8Array(encrypted), salt.length + iv.length);
 
-    return this.arrayBufferToBase64(combined.buffer);
+    return (vaultFormat ? VAULT_PREFIX : '') + this.arrayBufferToBase64(combined.buffer);
   }
 
   /**
    * 解密数据
    */
   static async decrypt(ciphertext: string, password: string): Promise<string> {
-    const decoder = new TextDecoder();
-    const combined = new Uint8Array(this.base64ToArrayBuffer(ciphertext));
+    if (this.isVaultCiphertext(ciphertext)) return (await this.openVault(ciphertext, password)).plaintext;
+    const envelope = this.readCiphertext(ciphertext);
+    return this.open(envelope, await this.deriveKey(password, envelope.salt));
+  }
 
-    const salt = combined.slice(0, 16);
-    const iv = combined.slice(16, 28);
-    const encrypted = combined.slice(28);
+  static isVaultCiphertext(ciphertext: string) {
+    return ciphertext.startsWith(VAULT_PREFIX);
+  }
 
-    const key = await this.deriveKey(password, salt);
+  static readCiphertext(ciphertext: string) {
+    const vaultFormat = this.isVaultCiphertext(ciphertext);
+    const combined = new Uint8Array(this.base64ToArrayBuffer(vaultFormat ? ciphertext.slice(VAULT_PREFIX.length) : ciphertext));
+    if (combined.length < 44) throw new Error('密文格式无效');
+    return { salt: combined.slice(0, 16), iv: combined.slice(16, 28), encrypted: combined.slice(28), vaultFormat };
+  }
 
+  static async deriveVaultKey(password: string, salt = this.generateSalt()): Promise<VaultKey> {
+    const key = await globalThis.crypto.subtle.importKey(
+      'raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']
+    );
+    const bits = await globalThis.crypto.subtle.deriveBits({
+      name: 'PBKDF2', hash: 'SHA-256', iterations: VAULT_KDF_ITERATIONS, salt: this.base64ToArrayBuffer(salt)
+    }, key, 256);
+    return { salt, value: this.arrayBufferToBase64(bits) };
+  }
+
+  static importVaultKey(key: VaultKey, usages: KeyUsage[]) {
+    return globalThis.crypto.subtle.importKey('raw', this.base64ToArrayBuffer(key.value), 'AES-GCM', false, usages);
+  }
+
+  static async openVault(ciphertext: string, password: string) {
+    const envelope = this.readCiphertext(ciphertext);
+    if (!envelope.vaultFormat) throw new Error('密钥库密文格式无效');
+    const key = await this.deriveVaultKey(password, this.arrayBufferToBase64(envelope.salt.buffer));
+    return { key, plaintext: await this.open(envelope, await this.importVaultKey(key, ['decrypt'])) };
+  }
+
+  static async encryptVault(plaintext: string, key: VaultKey) {
+    return this.seal(plaintext, await this.importVaultKey(key, ['encrypt']), new Uint8Array(this.base64ToArrayBuffer(key.salt)), true);
+  }
+
+  static matchesVaultKey(ciphertext: string, key: VaultKey) {
+    return this.isVaultCiphertext(ciphertext) && this.arrayBufferToBase64(this.readCiphertext(ciphertext).salt.buffer) === key.salt;
+  }
+
+  static async decryptVault(ciphertext: string, key: VaultKey) {
+    const envelope = this.readCiphertext(ciphertext);
+    if (!envelope.vaultFormat || this.arrayBufferToBase64(envelope.salt.buffer) !== key.salt) throw new Error('密钥库已变更，请重新解锁');
+    return this.open(envelope, await this.importVaultKey(key, ['decrypt']));
+  }
+
+  private static async open({ iv, encrypted, vaultFormat }: ReturnType<typeof CryptoUtils.readCiphertext>, key: CryptoKey) {
     const decrypted = await globalThis.crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: iv },
+      { name: 'AES-GCM', iv, ...(vaultFormat ? { additionalData: vaultHeader } : {}) },
       key,
       encrypted
     );
 
-    return decoder.decode(decrypted);
+    return new TextDecoder().decode(decrypted);
   }
 
   /**

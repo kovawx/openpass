@@ -4,6 +4,7 @@ import { normalizeVaultSecrets, readVault, writeVault } from './vault';
 import type { VaultSecret } from './vault';
 import { mergeSyncState } from './syncMerge';
 import { removeAccountGroup } from './accountOrganization';
+import { migrationLink, migrationParts } from './fixtures/otpMigration';
 
 const transport = vi.hoisted(() => ({ download: vi.fn(), upload: vi.fn(), retention: vi.fn(), versions: vi.fn(), deleteVersions: vi.fn() }));
 vi.mock('./s3CloudBackup', () => ({
@@ -73,6 +74,95 @@ beforeEach(async () => {
   await putSecrets([secret]);
 });
 describe('background authorization and writes', () => {
+  it('upgrades a legacy vault once and uses a single password derivation for subsequent unlocks and reads', async () => {
+    local.set('deviceOtpEnabled', false);
+    local.set('masterPasswordHash', 'legacy-verifier'); local.set('masterPasswordSalt', 'legacy-salt');
+    session.clear(); local.delete('sessionExpiresAt');
+    const request = { action: 'migrateVaultForUnlock', password: 'password' };
+    expect(await message(request)).toMatchObject({ success: true });
+    const ciphertext = String(local.get('encryptedSecrets'));
+    expect(CryptoUtils.isVaultCiphertext(ciphertext)).toBe(true);
+    expect(local.get('masterPasswordHash')).toBeNull();
+    expect(local.has('vaultSessionKey')).toBe(false);
+    expect(Object.keys(session.get('vaultSessionKey') as object)).toEqual(['salt', 'value']);
+    session.clear(); local.delete('sessionExpiresAt');
+    expect(await message({ ...request, password: 'wrong' })).toMatchObject({ incorrectPassword: true });
+    expect(session.has('vaultSessionKey')).toBe(false);
+    expect(local.get('encryptedSecrets')).toBe(ciphertext);
+
+    const derivations = vi.spyOn(globalThis.crypto.subtle, 'deriveBits');
+    try {
+      expect(await message(request)).toMatchObject({ success: true });
+      expect((await message({ action: 'getSecrets' })).secrets).toMatchObject([secret]);
+      expect((await readVault())[0]).toMatchObject(secret);
+      expect(derivations).toHaveBeenCalledTimes(1);
+      expect(derivations.mock.calls[0][0]).toMatchObject({ name: 'PBKDF2', iterations: 300000 });
+      expect(local.get('encryptedSecrets')).toBe(ciphertext);
+    } finally { derivations.mockRestore(); }
+  });
+
+  it('imports a complete Google migration once and restricts it to unlocked extension pages', async () => {
+    const request = { action: 'importOtpMigration', links: migrationLink };
+    expect((await message(request, page)).error).toContain('扩展页面');
+    expect((await message({ ...request, links: migrationParts[0] })).error).toContain('还缺少 1 张');
+    const previous = await readVault();
+    const [first, second] = await Promise.all([message(request), message(request)]);
+    expect(first).toMatchObject({ success: true, imported: 2, skipped: 0 });
+    expect(second).toMatchObject({ success: true, imported: 0, skipped: 2 });
+    expect(first.secrets).toBeUndefined();
+    const records = await readVault();
+    expect(records[0]).toEqual(previous[0]);
+    expect(records.slice(1)).toMatchObject([{ type: 'totp', name: 'Google · Alice' }, { type: 'hotp', counter: 42 }]);
+    session.clear(); local.delete('sessionExpiresAt');
+    expect((await message(request)).error).toContain('锁定');
+  });
+
+  it('returns matched popup previews and redacted metadata from one daily vault read', async () => {
+    await writeVault([secret, { ...secret, id: 'other', site: 'unrelated.example.net' }], 'password');
+    session.clear(); local.delete('sessionExpiresAt');
+    const request = { action: 'getPopupAccounts', url: 'https://example.com/login' };
+    expect(await message(request, page)).toMatchObject({ error: expect.stringContaining('扩展页面') });
+    const deriveKey = vi.spyOn(globalThis.crypto.subtle, 'deriveKey');
+    try {
+      const response = await message(request);
+      expect(response).toMatchObject({ locked: true, otpAvailable: true, secrets: [{ id: 'one' }, { id: 'other' }],
+        codes: [{ id: 'one', code: expect.stringMatching(/^\d{6}$/), expiresAt: null }] });
+      expect(response.secrets?.every(account => !('secret' in account))).toBe(true);
+      expect(deriveKey).toHaveBeenCalledTimes(1);
+    } finally { deriveKey.mockRestore(); }
+  });
+
+  it('allows only a new account append while locked, returns metadata and keeps management protected', async () => {
+    await writeVault([secret], 'password');
+    const original = (await readVault())[0];
+    session.clear(); local.delete('sessionExpiresAt');
+    const added = await message({ action: 'appendAccount', account: { ...secret, id: 'one', site: 'github.com', favorite: true }, secrets: [] });
+    expect(added).toMatchObject({ success: true, secrets: [{ id: 'one' }, { site: 'github.com', favorite: false }] });
+    expect(JSON.stringify(added)).not.toContain(secret.secret);
+    expect(JSON.parse(await CryptoUtils.decrypt(String(local.get('encryptedSecrets')), 'password'))[0]).toEqual(original);
+    const before = local.get('encryptedSecrets');
+    expect((await message({ action: 'appendAccount', account: secret }, page)).error).toContain('扩展页面');
+    for (const request of [{ action: 'saveVault', secrets: [] }, { action: 'setDeviceOtpEnabled', enabled: false },
+      { action: 'changeMasterPassword' }, { action: 'setBackupPassword', password: 'backup-password' },
+      { action: 'restoreVault' }, { action: 'prepareVaultClear', scope: 'local' }]) {
+      expect((await message(request)).error).toContain('锁定');
+    }
+    expect(local.get('encryptedSecrets')).toBe(before);
+    const snapshots = local.get('backupSnapshots') as Array<{ data: { encryptedData: string } }>;
+    expect(JSON.parse(await CryptoUtils.decrypt(snapshots[0].data.encryptedData, 'password'))).toHaveLength(2);
+  });
+  it('serializes concurrent daily additions and never reports a saved account as failed when its snapshot fails', async () => {
+    await writeVault([secret], 'password'); session.clear();
+    const set = chrome.storage.local.set;
+    vi.spyOn(chrome.storage.local, 'set').mockImplementation(async updates => {
+      if ('backupSnapshots' in updates) throw new Error('fixture quota');
+      return set(updates);
+    });
+    const results = await Promise.all(['first.example', 'second.example'].map(site => message({ action: 'appendAccount', account: { ...secret, site } })));
+    expect(results.every(result => result.success)).toBe(true);
+    expect(results.every(result => 'warning' in result)).toBe(true);
+    expect(JSON.parse(await CryptoUtils.decrypt(String(local.get('encryptedSecrets')), 'password'))).toHaveLength(3);
+  });
   it('backs up encrypted records while locked and marks success only after the file completes', async () => {
     local.set('enableAutoBackup', true); local.set('enableDirectoryBackup', true);
     local.set('backupFileDestination', 'downloads');
@@ -140,16 +230,16 @@ describe('background authorization and writes', () => {
     expect(local.get('localBackupStatus')).toMatchObject({ state: 'partial', lastSnapshotAt: null, lastFileAt: expect.any(String) });
     expect(chrome.notifications.create).toHaveBeenCalledWith(expect.objectContaining({ title: '自动备份部分完成' }));
   });
-  it('opens authentication for a locked QR request without capturing the page or logging a scan failure', async () => {
+  it('scans while management is locked without navigating to authentication', async () => {
     local.set('isSetupComplete', true); session.clear(); local.delete('sessionExpiresAt');
     const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
+      vi.mocked(chrome.tabs.captureVisibleTab).mockRejectedValue(new Error('fixture capture reached'));
       expect(await message({ action: 'startQrScan' }, { ...page, tab: { id: 7, windowId: 1 } as chrome.tabs.Tab }))
-        .toMatchObject({ success: true, requiresUnlock: true });
-      expect(chrome.tabs.captureVisibleTab).not.toHaveBeenCalled();
-      expect(chrome.tabs.create).toHaveBeenCalledWith({ url: 'chrome-extension://test-extension/auth.html?redirect=options.html' });
-      expect(chrome.notifications.create).toHaveBeenCalledWith(expect.objectContaining({ title: '请先解锁 OpenPass' }));
-      expect(errorLog).not.toHaveBeenCalled();
+        .toMatchObject({ error: 'fixture capture reached' });
+      expect(chrome.tabs.captureVisibleTab).toHaveBeenCalled();
+      expect(chrome.tabs.create).not.toHaveBeenCalled();
+      expect(chrome.notifications.create).not.toHaveBeenCalledWith(expect.objectContaining({ title: '请先解锁 OpenPass' }));
     } finally { errorLog.mockRestore(); }
   });
   it('returns an actual QR capture failure to the caller instead of reporting success', async () => {
@@ -257,7 +347,7 @@ describe('background authorization and writes', () => {
     expect((await message({ action: 'saveVault', secrets: [] })).error).toContain('锁定');
     expect((await message({ action: 'restoreVault', backupData: backup([]), mode: 'replace' })).error).toContain('锁定');
     expect((await message({ action: 'setDeviceOtpEnabled', enabled: false })).error).toContain('锁定');
-    expect((await message({ action: 'generateCode', secret: secret.secret })).error).toContain('解锁');
+    expect((await message({ action: 'generateCode', secret: secret.secret })).code).toMatch(/^\d{6}$/);
     expect((await message({ action: 'consumeCode', id: 'one' }, { ...page, url: 'https://other.org/' })).error).toContain('不匹配');
     session.set('sessionKey', 'password'); local.set('sessionExpiresAt', Date.now() + 60000);
     expect((await readVault())[0].counter).toBe(2);
@@ -299,9 +389,13 @@ describe('background authorization and writes', () => {
     expect(consumed.code).toMatch(/^\d{6}$/); expect(migrated.success).toBe(true);
     session.set('sessionKey', 'password'); local.set('sessionExpiresAt', Date.now() + 60000);
     expect((await readVault())[0].counter).toBe(1);
+    expect(JSON.parse(await CryptoUtils.decrypt(String(local.get('encryptedSecrets')), 'password'))[0].counter).toBe(1);
   });
   it('serializes concurrent HOTP consumption while previews never advance counters', async () => {
     const preview = await message({ action: 'generateCode', id: 'one' }, page);
+    const request = { action: 'previewAccountCodes', ids: ['one', 'missing'] };
+    expect((await message(request, page)).error).toContain('扩展页面');
+    expect(await message(request)).toEqual({ codes: [{ id: 'one', code: preview.code, expiresAt: null }] });
     expect((await readVault())[0].counter).toBe(0);
     const [first, second] = await Promise.all([message({ action: 'consumeCode', id: 'one' }, page), message({ action: 'consumeCode', id: 'one' }, page)]);
     expect(first.code).toBe(preview.code); expect(first.code).not.toBe(second.code);
@@ -339,12 +433,24 @@ describe('background authorization and writes', () => {
     expect((await message({ action: 'changeMasterPassword', currentPassword: 'wrong', password: 'new-password' })).error).toContain('密码');
     expect(session.get('sessionKey')).toBe('password');
     expect(await message({ action: 'changeMasterPassword', currentPassword: 'password', password: 'new-password' })).toMatchObject({ success: true });
+    expect(CryptoUtils.isVaultCiphertext(String(local.get('encryptedSecrets')))).toBe(true);
     expect(await readVault()).toMatchObject([secret]);
     session.clear();
     expect((await message({ action: 'generateCode', id: 'one' }, page)).code).toMatch(/^\d{6}$/);
     expect(JSON.parse(await CryptoUtils.decrypt(String(local.get('encryptedCloudBackupSecrets')), 'new-password'))).toEqual(cloudCredentials);
     const snapshots = local.get('backupSnapshots') as Array<{ data: { encryptedData: string } }>;
     expect(JSON.parse(await CryptoUtils.decrypt(snapshots[0].data.encryptedData, 'new-password'))).toMatchObject([secret]);
+    expect((await message({ action: 'appendAccount', account: { ...secret, site: 'github.com' } })).success).toBe(true);
+    expect(JSON.parse(await CryptoUtils.decrypt(String(local.get('encryptedSecrets')), 'new-password'))).toHaveLength(2);
+    await expect(CryptoUtils.decrypt(String(local.get('encryptedSecrets')), 'password')).rejects.toThrow();
+  });
+  it('initializes independent-password backup writing under the backend lock and includes subsequent daily additions', async () => {
+    await writeVault([secret], 'password');
+    local.set('enableBackupEncryption', true); local.set('useMasterPasswordForBackup', false);
+    expect(await message({ action: 'setBackupPassword', password: 'backup-password' })).toMatchObject({ success: true });
+    session.clear();
+    expect((await message({ action: 'appendAccount', account: { ...secret, site: 'github.com' } })).success).toBe(true);
+    expect(JSON.parse(await CryptoUtils.decrypt(String(local.get('encryptedSecretsForBackup')), 'backup-password'))).toHaveLength(2);
   });
 });
 describe('conditional cloud synchronization', () => {

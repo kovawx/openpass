@@ -1,15 +1,17 @@
 import jsQR, { type QRCode } from 'jsqr';
 import { parseOtpAuth } from './otpAuth';
 
-function decodedResult(code: QRCode | null, mapPoint: (point: { x: number; y: number }) => { x: number; y: number }) {
-  const secret = code?.data ? parseOtpAuth(code.data) : null;
-  if (!code || !secret) return null;
-  return { secret, code: { ...code, location: Object.fromEntries(Object.entries(code.location)
+function decodedResult<T>(code: QRCode | null, parse: (text: string) => T | null,
+  mapPoint: (point: { x: number; y: number }) => { x: number; y: number }) {
+  if (!code?.data) return null;
+  const value = parse(code.data);
+  if (value === null) return null;
+  return { value, code: { ...code, location: Object.fromEntries(Object.entries(code.location)
     .map(([name, point]) => [name, mapPoint(point)])) as QRCode['location'] } };
 }
 
 /** 对缩放后每个模块只有 2～3 像素的平面二维码，按定位框和标准模块数重建均匀网格。 */
-function decodeSquareGrid(data: Uint8ClampedArray, width: number, height: number) {
+function decodeSquareGrid<T>(data: Uint8ClampedArray, width: number, height: number, parse: (text: string) => T | null) {
   const luminance = new Float32Array(width * height);
   let min = 255, max = 0;
   for (let i = 0; i < luminance.length; i++) {
@@ -42,7 +44,7 @@ function decodeSquareGrid(data: Uint8ClampedArray, width: number, height: number
           pixels.set([0, 0, 0, 255], (((y + 4) * 4 + dy) * size + (x + 4) * 4 + dx) * 4);
         }
       }
-      const result = decodedResult(jsQR(pixels, size, size, { inversionAttempts: 'attemptBoth' }), point => ({
+      const result = decodedResult(jsQR(pixels, size, size, { inversionAttempts: 'attemptBoth' }), parse, point => ({
         x: left + (point.x / 4 - 4) * gridWidth / modules,
         y: top + (point.y / 4 - 4) * gridHeight / modules
       }));
@@ -53,9 +55,12 @@ function decodeSquareGrid(data: Uint8ClampedArray, width: number, height: number
 }
 
 /** 小图按整数倍复制像素重试，避免插值把密集二维码的黑白模块混在一起。 */
-export function decodeOtpQrPixels(data: Uint8ClampedArray, width: number, height: number) {
-  const scales = Math.max(width, height) <= 512 ? [1, 2, 3] : [1];
+export function decodeQrPixels<T>(data: Uint8ClampedArray, width: number, height: number, parse: (text: string) => T | null,
+  deadline = Number.POSITIVE_INFINITY) {
+  const side = Math.max(width, height);
+  const scales = [1, 2, 3].filter(scale => scale === 1 || side * scale <= 720);
   for (const scale of scales) {
+    if (performance.now() >= deadline) return null;
     const pixels = scale === 1 ? data : new Uint8ClampedArray(width * height * scale * scale * 4);
     if (scale !== 1) {
       for (let y = 0; y < height * scale; y++) for (let x = 0; x < width * scale; x++) {
@@ -64,9 +69,14 @@ export function decodeOtpQrPixels(data: Uint8ClampedArray, width: number, height
         for (let channel = 0; channel < 4; channel++) pixels[to + channel] = data[from + channel];
       }
     }
-    const result = decodedResult(jsQR(pixels, width * scale, height * scale, { inversionAttempts: 'attemptBoth' }),
+    const result = decodedResult(jsQR(pixels, width * scale, height * scale, { inversionAttempts: 'attemptBoth' }), parse,
       point => ({ x: point.x / scale, y: point.y / scale }));
     if (result) return result;
   }
-  return Math.max(width, height) <= 512 ? decodeSquareGrid(data, width, height) : null;
+  return side <= 512 && performance.now() < deadline ? decodeSquareGrid(data, width, height, parse) : null;
+}
+
+export function decodeOtpQrPixels(data: Uint8ClampedArray, width: number, height: number) {
+  const decoded = decodeQrPixels(data, width, height, parseOtpAuth);
+  return decoded && { secret: decoded.value, code: decoded.code };
 }

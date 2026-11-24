@@ -1,7 +1,8 @@
 import { installGlobalRuntimeErrorListeners } from '@/utils/runtimeErrors';
 import { matchSecrets } from '@/utils/domainMatch';
 import { detectOtpInputGroups } from '@/utils/otpInputDom';
-import { readQrImageSource, readPageQrSources } from '@/utils/qrImage';
+import { readQrElementSource, readQrImageSource, readPageQrSources } from '@/utils/qrImage';
+import { withQrTimeout, type NormalizedPoint } from '@/utils/qrScan';
 
 interface ContentSecret {
   id?: string;
@@ -33,7 +34,8 @@ interface GenerateCodeResponse {
 }
 
 interface QrScanCandidate {
-  secret: ContentSecret;
+  id: string;
+  label: string;
   rect: { x: number; y: number; width: number; height: number };
 }
 
@@ -191,12 +193,14 @@ export default defineContentScript({
         button.style.top = `${candidate.rect.y * 100}%`;
         button.style.width = `${candidate.rect.width * 100}%`;
         button.style.height = `${candidate.rect.height * 100}%`;
-        button.title = candidate.secret.name || candidate.secret.site || 'OTP 账户';
+        button.title = candidate.label;
         button.addEventListener('click', () => {
           closeQrOverlay();
           void chrome.runtime.sendMessage({
             action: 'selectQrCandidate',
-            secret: candidate.secret
+            id: candidate.id
+          }).then(result => {
+            if (result?.error) showToast(result.error, 'error');
           }).catch((error) => showToast((error as Error).message, 'error'));
         });
         overlay.appendChild(button);
@@ -210,54 +214,80 @@ export default defineContentScript({
       selection.className = 'openpass-qr-selection';
       overlay.appendChild(selection);
 
-      let startX = 0;
-      let startY = 0;
-      let dragging = false;
+      let start: { x: number; y: number; pointerId: number; element: Element | null } | null = null;
 
-      const updateSelection = (x: number, y: number) => {
-        const left = Math.min(startX, x);
-        const top = Math.min(startY, y);
-        selection.style.left = `${left}px`;
-        selection.style.top = `${top}px`;
-        selection.style.width = `${Math.abs(x - startX)}px`;
-        selection.style.height = `${Math.abs(y - startY)}px`;
-      };
+      function elementAt(x: number, y: number) {
+        overlay.style.pointerEvents = 'none';
+        const hit = document.elementFromPoint(x, y);
+        overlay.style.pointerEvents = '';
+        if (!hit || hit === document.body || hit === document.documentElement) return null;
+        return hit.closest('img, canvas, svg') || hit;
+      }
+
+      function dragBounds(x: number, y: number) {
+        return start && new DOMRect(Math.min(start.x, x), Math.min(start.y, y), Math.abs(x - start.x), Math.abs(y - start.y));
+      }
+
+      function highlight(bounds?: DOMRect | null) {
+        selection.style.display = bounds?.width && bounds.height ? 'block' : 'none';
+        if (!bounds) return;
+        Object.assign(selection.style, { left: `${bounds.left}px`, top: `${bounds.top}px`, width: `${bounds.width}px`, height: `${bounds.height}px` });
+      }
+
+      async function scan(bounds: DOMRect, element: Element | null, target?: NormalizedPoint) {
+        // The picker was removed in the previous frame. Wait for that paint while reading the image.
+        const pagePaint = withQrTimeout(new Promise<void>(resolve => requestAnimationFrame(() => resolve())), 200).catch(() => {});
+        const progress = bounds.top > 72 || bounds.bottom < innerHeight - 72
+          ? showToast('正在识别二维码…', 'default', 8000) : null;
+        if (progress) {
+          progress.style.pointerEvents = 'none';
+          if (bounds.top <= 72) Object.assign(progress.style, { top: 'auto', bottom: '20px' });
+        }
+        try {
+          const source = element instanceof HTMLImageElement || element instanceof HTMLCanvasElement || element instanceof SVGSVGElement
+            ? await readQrElementSource(element) : null;
+          await pagePaint;
+          const result = await withQrTimeout(chrome.runtime.sendMessage({
+            action: 'scanQrSelection',
+            dataUrl: source?.dataUrl,
+            target,
+            rect: source?.rect ?? {
+              x: bounds.left / innerWidth, y: bounds.top / innerHeight,
+              width: bounds.width / innerWidth, height: bounds.height / innerHeight
+            }
+          }), 7000);
+          if (result?.error) showToast(result.error, 'error');
+        } finally { progress?.remove(); }
+      }
 
       overlay.addEventListener('pointerdown', (event) => {
-        if (event.button !== 0) return;
-        dragging = true;
-        startX = event.clientX;
-        startY = event.clientY;
-        selection.style.display = 'block';
-        updateSelection(startX, startY);
+        if (event.button !== 0 || start) return;
+        event.preventDefault();
+        start = { x: event.clientX, y: event.clientY, pointerId: event.pointerId, element: elementAt(event.clientX, event.clientY) };
         overlay.setPointerCapture(event.pointerId);
       });
       overlay.addEventListener('pointermove', (event) => {
-        if (dragging) updateSelection(event.clientX, event.clientY);
+        const bounds = dragBounds(event.clientX, event.clientY);
+        if (bounds && (bounds.width >= 6 || bounds.height >= 6)) highlight(bounds);
+        else highlight(elementAt(event.clientX, event.clientY)?.getBoundingClientRect());
       });
+      overlay.addEventListener('pointerleave', () => { if (!start) highlight(); });
+      overlay.addEventListener('pointercancel', () => { start = null; highlight(); });
       overlay.addEventListener('pointerup', (event) => {
-        if (!dragging) return;
-        dragging = false;
-        const left = Math.min(startX, event.clientX);
-        const top = Math.min(startY, event.clientY);
-        const width = Math.abs(event.clientX - startX);
-        const height = Math.abs(event.clientY - startY);
-        if (width < 24 || height < 24) {
-          selection.style.display = 'none';
-          return;
-        }
-
-        closeQrOverlay();
-        void chrome.runtime.sendMessage({
-          action: 'scanQrSelection',
-          rect: {
-            x: left / window.innerWidth,
-            y: top / window.innerHeight,
-            width: width / window.innerWidth,
-            height: height / window.innerHeight
-          }
-        }).catch((error) => showToast((error as Error).message, 'error'));
+        if (start?.pointerId !== event.pointerId) return;
+        const dragged = dragBounds(event.clientX, event.clientY)!;
+        const element = dragged.width < 6 && dragged.height < 6 ? start.element : null;
+        const bounds = element?.getBoundingClientRect() ?? dragged;
+        start = null;
+        if (bounds.width < (element ? 1 : 24) || bounds.height < (element ? 1 : 24)) { highlight(); return; }
+        const target = element ? { x: (event.clientX - bounds.left) / bounds.width, y: (event.clientY - bounds.top) / bounds.height } : undefined;
+        requestAnimationFrame(() => {
+          if (qrOverlay !== overlay) return;
+          closeQrOverlay();
+          void scan(bounds, element, target).catch((error) => showToast((error as Error).message, 'error'));
+        });
       });
+      overlay.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); });
     }
 
     function positionGroupButton(group: OtpGroup, button: HTMLDivElement) {
@@ -612,13 +642,14 @@ export default defineContentScript({
       groupButtons.delete(anchor);
     }
 
-    function showToast(message: string, type = 'default') {
+    function showToast(message: string, type = 'default', duration = 2000) {
       const oldToast = document.querySelector('.openpass-toast');
       oldToast?.remove();
 
       const toast = document.createElement('div');
       toast.className = `openpass-toast openpass-toast-${type}`;
       toast.textContent = message;
+      toast.setAttribute('role', 'status');
       document.body.appendChild(toast);
 
       requestAnimationFrame(() => {
@@ -628,7 +659,8 @@ export default defineContentScript({
       window.setTimeout(() => {
         toast.classList.remove('openpass-toast-show');
         window.setTimeout(() => toast.remove(), 300);
-      }, 2000);
+      }, duration);
+      return toast;
     }
 
     function init() {
@@ -648,7 +680,11 @@ export default defineContentScript({
         } else if (request.action === 'showQrCandidates' && Array.isArray(request.candidates)) {
           showQrCandidates(request.candidates as QrScanCandidate[]);
         } else if (request.action === 'startQrSelection') {
-          startQrSelection(String(request.message || '请框选二维码区域'));
+          startQrSelection(String(request.message || '将鼠标移到二维码上并点击，也可拖动框选'));
+          sendResponse({ success: true });
+        } else if (request.action === 'showQrDraftReady' && sender.id === chrome.runtime.id) {
+          showToast(String(request.message), 'success');
+          sendResponse({ success: true });
         }
       });
 
@@ -680,7 +716,7 @@ const CONTENT_STYLES = String.raw`
   cursor: default;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
-.openpass-qr-overlay.openpass-qr-selecting { cursor: crosshair; }
+.openpass-qr-overlay.openpass-qr-selecting { background: transparent; cursor: crosshair; touch-action: none; }
 .openpass-qr-hint {
   position: fixed;
   top: 20px;
@@ -718,7 +754,8 @@ const CONTENT_STYLES = String.raw`
   position: fixed;
   border: 2px solid #818cf8;
   background: rgba(255, 255, 255, 0.12);
-  box-shadow: 0 0 0 9999px rgba(15, 23, 42, 0.42);
+  box-sizing: border-box;
+  box-shadow: 0 0 0 9999px rgba(15, 23, 42, 0.24);
   pointer-events: none;
 }
 

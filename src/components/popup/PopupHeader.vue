@@ -24,15 +24,16 @@ onUnmounted(() => document.removeEventListener('click', handleGlobalClick));
 </script>
 
 <template>
-  <header class="flex items-center justify-between px-4 py-3 bg-white border-b border-gray-100 sticky top-0 z-10">
+  <header class="flex items-center justify-between px-4 py-3 bg-white border-b border-gray-100 shrink-0 relative z-10">
     <h1 class="text-base font-semibold text-gray-900">OpenPass</h1>
 
     <div class="flex gap-1">
-      <!-- 扫描当前页面 -->
+      <!-- 点选二维码 -->
       <button
         type="button"
-        class="flex items-center justify-center w-9 h-9 rounded-lg text-gray-500 hover:bg-gray-100 hover:text-primary-600 transition-colors"
-        title="扫描当前页面二维码"
+        class="flex items-center justify-center gap-1 px-2 h-9 rounded-lg text-gray-500 hover:bg-gray-100 hover:text-primary-600 transition-colors"
+        title="点选网页二维码"
+        aria-label="点选二维码"
         @click="emit('scan')"
       >
         <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -45,13 +46,15 @@ onUnmounted(() => document.removeEventListener('click', handleGlobalClick));
           <rect x="7" y="14" width="3" height="3" />
           <path d="M14 14h3v3h-3z" />
         </svg>
+        <span class="text-sm font-medium">点选二维码</span>
       </button>
 
       <!-- 添加 -->
       <button
         type="button"
-        class="flex items-center justify-center w-9 h-9 rounded-lg text-gray-500 hover:bg-gray-100 hover:text-primary-600 transition-colors"
+        class="flex items-center justify-center gap-1 px-2 h-9 rounded-lg text-primary-600 hover:bg-primary-50 transition-colors"
         title="添加密钥"
+        aria-label="新增账户"
         @click="emit('add')"
       >
         <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -59,6 +62,7 @@ onUnmounted(() => document.removeEventListener('click', handleGlobalClick));
           <line x1="12" y1="8" x2="12" y2="16" />
           <line x1="8" y1="12" x2="16" y2="12" />
         </svg>
+        <span class="text-sm font-medium">新增</span>
       </button>
 
       <!-- 更多操作 -->
@@ -67,6 +71,9 @@ onUnmounted(() => document.removeEventListener('click', handleGlobalClick));
           type="button"
           class="flex items-center justify-center w-9 h-9 rounded-lg text-gray-500 hover:bg-gray-100 hover:text-primary-600 transition-colors"
           title="更多操作"
+          aria-label="更多操作"
+          :aria-expanded="showMenu"
+          @keydown.esc="showMenu = false"
           @click="showMenu = !showMenu"
         >
           <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -98,13 +105,14 @@ onUnmounted(() => document.removeEventListener('click', handleGlobalClick));
           <button
             type="button"
             class="flex items-center gap-2.5 w-full px-3.5 py-2.5 text-[13px] text-gray-700 hover:bg-gray-50 transition-colors"
+            aria-label="打开管理页面"
             @click="showMenu = false; emit('manage')"
           >
             <svg class="w-4 h-4 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
               <line x1="9" y1="3" x2="9" y2="21" />
             </svg>
-            <span>打开管理页面</span>
+            <span class="text-left">打开管理页面<small class="block text-[11px] text-gray-400 mt-0.5">账户管理、备份与配置</small></span>
           </button>
         </div>
       </div>

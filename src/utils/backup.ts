@@ -1,5 +1,5 @@
-import CryptoUtils from './crypto';
-import { requireSessionKey } from './session';
+import CryptoUtils, { LEGACY_KDF_ITERATIONS, VAULT_KDF_ITERATIONS } from './crypto';
+import { decryptSessionData, encryptSessionData, requireSessionKey } from './session';
 import { getBackupSyncMetadata, type BackupSyncMetadata } from './syncMerge';
 
 export interface BackupSecretLike {
@@ -384,21 +384,23 @@ export async function createBackupData<T>(
   };
 
   if (password) {
-    backupData.encryptionVersion = 1;
-    backupData.kdf = 'PBKDF2';
-    backupData.kdfIterations = 100000;
-    backupData.encryptedData = await CryptoUtils.encrypt(JSON.stringify(secrets), password);
+    Object.assign(backupData, encryptedBackupFields(await encryptSessionData(JSON.stringify(secrets), password)));
   }
 
   return backupData;
+}
+
+export function encryptedBackupFields(encryptedData: string) {
+  const vaultFormat = CryptoUtils.isVaultCiphertext(encryptedData);
+  return { encrypted: true, encryptedData, encryptionVersion: vaultFormat ? 2 : 1,
+    kdf: 'PBKDF2', kdfIterations: vaultFormat ? VAULT_KDF_ITERATIONS : LEGACY_KDF_ITERATIONS };
 }
 
 export async function saveBackupSnapshot<T>(backupData: BackupData<T>) {
   if (!backupData.encrypted) {
     const key = await requireSessionKey();
     const { secrets, ...metadata } = backupData;
-    backupData = { ...metadata, encrypted: true, encryptionVersion: 1, kdf: 'PBKDF2',
-      kdfIterations: 100000, encryptedData: await CryptoUtils.encrypt(JSON.stringify(secrets ?? []), key) };
+    backupData = { ...metadata, ...encryptedBackupFields(await encryptSessionData(JSON.stringify(secrets ?? []), key)) };
   }
   const result = await chrome.storage.local.get<{
     backupSnapshots?: Array<{ data: BackupData<T>; timestamp: string; count: number }>;
@@ -488,7 +490,7 @@ export async function decryptBackupData<T extends BackupSecretLike>(
 
   let decrypted: string;
   try {
-    decrypted = await CryptoUtils.decrypt(backupData.encryptedData, password);
+    decrypted = await decryptSessionData(backupData.encryptedData, password);
   } catch {
     throw new Error('备份密码不正确，请重新输入');
   }
@@ -544,5 +546,5 @@ export async function resolveStoredBackupPassword(
     return undefined;
   }
 
-  return CryptoUtils.decrypt(settings.encryptedBackupPassword, sessionKey);
+  return decryptSessionData(settings.encryptedBackupPassword, sessionKey);
 }

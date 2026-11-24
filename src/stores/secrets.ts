@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { useAuthStore } from './auth';
 import { readVault, type VaultSecret } from '@/utils/vault';
 import { requireSessionKey } from '@/utils/session';
@@ -23,20 +23,26 @@ export const useSecretStore = defineStore('secrets', () => {
   const searchQuery = ref('');
   const selectedGroup = ref<string | null>(null);
   const favoritesOnly = ref(false);
+  let loadRevision = 0;
 
   const authStore = useAuthStore();
   watch(() => authStore.sessionKey, (key) => { if (!key) secrets.value = []; });
 
-  async function loadSecrets() {
+  async function loadSecrets(sessionKey?: string) {
+    const revision = ++loadRevision;
     loading.value = true;
     try {
-      secrets.value = await authStore.checkSession() ? await readVault() : [];
-      savedState = JSON.stringify(secrets.value);
+      const key = sessionKey ?? (await authStore.checkSession() ? authStore.sessionKey : null);
+      const records = key ? await readVault(key) : [];
+      if (revision !== loadRevision) return;
+      secrets.value = records;
+      savedState = JSON.stringify(records);
     } catch (error) {
+      if (revision !== loadRevision) return;
       secrets.value = [];
       showToast((error as Error).message || '加载密钥失败', 'error');
     } finally {
-      loading.value = false;
+      if (revision === loadRevision) loading.value = false;
     }
   }
 
@@ -93,11 +99,9 @@ export const useSecretStore = defineStore('secrets', () => {
     showToast('密钥已删除', 'success');
   }
 
-  function getFilteredSecrets() {
-    return filterAccounts(secrets.value, {
-      query: searchQuery.value, group: selectedGroup.value, favoritesOnly: favoritesOnly.value
-    }, true);
-  }
+  const filteredSecrets = computed(() => filterAccounts(secrets.value, {
+    query: searchQuery.value, group: selectedGroup.value, favoritesOnly: favoritesOnly.value
+  }, true));
 
   async function toggleFavorite(secret: Secret) {
     await updateSecret(secret.id, { favorite: secret.favorite !== true }, secret);
@@ -211,7 +215,7 @@ export const useSecretStore = defineStore('secrets', () => {
     deleteSecret,
     toggleFavorite,
     deleteGroup,
-    getFilteredSecrets,
+    filteredSecrets,
     searchSecrets,
     getSecretById,
     exportSecrets,

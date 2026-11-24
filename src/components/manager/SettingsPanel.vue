@@ -5,7 +5,6 @@ import { useAuthStore } from '@/stores/auth';
 import { useAutoBackup, type DirectoryInfo } from '@/composables/useAutoBackup';
 import { getErrorMessage } from '@/utils/error';
 import { showToast } from '@/utils/ui';
-import CryptoUtils from '@/utils/crypto';
 import { restoreBackupInManager } from '@/utils/restoreClient';
 import type { RestoreMode } from '@/utils/restore';
 import {
@@ -182,7 +181,7 @@ async function saveDeviceOtpSettings() {
   try {
     const result = await chrome.runtime.sendMessage({ action: 'setDeviceOtpEnabled', enabled: deviceOtpEnabled.value });
     if (result?.error || !result?.success) throw new Error(result?.error || '免密设置保存失败');
-    showToast(deviceOtpEnabled.value ? '日常验证码已开启免密' : '日常验证码已改为解锁后使用', 'success');
+    showToast(deviceOtpEnabled.value ? '日常取码和新增账户已开启免密' : '日常使用已改为解锁后操作', 'success');
   } catch (error) {
     deviceOtpEnabled.value = !deviceOtpEnabled.value;
     showToast(getErrorMessage(error), 'error');
@@ -381,26 +380,8 @@ async function saveBackupPassword() {
       return;
     }
 
-    const { hash, salt } = await CryptoUtils.createMasterPasswordHash(backupPassword.value);
-    const encryptedBackupPassword = await CryptoUtils.encrypt(
-      backupPassword.value,
-      authStore.sessionKey
-    );
-
-    const storageData: Record<string, string> = {
-      backupPasswordHash: hash,
-      backupPasswordSalt: salt,
-      encryptedBackupPassword
-    };
-
-    if (secretStore.secrets.length > 0) {
-      storageData.encryptedSecretsForBackup = await CryptoUtils.encrypt(
-        JSON.stringify(secretStore.secrets),
-        backupPassword.value
-      );
-    }
-
-    await chrome.storage.local.set(storageData);
+    const result = await chrome.runtime.sendMessage({ action: 'setBackupPassword', password: backupPassword.value });
+    if (result?.error || !result?.success) throw new Error(result?.error || '保存失败');
 
     backupPasswordError.value = '';
     backupPassword.value = '';
@@ -770,7 +751,7 @@ async function changePassword() {
     const result = await chrome.runtime.sendMessage({ action: 'changeMasterPassword',
       currentPassword: currentPassword.value, password: newPassword.value });
     if (result?.error || !result?.success) throw new Error(result?.error || '修改密码失败');
-    await authStore.createSession(newPassword.value);
+    if (!await authStore.checkSession() || authStore.sessionKey !== newPassword.value) throw new Error('会话已变更，请重新解锁');
     showPasswordModal.value = false;
     showToast('主密码已更新', 'success');
   } catch (error) {
@@ -855,7 +836,7 @@ async function resetAllData() {
       <!-- 主密码设置 -->
       <section class="settings-section security-section" aria-labelledby="security-heading">
         <h3 id="security-heading">主密码与免密</h3>
-        <p class="settings-desc">管理操作需要解锁，日常验证码可直接使用。</p>
+        <p class="settings-desc">备份、配置和管理页面需要解锁；日常验证码、扫码及新增账户可免密使用。</p>
         <div class="security-items">
           <div class="settings-item password-row">
             <div class="settings-item-info">
@@ -872,13 +853,13 @@ async function resetAllData() {
           </div>
           <div class="settings-item">
             <div class="settings-item-info">
-              <span class="settings-item-label">日常验证码免密</span>
-              <span class="settings-item-desc">匹配、查看、复制和填充无需主密码，重启浏览器后仍可使用。</span>
+              <span class="settings-item-label">日常使用免密</span>
+              <span class="settings-item-desc">查看、复制、填充验证码及新增账户无需主密码；备份、配置、编辑和删除仍需解锁。</span>
             </div>
             <div class="security-toggle-control">
               <span class="security-toggle-status" role="status">{{ savingDeviceOtp ? '保存中…' : deviceOtpEnabled ? '已开启' : '已关闭' }}</span>
               <label class="toggle">
-                <input v-model="deviceOtpEnabled" type="checkbox" role="switch" aria-label="日常验证码免密" :aria-checked="deviceOtpEnabled" :disabled="!isInitialized || savingDeviceOtp" @change="saveDeviceOtpSettings">
+                <input v-model="deviceOtpEnabled" type="checkbox" role="switch" aria-label="日常使用免密" :aria-checked="deviceOtpEnabled" :disabled="!isInitialized || savingDeviceOtp" @change="saveDeviceOtpSettings">
                 <span class="toggle-slider"></span>
               </label>
             </div>

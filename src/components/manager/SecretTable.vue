@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
+import { ref, shallowRef, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useSecretStore, type Secret } from '@/stores/secrets';
+import { useAuthStore } from '@/stores/auth';
 import { TOTP } from '@/utils/totp';
+import { generateOtp } from '@/utils/otp';
 import { showToast } from '@/utils/ui';
 import { getAccountGroups } from '@/utils/accountOrganization';
 import AccountFilters from '@/components/AccountFilters.vue';
@@ -13,17 +15,19 @@ interface Props {
 
 interface Emits {
   (e: 'add'): void;
+  (e: 'import'): void;
   (e: 'edit', secret: Secret): void;
   (e: 'delete', secret: Secret): void;
 }
 
 const secretStore = useSecretStore();
+const authStore = useAuthStore();
 withDefaults(defineProps<Props>(), {
   selectedIndex: -1
 });
 const emit = defineEmits<Emits>();
 const groups = computed(() => getAccountGroups(secretStore.secrets));
-const filteredSecrets = computed(() => secretStore.getFilteredSecrets());
+const filteredSecrets = computed(() => secretStore.filteredSecrets);
 const organizing = ref(false);
 
 async function toggleFavorite(secret: Secret) {
@@ -42,81 +46,53 @@ async function deleteGroup(group: string) {
   finally { organizing.value = false; }
 }
 
-const codeData = ref<Record<string, { code: string; remaining: number }>>({});
-let timerInterval: number | null = null;
-let initialized = false;
+interface CodePreview {
+  account: Secret;
+  step: number;
+  code: string;
+  remaining: number;
+}
 
+const codeData = shallowRef<Record<string, CodePreview>>(Object.create(null));
+let refreshTimer: number | undefined;
+
+function refreshCodes() {
+  window.clearTimeout(refreshTimer);
+  const next: Record<string, CodePreview> = Object.create(null);
+  const now = Date.now();
+  if (document.visibilityState === 'visible' && (authStore.expiresAt ?? 0) > now && filteredSecrets.value.length) {
+    const seconds = Math.floor(now / 1000);
+    let hasTotp = false;
+    for (const account of filteredSecrets.value) {
+      const isHotp = account.type === 'hotp';
+      const period = account.period ?? 30;
+      const step = isHotp ? account.counter ?? 0 : Math.floor(seconds / period);
+      const remaining = isHotp ? 0 : period - seconds % period;
+      const previous = codeData.value[account.id];
+      hasTotp ||= !isHotp;
+      if (previous?.account === account && previous.step === step) {
+        next[account.id] = previous.remaining === remaining ? previous : { ...previous, remaining };
+      } else {
+        let code = '';
+        try { code = TOTP.formatCode(generateOtp(account.secret, account, now).code); }
+        catch { /* A bad record must not prevent the other previews from loading. */ }
+        next[account.id] = { account, step, code, remaining };
+      }
+    }
+    if (hasTotp) refreshTimer = window.setTimeout(refreshCodes, Math.max(1, (seconds + 1) * 1000 - Date.now()));
+  }
+  codeData.value = next;
+}
+
+watch([filteredSecrets, () => authStore.expiresAt], refreshCodes);
 onMounted(() => {
-  // 如果 secrets 已经加载完成，立即生成验证码
-  if (!secretStore.loading && secretStore.secrets.length > 0) {
-    initializeCodes();
-  }
-  startTimer();
+  refreshCodes();
+  document.addEventListener('visibilitychange', refreshCodes);
 });
-
 onUnmounted(() => {
-  stopTimer();
+  window.clearTimeout(refreshTimer);
+  document.removeEventListener('visibilitychange', refreshCodes);
 });
-
-// 监听 loading 状态，当加载完成时初始化验证码
-watch(
-  () => secretStore.loading,
-  async (loading) => {
-    if (!loading && !initialized && secretStore.secrets.length > 0) {
-      await initializeCodes();
-      initialized = true;
-    }
-  }
-);
-
-watch(
-  () => JSON.stringify(secretStore.secrets),
-  async () => { codeData.value = {}; await initializeCodes(); }
-);
-
-async function initializeCodes() {
-  for (const secret of secretStore.secrets) {
-    await generateCodeForSecret(secret);
-  }
-  initialized = true;
-}
-
-async function generateCodeForSecret(secret: Secret) {
-  try {
-    const result = await TOTP.generateCode(secret);
-    codeData.value[secret.id] = {
-      code: TOTP.formatCode(result.code),
-      remaining: result.remainingSeconds
-    };
-  } catch (e) {
-    delete codeData.value[secret.id];
-    console.error('生成验证码失败:', secret.site, e);
-  }
-}
-
-function startTimer() {
-  timerInterval = window.setInterval(updateAllCodes, 1000);
-}
-
-function stopTimer() {
-  if (timerInterval) {
-    clearInterval(timerInterval);
-    timerInterval = null;
-  }
-}
-
-async function updateAllCodes() {
-  for (const secret of secretStore.secrets) {
-    const existing = codeData.value[secret.id];
-    if (secret.type === 'hotp' && existing) continue;
-    if (existing && existing.remaining > 1) {
-      existing.remaining--;
-      continue;
-    }
-
-    await generateCodeForSecret(secret);
-  }
-}
 
 async function copyCode(secret: Secret) {
   try {
@@ -146,13 +122,18 @@ function openSite(site: string) {
     <!-- Header -->
     <div class="flex items-center justify-between mb-6">
       <h2 class="text-2xl font-bold text-gray-900">密钥管理</h2>
-      <button class="btn-primary" @click="emit('add')">
-        <svg class="w-4 h-4 mr-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="12" y1="5" x2="12" y2="19" />
-          <line x1="5" y1="12" x2="19" y2="12" />
-        </svg>
-        添加密钥
-      </button>
+      <div class="flex flex-wrap justify-end gap-2">
+        <button class="btn-secondary" :disabled="secretStore.loading" @click="emit('import')">
+          导入验证器
+        </button>
+        <button class="btn-primary" :disabled="secretStore.loading" @click="emit('add')">
+          <svg class="w-4 h-4 mr-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+          添加密钥
+        </button>
+      </div>
     </div>
 
     <!-- Search -->
@@ -198,8 +179,8 @@ function openSite(site: string) {
                 <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
                 <path d="M7 11V7a5 5 0 0 1 10 0v4" />
               </svg>
-              <p>{{ secretStore.secrets.length ? '未找到匹配结果' : '暂无密钥' }}</p>
-              <button v-if="!secretStore.secrets.length" class="mt-3 text-primary-600 hover:text-primary-700 text-sm font-medium" @click="emit('add')">
+              <p>{{ secretStore.loading ? '正在加载密钥…' : secretStore.secrets.length ? '未找到匹配结果' : '暂无密钥' }}</p>
+              <button v-if="!secretStore.loading && !secretStore.secrets.length" class="mt-3 text-primary-600 hover:text-primary-700 text-sm font-medium" @click="emit('add')">
                 添加第一个密钥 →
               </button>
             </td>
@@ -231,7 +212,7 @@ function openSite(site: string) {
               >{{ secret.site }}</div>
             </td>
             <td class="px-6 py-4">
-              <div v-if="codeData[secret.id]" class="flex items-center space-x-2">
+              <div v-if="codeData[secret.id]?.code" class="flex items-center space-x-2">
                 <span
                   class="text-lg font-mono font-semibold cursor-pointer hover:text-primary-600 transition-colors"
                   title="点击复制验证码"
@@ -246,7 +227,7 @@ function openSite(site: string) {
                   {{ secret.type === 'hotp' ? `HOTP · ${secret.counter ?? 0}` : `${codeData[secret.id].remaining}s` }}
                 </span>
               </div>
-              <div v-else class="text-sm text-gray-400">生成中...</div>
+              <div v-else class="text-sm text-gray-400">{{ codeData[secret.id] ? '不可用' : '—' }}</div>
             </td>
             <td class="px-6 py-4 text-right">
               <div class="flex items-center justify-end space-x-2">

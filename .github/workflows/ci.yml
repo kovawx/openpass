@@ -37,3 +37,6 @@ jobs:
 
       - name: Verify backup settings and permission recovery
         run: pnpm test:cloud-settings
+
+      - name: Verify password-free scan and account creation
+        run: pnpm test:daily-add

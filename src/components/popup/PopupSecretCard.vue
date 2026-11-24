@@ -54,7 +54,7 @@ const isDanger = computed(() => props.secret.type !== 'hotp' && props.remaining 
       </div>
 
       <FavoriteButton :favorite="secret.favorite" :disabled="organizing" @toggle="emit('favorite', secret)" />
-      <div class="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+      <div class="flex gap-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
         <button
           type="button"
           class="flex items-center justify-center w-7 h-7 rounded-md text-gray-400 hover:bg-gray-100 hover:text-gray-700 transition-colors"
@@ -83,9 +83,15 @@ const isDanger = computed(() => props.secret.type !== 'hotp' && props.remaining 
 
     <!-- 验证码 + 倒计时 -->
     <div class="flex items-center justify-between">
-      <span class="text-[26px] font-bold tracking-wide font-mono text-primary-600 select-none">
+      <button
+        type="button"
+        class="text-[26px] font-bold tracking-wide font-mono text-primary-600 select-none rounded focus-visible:outline-primary-600"
+        :aria-label="`复制 ${secret.name || secret.site} 的验证码`"
+        title="复制验证码"
+        @click.stop="emit('copy', secret)"
+      >
         {{ code }}
-      </span>
+      </button>
       <span
         class="relative overflow-hidden min-w-[36px] text-xs font-semibold px-2.5 py-1 rounded-xl flex items-center gap-1"
         :class="isDanger
