@@ -39,7 +39,7 @@ const server = createServer(async (req, res) => {
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 let browser, page;
 try {
-  browser = await puppeteer.launch({ headless: true,
+  browser = await puppeteer.launch({ headless: true, pipe: true,
     executablePath: process.env.OPENPASS_CHROME_PATH || (process.platform === 'darwin'
       ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : '/usr/bin/google-chrome') });
   page = await browser.newPage();
@@ -48,10 +48,11 @@ try {
   page.on('dialog', dialog => dialog.accept());
   await page.evaluateOnNewDocument((initial, original, password, defaults) => {
     const normalized = entry => ({ ...entry, ...defaults, ...entry, group: typeof entry.group === 'string' ? entry.group.trim() : '', favorite: entry.favorite === true });
+    const redact = account => { const metadata = { ...account }; delete metadata.secret; return metadata; };
     const persisted = localStorage.getItem('organization-fixture');
     const values = persisted ? JSON.parse(persisted) : initial;
     const saved = localStorage.getItem('organization-accounts');
-    const control = { accounts: (saved ? JSON.parse(saved) : original).map(normalized), saves: [], copies: 0, failSave: false, migrationError: '', opened: [] };
+    const control = { accounts: (saved ? JSON.parse(saved) : original).map(normalized), saves: [], copies: 0, failSave: false, migrationError: '', opened: [], previews: [] };
     window.openpassFixture = control;
     const previousSession = sessionStorage.getItem('organization-session');
     const session = location.search.includes('locked') ? {} : previousSession ? JSON.parse(previousSession) : { sessionKey: password };
@@ -89,8 +90,12 @@ try {
       runtime: { id: 'fixture-extension', getURL: path => location.origin + '/' + path,
         getManifest: () => ({ version: '0.3.0' }), onMessage: { addListener() {}, removeListener() {} },
         sendMessage: async request => {
-          if (request.action === 'migrateVaultForUnlock') return control.migrationError
-            ? { error: control.migrationError } : { success: true };
+          if (request.action === 'migrateVaultForUnlock') {
+            if (request.password !== password) return { incorrectPassword: true, error: '主密码错误' };
+            if (control.migrationError) return { error: control.migrationError };
+            await area(session, 'session').set({ sessionKey: password, sessionExpiresAt: Date.now() + 900000 });
+            return { success: true };
+          }
           if (request.action === 'saveVault') {
             if (control.failSave) return { error: 'fixture concurrent update' };
             if (request.expectedSecrets !== JSON.stringify(control.accounts)) return { error: 'fixture stale write' };
@@ -98,17 +103,28 @@ try {
             control.saves.push(request);
             localStorage.setItem('organization-accounts', JSON.stringify(control.accounts));
             await local.set({ encryptedSecrets: await encrypt(control.accounts) });
-            return { success: true, secrets: control.accounts };
+            return { success: true, secrets: structuredClone(control.accounts) };
           }
           if (request.action === 'getSecrets') return { locked: !session.sessionKey, otpAvailable: true,
-            secrets: control.accounts.map(account => { const metadata = { ...account }; delete metadata.secret; return metadata; }) };
+            secrets: control.accounts.map(redact) };
+          if (request.action === 'getPopupAccounts') {
+            const locked = !session.sessionKey;
+            const accounts = locked ? control.accounts.map(redact) : structuredClone(control.accounts);
+            const codes = accounts.filter(account => request.url.includes(account.site) && account.site === 'github.com')
+              .map(({ id }) => ({ id, code: '123456', expiresAt: Date.now() + 25000 }));
+            return { locked, otpAvailable: true, secrets: accounts, codes };
+          }
           if (request.action === 'generateCode' || request.action === 'consumeCode') return { code: '123456', remainingSeconds: 25 };
+          if (request.action === 'previewAccountCodes') {
+            control.previews.push(request.ids);
+            return { codes: request.ids.map(id => ({ id, code: '123456', expiresAt: Date.now() + 25000 })) };
+          }
           return { success: true };
         } },
       storage: { local, session: area(session, 'session'), onChanged: {
         addListener: listener => listeners.add(listener), removeListener: listener => listeners.delete(listener)
       } },
-      tabs: { query: async () => [{ url: 'https://github.com/login' }], create: async options => { control.opened.push(options.url); } },
+      tabs: { query: async () => [{ url: location.search.includes('unmatched') ? 'https://unmatched.example.net' : 'https://github.com/login' }], create: async options => { control.opened.push(options.url); } },
       permissions: { request: async () => true, contains: async () => true }
     } });
   }, fixture, accounts, password, defaults);
@@ -138,8 +154,8 @@ try {
   await waitIdle();
   assert.equal(await page.evaluate(() => window.openpassFixture.copies), 0);
   await page.click('input[type="checkbox"]');
+  await page.waitForFunction(() => document.querySelector('tbody')?.textContent.includes('未找到匹配结果'));
   await assertRows([]);
-  assert.match(await page.$eval('tbody', el => el.textContent), /未找到匹配结果/);
   await page.click('input[type="checkbox"]');
   await page.click('tbody button[title="编辑"]');
   await page.waitForSelector('input[list]');
@@ -164,9 +180,36 @@ try {
   await page.setViewport({ width: 420, height: 760 });
   await page.goto(origin + '/popup.html');
   await page.waitForSelector('button[aria-label="收藏"]');
+  assert.deepEqual(await page.$$eval('section[aria-label="当前站点"] [title="复制验证码"]', buttons => buttons.map(button => button.getAttribute('aria-label'))), ['复制 工作账户 的验证码']);
+  assert.equal(await page.$$eval('main [title="复制验证码"]', buttons => buttons.length), 1);
+  assert.equal(await page.$eval('main [title="复制验证码"]', button => button.textContent.trim()), '123 456');
+  assert.deepEqual(await page.evaluate(() => window.openpassFixture.previews), []);
+  await page.screenshot({ path: join(screenshots, 'popup-list.png') });
+  await page.type('input[aria-label="搜索账户"]', 'does-not-exist');
+  await page.waitForFunction(() => document.body.innerText.includes('未找到匹配结果'));
+  await clickText('清除筛选');
+  await page.waitForSelector('section[aria-label="当前站点"]');
+  await page.type('input[aria-label="搜索账户"]', '个人');
+  await page.waitForSelector('section[aria-label="搜索结果"] button[aria-label="复制 个人账户 的验证码"]');
+  await page.focus('button[aria-label="复制 个人账户 的验证码"]');
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => window.openpassFixture.copies === 1);
+  await clickText('全部账户');
+  await page.waitForFunction(() => document.querySelectorAll('main [title="复制验证码"]').length === 3);
+  await clickText('当前站点');
+  await page.waitForFunction(() => document.querySelectorAll('main [title="复制验证码"]').length === 1);
+  await page.goto(origin + '/popup.html?unmatched');
+  await page.waitForFunction(() => document.body.innerText.includes('当前站点没有匹配的账户'));
+  assert.equal(await page.$$eval('main [title="复制验证码"]', buttons => buttons.length), 0);
+  await clickText('全部账户');
+  await page.waitForSelector('section[aria-label="全部账户"]');
+  assert.equal(await page.$$eval('main [title="复制验证码"]', buttons => buttons.length), 3);
+  await page.goto(origin + '/popup.html');
+  await page.waitForSelector('button[aria-label="收藏"]');
   await page.click('button[aria-label="收藏"]');
   await page.waitForSelector('button[aria-label="取消收藏"]');
   await waitIdle();
+  await clickText('全部账户');
   await page.click('input[type="checkbox"]');
   await page.waitForFunction(() => document.querySelectorAll('button[aria-pressed]').length === 1);
   await page.screenshot({ path: join(screenshots, 'popup.png') });
@@ -179,6 +222,8 @@ try {
   await page.waitForSelector('input[list]');
   await typeGroup('家庭');
   await clickText('保存修改');
+  await page.waitForFunction(() => [...document.querySelectorAll('button')].some(button => button.textContent.trim() === '全部账户'));
+  await clickText('全部账户');
   await page.waitForSelector('select[aria-label="分组筛选"]');
   await waitIdle();
   await page.select('select[aria-label="分组筛选"]', '家庭');
@@ -201,13 +246,14 @@ try {
   await assertRows(['工作账户']);
   await page.setViewport({ width: 420, height: 760 });
   await page.goto(origin + '/popup.html?locked');
-  await page.waitForSelector('select[aria-label="分组筛选"]');
+  await page.waitForSelector('section[aria-label="当前站点"]');
+  await clickText('全部账户');
   await page.click('input[type="checkbox"]');
   await page.waitForSelector('button[aria-label="取消收藏"]');
   assert.match(await page.$eval('main', el => el.textContent), /工作账户/);
   // Follow the popup manager entry, then submit the real password form with native Enter.
   await page.click('button[title="更多操作"]');
-  await clickText('打开管理页面');
+  await page.click('button[aria-label="打开管理页面"]');
   const managerUrl = await page.evaluate(() => window.openpassFixture.opened.at(-1));
   assert.equal(managerUrl, origin + '/options.html');
   await page.goto(managerUrl);
@@ -228,7 +274,7 @@ try {
   await page.waitForSelector('tbody button[aria-pressed]');
   // Migration/session failures stay visible rather than silently returning to the password page.
   await page.goto(origin + '/popup.html?locked');
-  await page.waitForSelector('select[aria-label="分组筛选"]');
+  await page.waitForSelector('section[aria-label="当前站点"]');
   await page.goto(origin + '/options.html');
   await page.waitForSelector('#password');
   await page.evaluate(() => { window.openpassFixture.migrationError = 'fixture unlock migration failed'; });

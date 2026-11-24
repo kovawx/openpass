@@ -1,18 +1,20 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch } from 'vue';
+import { defineAsyncComponent, ref, onMounted, onUnmounted, watch } from 'vue';
 import { useAuthStore } from '@/stores/auth';
 import { useSecretStore } from '@/stores/secrets';
 import { useKeyboardShortcuts } from '@/composables/useKeyboardShortcuts';
 import Sidebar from '@/components/manager/Sidebar.vue';
 import SecretTable from '@/components/manager/SecretTable.vue';
-import SecretModal from '@/components/manager/SecretModal.vue';
-import BackupPanel from '@/components/manager/BackupPanel.vue';
-import SettingsPanel from '@/components/manager/SettingsPanel.vue';
-import AboutPanel from '@/components/manager/AboutPanel.vue';
-import WelcomeGuide from '@/components/manager/WelcomeGuide.vue';
-import ErrorCenter from '@/components/manager/ErrorCenter.vue';
 import type { Secret } from '@/stores/secrets';
 import { showToast } from '@/utils/ui';
+
+const SecretModal = defineAsyncComponent(() => import('@/components/manager/SecretModal.vue'));
+const AuthenticatorImport = defineAsyncComponent(() => import('@/components/manager/AuthenticatorImport.vue'));
+const BackupPanel = defineAsyncComponent(() => import('@/components/manager/BackupPanel.vue'));
+const SettingsPanel = defineAsyncComponent(() => import('@/components/manager/SettingsPanel.vue'));
+const AboutPanel = defineAsyncComponent(() => import('@/components/manager/AboutPanel.vue'));
+const WelcomeGuide = defineAsyncComponent(() => import('@/components/manager/WelcomeGuide.vue'));
+const ErrorCenter = defineAsyncComponent(() => import('@/components/manager/ErrorCenter.vue'));
 
 const authStore = useAuthStore();
 const secretStore = useSecretStore();
@@ -21,9 +23,11 @@ const currentPage = ref('secrets');
 const showWelcome = ref(false);
 const welcomeGuideKey = ref(0);
 const showSecretModal = ref(false);
+const showAuthenticatorImport = ref(false);
 const editingSecret = ref<Secret | null>(null);
 const loading = ref(true);
 let lastActivityAt = 0;
+let managementStarted = false;
 
 function getAuthRedirect() {
   const redirect = window.location.pathname.split('/').pop() || 'options.html';
@@ -108,17 +112,13 @@ async function handleStorageChange(
     return;
   }
 
-  if (changes.sessionKey || changes.sessionExpiresAt) {
-    if (!await ensureAuthenticated()) { secretStore.secrets = []; return; }
+  if ((areaName === 'session' && (changes.sessionKey || changes.sessionExpiresAt)) ||
+      (areaName === 'local' && changes.sessionExpiresAt && changes.sessionExpiresAt.newValue === undefined)) {
+    if (!await ensureAuthenticated()) return;
   }
-  if (!changes.encryptedSecrets) {
-    return;
-  }
-
-  await secretStore.loadSecrets();
-
-  if (currentPage.value === 'secrets') {
-    shortcuts.setTotal(secretStore.getFilteredSecrets().length);
+  if ((areaName === 'session' && changes.sessionKey) ||
+      (areaName === 'local' && (changes.encryptedSecrets || changes.hotpCounters))) {
+    await secretStore.loadSecrets(authStore.sessionKey ?? undefined);
   }
 }
 
@@ -129,8 +129,8 @@ const shortcuts = useKeyboardShortcuts({
     input?.focus();
   },
   onAdd: () => {
-    if (currentPage.value === 'secrets') {
-      showSecretModal.value = true;
+    if (currentPage.value === 'secrets' && !secretStore.loading) {
+      addSecret();
     }
   },
   onSettings: () => currentPage.value = 'settings',
@@ -158,46 +158,41 @@ const shortcuts = useKeyboardShortcuts({
   },
   onSelectNext: () => {},
   onSelectPrevious: () => {},
-  isModalOpen: () => showSecretModal.value || showWelcome.value,
+  isModalOpen: () => showSecretModal.value || showAuthenticatorImport.value || showWelcome.value,
   isInputFocused: () => {
     const tag = document.activeElement?.tagName;
     return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
   }
 });
 
-onMounted(async () => {
-  await authStore.init();
-
-  // 检查是否首次使用（未设置主密码）
-  const setupResult = await chrome.storage.local.get(['masterPasswordHash', 'isSetupComplete']);
-  if (!setupResult.masterPasswordHash) {
-    // 首次使用，直接显示欢迎引导，不跳转认证页面
-    showWelcome.value = true;
-    await secretStore.loadSecrets();
-    loading.value = false;
-    shortcuts.register();
-    return;
-  }
-
-  if (!(await ensureAuthenticated())) {
-    return;
-  }
-
-  await secretStore.loadSecrets();
-  await authStore.updateActivity();
-
-  // 检查是否需要显示欢迎引导
-  const result = await chrome.storage.local.get(['isSetupComplete', 'welcomeCompleted']);
-  if (!result.isSetupComplete || !result.welcomeCompleted) {
-    showWelcome.value = true;
-  }
-
-  shortcuts.register();
-  shortcuts.setTotal(secretStore.secrets.length);
+function startManagementSession() {
+  if (managementStarted || !authStore.sessionKey) return;
+  managementStarted = true;
   setupActivityListener();
   chrome.storage.onChanged.addListener(handleStorageChange);
+  void secretStore.loadSecrets(authStore.sessionKey);
+  void handleActivity();
+}
 
+onMounted(async () => {
+  const [setup, authenticated] = await Promise.all([
+    chrome.storage.local.get(['masterPasswordHash', 'isSetupComplete', 'welcomeCompleted']),
+    authStore.checkSession()
+  ]);
+  const configured = setup.isSetupComplete === true || !!setup.masterPasswordHash;
+  if (configured && !authenticated) {
+    redirectToAuth();
+    return;
+  }
+
+  showWelcome.value = !configured || !setup.welcomeCompleted;
+  if (authenticated) startManagementSession();
+  shortcuts.register();
   loading.value = false;
+});
+
+watch(() => authStore.isAuthenticated, (authenticated) => {
+  if (authenticated && !loading.value) startManagementSession();
 });
 
 onUnmounted(() => {
@@ -212,7 +207,7 @@ function addSecret() {
 }
 
 function getSelectedSecret() {
-  const filteredSecrets = secretStore.getFilteredSecrets();
+  const filteredSecrets = secretStore.filteredSecrets;
   if (filteredSecrets.length === 0) {
     return null;
   }
@@ -268,8 +263,7 @@ watch(showWelcome, (visible) => {
 });
 
 watch(
-  () => [currentPage.value, secretStore.searchQuery, secretStore.selectedGroup, secretStore.favoritesOnly,
-    JSON.stringify(secretStore.secrets)],
+  () => [currentPage.value, secretStore.filteredSecrets],
   () => {
     if (currentPage.value !== 'secrets') {
       shortcuts.setTotal(0);
@@ -277,7 +271,7 @@ watch(
       return;
     }
 
-    shortcuts.setTotal(secretStore.getFilteredSecrets().length);
+    shortcuts.setTotal(secretStore.filteredSecrets.length);
     shortcuts.clearSelection();
   }
 );
@@ -302,6 +296,7 @@ watch(
         v-if="currentPage === 'secrets'"
         :selected-index="shortcuts.selectedIndex.value"
         @add="addSecret"
+        @import="showAuthenticatorImport = true"
         @edit="editSecret"
         @delete="deleteSecret"
       />
@@ -318,10 +313,12 @@ watch(
 
     <!-- 密钥表单模态框 -->
     <SecretModal
+      v-if="showSecretModal"
       :open="showSecretModal"
       :editing-secret="editingSecret"
       @close="handleModalClose"
     />
+    <AuthenticatorImport v-if="showAuthenticatorImport" @close="showAuthenticatorImport = false" />
 
     <!-- 欢迎引导 -->
     <WelcomeGuide

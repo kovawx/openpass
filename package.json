@@ -1,6 +1,6 @@
 {
   "name": "openpass",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "> 开源、本地、安全的两步验证管理器",
   "main": "auth.js",
   "packageManager": "pnpm@10.34.3",
@@ -26,7 +26,8 @@
     "test:cloud-settings": "node scripts/check-cloud-settings.mjs",
     "test:backup-directory": "node scripts/check-backup-directory.mjs",
     "test:organization": "node scripts/check-account-organization.mjs",
-    "test:qr-scan": "node scripts/check-qr-scan.mjs"
+    "test:qr-scan": "node scripts/check-qr-scan.mjs",
+    "test:daily-add": "node scripts/check-daily-add.mjs"
   },
   "repository": {
     "type": "git",
@@ -56,6 +57,7 @@
     "eslint": "^10.2.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-vue": "^10.8.0",
+    "fake-indexeddb": "^6.2.6",
     "globals": "^17.5.0",
     "happy-dom": "^20.14.6",
     "postcss": "^8.5.9",
@@ -74,6 +76,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1090.0",
     "@aws-sdk/xml-builder": "3.972.36",
+    "@noble/hashes": "2.2.0",
     "@vueuse/core": "^14.2.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",

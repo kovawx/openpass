@@ -5,7 +5,20 @@ export interface NormalizedRect {
   height: number;
 }
 
+export interface NormalizedPoint { x: number; y: number }
+
 export type PixelRegion = [x: number, y: number, width: number, height: number];
+
+export const QR_RETRY_MESSAGE = '识别二维码超时，请只框选二维码区域后重试';
+
+export async function withQrTimeout<T>(operation: Promise<T>, milliseconds: number, message = QR_RETRY_MESSAGE): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([operation, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), Math.max(0, milliseconds));
+    })]);
+  } finally { clearTimeout(timer); }
+}
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
@@ -16,6 +29,9 @@ export function getQrScanErrorMessage(error: unknown): string {
   }
   if (/Cannot access contents of url|Cannot access a chrome:\/\//i.test(message)) {
     return '当前页面受浏览器保护，无法扫描；请在普通网页中重试';
+  }
+  if (/Receiving end does not exist|Could not establish connection/i.test(message)) {
+    return '未能连接到当前网页，请刷新页面后重试';
   }
   return message || '无法扫描当前页面';
 }

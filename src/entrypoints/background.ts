@@ -1,14 +1,20 @@
-import { decodeOtpQrPixels } from '@/utils/qrDecode';
-import CryptoUtils from '@/utils/crypto';
+import { decodeQrPixels } from '@/utils/qrDecode';
+import { classifyOtpQrInput, DEVICE_REGISTRATION_MESSAGE, type OtpQrInput } from '@/utils/otpQrInput';
+import CryptoUtils, { type VaultKey } from '@/utils/crypto';
 import { getBackupSchedule } from '@/utils/backupSchedule';
 import { decodeRestoreBackup, planRestore, type RestoreMode } from '@/utils/restore';
-import { generateOtp, normalizeOtpSettings } from '@/utils/otp';
+import { generateOtp, normalizeOtpSettings, type OtpSettings } from '@/utils/otp';
+import { parseOtpMigration } from '@/utils/otpMigration';
 import { readVault, writeVault, normalizeVaultSecrets, mergeHotpCounters, applyHotpCounters,
-  prepareDeviceOtpState, readDeviceOtpVault, writeDeviceOtpCounters, assertDeviceOtpAccess, toOtpAccount, migrateLegacyVault, type VaultSecret } from '@/utils/vault';
-import { getValidSession, getValidSessionKey, requireSessionKey, assertSessionKey, SESSION_ALARM } from '@/utils/session';
+  appendVaultAccount, prepareDeviceOtpState, readDeviceOtpVault, writeDeviceOtpCounters, assertDeviceOtpAccess, toOtpAccount,
+  migrateLegacyVault, rekeyMasterData, VaultAuthenticationError, type VaultSecret } from '@/utils/vault';
+import { hasDailyWriteKey, prepareDailyWriteKeys, retainDailyWriteKeys } from '@/utils/deviceVaultWrite';
+import { decryptSessionData, encryptSessionData, getSessionVaultKey, getValidSession, getValidSessionKey,
+  publishVaultSession, requireSessionKey, assertSessionKey, SESSION_ALARM } from '@/utils/session';
 import {
   type BackupData,
   createBackupData,
+  encryptedBackupFields,
   validateBackupData,
   getBackupEncryptionSettings,
   resolveStoredBackupPassword,
@@ -50,7 +56,11 @@ import {
   createScanRegions,
   getQrScanErrorMessage,
   normalizeQrBounds,
-  type NormalizedRect
+  QR_RETRY_MESSAGE,
+  withQrTimeout,
+  type NormalizedPoint,
+  type NormalizedRect,
+  type PixelRegion
 } from '@/utils/qrScan';
 
 type BackupFrequency = 'every5min' | 'daily' | 'weekly' | 'monthly';
@@ -59,13 +69,25 @@ type StoredSecret = VaultSecret;
 type PendingSecret = Omit<VaultSecret, 'id'>;
 
 interface QrCandidate {
-  secret: PendingSecret;
+  input: OtpQrInput;
   rect: NormalizedRect;
 }
 
-interface ClickedQrImage {
-  srcUrl: string;
-  frameId: number;
+function qrCandidateKey(input: OtpQrInput) {
+  if (input.kind === 'account') return input.account.secret;
+  return input.kind === 'migration' ? input.link : 'device-registration';
+}
+
+function previewCodesForAccounts(accounts: VaultSecret[]) {
+  const now = Date.now();
+  const codes: { id: string; code: string; expiresAt: number | null }[] = [];
+  for (const account of accounts) {
+    try {
+      const { code, type, remainingSeconds } = generateOtp(account.secret, account, now);
+      codes.push({ id: account.id, code, expiresAt: type === 'hotp' ? null : (Math.floor(now / 1000) + remainingSeconds) * 1000 });
+    } catch { /* A bad record does not prevent the other previews from loading. */ }
+  }
+  return codes;
 }
 
 interface SiteListItem {
@@ -115,12 +137,9 @@ export default defineBackground(() => {
     if (!key) return;
     const state = await chrome.storage.local.get(['encryptedSecrets', 'deviceOtpEnabled', 'deviceOtpRevision', 'encryptedDeviceOtpSecrets']);
     if (state.deviceOtpEnabled === false || typeof state.encryptedSecrets !== 'string' ||
-        (state.deviceOtpRevision === state.encryptedSecrets && typeof state.encryptedDeviceOtpSecrets === 'string')) return;
-    const deviceOtpState = await prepareDeviceOtpState(await readVault(key), state.encryptedSecrets);
-    await assertSessionKey(key);
-    const current = await chrome.storage.local.get(['encryptedSecrets']);
-    if (current.encryptedSecrets !== state.encryptedSecrets) return;
-    await chrome.storage.local.set(deviceOtpState);
+        (state.deviceOtpRevision === state.encryptedSecrets && typeof state.encryptedDeviceOtpSecrets === 'string' &&
+          await hasDailyWriteKey(state.encryptedSecrets))) return;
+    await writeVault(await readVault(key), key);
     await notifyVaultChanged();
   }).catch((error) => console.error('OpenPass: 初始化验证码免密失败', error));
 
@@ -143,10 +162,14 @@ export default defineBackground(() => {
 
   // 创建右键菜单
   chrome.runtime.onInstalled.addListener((details) => {
-    chrome.contextMenus.create({
-      id: 'parseQRCode',
-      title: '扫描页面二维码',
-      contexts: ['all']
+    const id = 'parseQRCode';
+    const title = '点选网页二维码';
+    const createMenu = () => chrome.contextMenus.create({ id, title, contexts: ['all'] }, () => {
+      if (chrome.runtime.lastError) console.warn('OpenPass: 无法创建二维码右键菜单', chrome.runtime.lastError.message);
+    });
+    if (details.reason === 'install') createMenu();
+    else chrome.contextMenus.update(id, { title }, () => {
+      if (chrome.runtime.lastError) createMenu();
     });
 
     // 创建自动备份定时器
@@ -166,9 +189,7 @@ export default defineBackground(() => {
     if (info.menuItemId !== 'parseQRCode') {
       return;
     }
-    const image = info.mediaType === 'image' && info.srcUrl
-      ? { srcUrl: info.srcUrl, frameId: info.frameId ?? 0 } : undefined;
-    void startQrScan(tab, undefined, image, info.frameId ?? 0).catch(reportQrScanFailure);
+    void startQrElementPicker(tab, info.frameId ?? 0).catch(reportQrScanFailure);
   });
 
   /** 若 secret.site 不是域名（含点+TLD），则替换为页面主域名。 */
@@ -266,35 +287,78 @@ export default defineBackground(() => {
     }
   }
 
-  async function scanQrImage(imageUrl: string, crop?: NormalizedRect, maxPixels = Number.POSITIVE_INFINITY): Promise<QrCandidate[]> {
-    const response = await fetch(imageUrl);
-    if (!response.ok) throw new Error(`Screenshot decode failed: ${response.status}`);
-    const imageBitmap = await createImageBitmap(await response.blob());
+  function qrScanTimeLeft(deadline: number) {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw new Error(QR_RETRY_MESSAGE);
+    return remaining;
+  }
+
+  async function scanQrImage(imageUrl: string, deadline: number, crop?: NormalizedRect, maxPixels = Number.POSITIVE_INFINITY, target?: NormalizedPoint): Promise<QrCandidate[]> {
+    const remaining = qrScanTimeLeft(deadline);
+    const pendingBitmap = fetch(imageUrl, { signal: AbortSignal.timeout(Math.ceil(remaining)) }).then(async response => {
+      if (!response.ok) throw new Error('无法读取二维码图像');
+      return createImageBitmap(await response.blob());
+    });
+    const imageBitmap = await withQrTimeout(pendingBitmap, remaining).catch(error => {
+      void pendingBitmap.then(bitmap => bitmap.close(), () => {});
+      throw error;
+    });
 
     try {
-      if (imageBitmap.width * imageBitmap.height > maxPixels) return [];
-      const canvas = new OffscreenCanvas(imageBitmap.width, imageBitmap.height);
-      const ctx = canvas.getContext('2d');
+      const { width, height } = imageBitmap;
+      if (width * height > maxPixels) return [];
+      const [left, top, cropWidth, cropHeight] = createScanRegions(width, height, crop)[0];
+      if (left >= width || top >= height) return [];
+
+      const maxSide = 640;
+      const needsTiles = !crop || Math.max(cropWidth, cropHeight) > maxSide;
+      const regions = needsTiles ? createScanRegions(cropWidth, cropHeight) : [[0, 0, cropWidth, cropHeight] as PixelRegion];
+      const clickX = target ? target.x * cropWidth : 0;
+      const clickY = target ? target.y * cropHeight : 0;
+      if (target && Math.max(cropWidth, cropHeight) > maxSide) {
+        const centeredWidth = Math.min(maxSide, cropWidth);
+        const centeredHeight = Math.min(maxSide, cropHeight);
+        const x = Math.max(0, Math.min(cropWidth - centeredWidth, Math.round(clickX - centeredWidth / 2)));
+        const y = Math.max(0, Math.min(cropHeight - centeredHeight, Math.round(clickY - centeredHeight / 2)));
+        regions.splice(1, 0, [x, y, centeredWidth, centeredHeight]);
+      }
+
+      const canvas = new OffscreenCanvas(1, 1);
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
       if (!ctx) throw new Error('2D canvas context unavailable');
-      ctx.fillStyle = '#fff';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(imageBitmap, 0, 0);
 
       const candidates = new Map<string, QrCandidate>();
-      for (const [x, y, width, height] of createScanRegions(canvas.width, canvas.height, crop)) {
-        const safeWidth = Math.min(width, canvas.width - x);
-        const safeHeight = Math.min(height, canvas.height - y);
-        if (safeWidth <= 0 || safeHeight <= 0) continue;
+      for (const [x, y, regionWidth, regionHeight] of regions) {
+        qrScanTimeLeft(deadline);
+        const safeWidth = Math.min(regionWidth, width - left - x);
+        const safeHeight = Math.min(regionHeight, height - top - y);
+        if (safeWidth < 21 || safeHeight < 21) continue;
+        const scale = Math.min(1, maxSide / Math.max(safeWidth, safeHeight));
+        canvas.width = Math.max(1, Math.round(safeWidth * scale));
+        canvas.height = Math.max(1, Math.round(safeHeight * scale));
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(imageBitmap, left + x, top + y, safeWidth, safeHeight, 0, 0, canvas.width, canvas.height);
+        const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const decoded = decodeQrPixels(pixels.data, pixels.width, pixels.height, classifyOtpQrInput, deadline);
+        qrScanTimeLeft(deadline);
+        if (!decoded || candidates.has(qrCandidateKey(decoded.value))) continue;
 
-        const imageData = ctx.getImageData(x, y, safeWidth, safeHeight);
-        const decoded = decodeOtpQrPixels(imageData.data, imageData.width, imageData.height);
-        if (!decoded || candidates.has(decoded.secret.secret)) continue;
-
-        const points = Object.values(decoded.code.location);
-        candidates.set(decoded.secret.secret, {
-          secret: decoded.secret,
-          rect: normalizeQrBounds(points, x, y, canvas.width, canvas.height)
-        });
+        const points = Object.values(decoded.code.location).map(point => ({
+          x: point.x * safeWidth / pixels.width, y: point.y * safeHeight / pixels.height
+        }));
+        const rect = normalizeQrBounds(points, left + x, top + y, width, height);
+        const candidate = { input: decoded.value, rect };
+        if (target) {
+          const x = (left + clickX) / width;
+          const y = (top + clickY) / height;
+          const marginX = rect.width * .05;
+          const marginY = rect.height * .05;
+          if (x >= rect.x - marginX && x <= rect.x + rect.width + marginX &&
+              y >= rect.y - marginY && y <= rect.y + rect.height + marginY) return [candidate];
+        }
+        candidates.set(qrCandidateKey(decoded.value), candidate);
       }
       return [...candidates.values()];
     } finally {
@@ -312,13 +376,83 @@ export default defineBackground(() => {
     return chrome.tabs.sendMessage(tab.id, message, { frameId });
   }
 
-  async function acceptQrSecret(secret: PendingSecret, tab: chrome.tabs.Tab) {
-    resolveSiteFromPage(secret, tab);
-    await storePendingSecret(secret, tab);
-    await chrome.action.openPopup();
+  function placeQrCandidate(candidate: QrCandidate, bounds: NormalizedRect): QrCandidate {
+    const { x, y, width, height } = candidate.rect;
+    return { ...candidate, rect: { x: bounds.x + x * bounds.width, y: bounds.y + y * bounds.height,
+      width: width * bounds.width, height: height * bounds.height } };
   }
 
-  async function startQrScan(tab?: chrome.tabs.Tab, crop?: NormalizedRect, clickedImage?: ClickedQrImage, sourceFrameId = 0) {
+  async function showQrDraftPopup(tab: chrome.tabs.Tab) {
+    if (typeof tab.windowId === 'number' && tab.windowId >= 0) {
+      try {
+        await withQrTimeout(chrome.action.openPopup({ windowId: tab.windowId }), 1500);
+        return;
+      } catch { /* The browser can reject popups for unfocused windows. The draft is already available. */ }
+    }
+
+    const message = '二维码已识别，请点击浏览器工具栏上的 OpenPass 图标查看';
+    try {
+      const response = await withQrTimeout(sendToTab(tab, { action: 'showQrDraftReady', message }), 500);
+      if (response?.success) return;
+    } catch { /* The page may have navigated or closed. */ }
+    showNotification('二维码已识别', message);
+  }
+
+  async function openQrDraft(candidates: QrCandidate[], tab: chrome.tabs.Tab, openPopup: boolean) {
+    if (!candidates.length) return false;
+    const input = candidates[0].input;
+    if (candidates.every(candidate => candidate.input.kind === 'migration')) {
+      const links = candidates.flatMap(candidate => candidate.input.kind === 'migration' ? [candidate.input.link] : []).join('\n');
+      await chrome.storage.session.set({ pendingOtpImport: { links, createdAt: Date.now() }, pendingQrDraft: null });
+    } else {
+      if (candidates.length !== 1) return false;
+      if (input.kind === 'device-registration') throw new Error(DEVICE_REGISTRATION_MESSAGE);
+      if (input.kind !== 'account') return false;
+      resolveSiteFromPage(input.account, tab);
+      await storePendingSecret(input.account, tab);
+    }
+    if (openPopup) await showQrDraftPopup(tab);
+    return true;
+  }
+
+  const visibleQrSelections = new Map<number, { expiresAt: number; frameId: number; url?: string; choices: Map<string, QrCandidate> }>();
+
+  async function showQrCandidates(tab: chrome.tabs.Tab, candidates: QrCandidate[], frameId = 0) {
+    if (typeof tab.id !== 'number') throw new Error('无法确定当前标签页');
+    const now = Date.now();
+    for (const [id, selection] of visibleQrSelections) {
+      if (selection.expiresAt <= now) visibleQrSelections.delete(id);
+    }
+    const choices = new Map<string, QrCandidate>();
+    const visible = candidates.map(candidate => {
+      const id = globalThis.crypto.randomUUID();
+      choices.set(id, candidate);
+      const input = candidate.input;
+      const label = input.kind === 'account' ? input.account.name || input.account.site || 'OTP 账户'
+        : input.kind === 'migration' ? 'Google Authenticator 迁移' : 'Microsoft Authenticator 设备注册';
+      return { id, label, rect: candidate.rect };
+    });
+    visibleQrSelections.set(tab.id, { expiresAt: now + 60000, frameId, url: tab.url, choices });
+    await sendToTab(tab, { action: 'showQrCandidates', candidates: visible }, frameId);
+  }
+
+  async function startQrElementPicker(tab?: chrome.tabs.Tab, frameId = 0) {
+    if (!await checkSetupComplete()) throw new Error('请先设置主密码');
+    if (!tab) [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!tab) throw new Error('未找到当前标签页，请切换到要识别的网页');
+    if (tab.url && /^(?:chrome|edge|about|moz-extension|chrome-extension):/i.test(tab.url)) {
+      throw new Error('当前页面受浏览器保护，请切换到普通网页');
+    }
+    try { await sendToTab(tab, { action: 'startQrSelection' }, frameId); }
+    catch (error) {
+      if (frameId === 0) throw error;
+      await sendToTab(tab, { action: 'startQrSelection' });
+    }
+    return { success: true };
+  }
+
+  async function startQrScan(tab?: chrome.tabs.Tab, crop?: NormalizedRect & { dataUrl?: string; target?: NormalizedPoint }, sourceFrameId = 0, openResultPopup = true) {
+    const deadline = performance.now() + 4300;
     const setupComplete = await checkSetupComplete();
     if (!setupComplete) {
       showNotification('请先设置主密码', '点击扩展图标开始设置');
@@ -332,93 +466,64 @@ export default defineBackground(() => {
       throw new Error('未找到可扫描的浏览器窗口，请先切换到要扫描的普通网页后重试');
     }
 
-    if (!await getValidSessionKey()) {
-      showNotification('请先解锁 OpenPass', '扫描并添加账户需要解锁。解锁后请回到原网页重新扫描。');
-      await chrome.tabs.create({ url: chrome.runtime.getURL('auth.html?redirect=options.html') });
-      return { success: true, requiresUnlock: true };
-    }
-    let screenshot: string | undefined;
-    if (!crop && clickedImage) {
-      let source: QrImageSource | null = null;
-      try {
-        source = await sendToTab(tab, { action: 'getQrImage', srcUrl: clickedImage.srcUrl }, clickedImage.frameId);
-      } catch { /* 已打开的页面可能尚未注入内容脚本，尝试直接读取原图。 */ }
-      let imageCandidates: QrCandidate[] = [];
-      const sourceUrl = source?.dataUrl?.startsWith('data:image/png;base64,')
-        ? source.dataUrl : clickedImage.srcUrl;
-      if (/^(data:image\/|https?:\/\/|blob:)/i.test(sourceUrl)) {
-        try { imageCandidates = await scanQrImage(sourceUrl, undefined, 4194304); }
-        catch { /* 无原图访问权限时回退到可见图片区域。 */ }
-      }
-      if (imageCandidates.length === 1) {
-        await acceptQrSecret(imageCandidates[0].secret, tab);
+    // Expire an old management session before creating a fresh scan draft.
+    // Reading a QR from the user's page does not grant vault management access.
+    await getValidSessionKey();
+    if (crop?.dataUrl) {
+      let candidates: QrCandidate[] = [];
+      try { candidates = await scanQrImage(crop.dataUrl, deadline, undefined, 4194304, crop.target); }
+      catch { /* 使用选区截图重试。 */ }
+      if (await openQrDraft(candidates, tab, openResultPopup)) return { success: true, pendingDraft: true };
+      if (candidates.length > 1) {
+        await showQrCandidates(tab, candidates.map(candidate => placeQrCandidate(candidate, crop)), sourceFrameId);
         return { success: true };
-      }
-      if (imageCandidates.length > 1 && source?.rect) {
-        const rect = source.rect;
-        await sendToTab(tab, { action: 'showQrCandidates', candidates: imageCandidates.map(candidate => ({
-          ...candidate, rect: { x: rect.x + candidate.rect.x * rect.width, y: rect.y + candidate.rect.y * rect.height,
-            width: candidate.rect.width * rect.width, height: candidate.rect.height * rect.height }
-        })) }, clickedImage.frameId);
-        return { success: true };
-      }
-      // 图片位置属于该 frame；顶层图片可直接裁剪截图，iframe 中由用户框选。
-      if (source?.rect && clickedImage.frameId === 0) {
-        screenshot = await captureTab(tab);
-        const candidates = await scanQrImage(screenshot, source.rect);
-        if (candidates.length === 1) {
-          await acceptQrSecret(candidates[0].secret, tab);
-          return { success: true };
-        }
-        if (candidates.length > 1) {
-          await sendToTab(tab, { action: 'showQrCandidates', candidates });
-          return { success: true };
-        }
       }
     } else if (!crop) {
       let sources: QrImageSource[] = [];
       try {
-        const result = await sendToTab(tab, { action: 'getPageQrSources' }, sourceFrameId);
+        const result = await withQrTimeout(sendToTab(tab, { action: 'getPageQrSources' }, sourceFrameId), 1200);
         if (Array.isArray(result)) sources = result;
       } catch { /* 无法读取页面图像时继续网页截图扫描。 */ }
       const candidates = new Map<string, QrCandidate>();
       for (const source of sources) {
+        qrScanTimeLeft(deadline);
         if (!source.dataUrl?.startsWith('data:image/png;base64,')) continue;
         try {
-          for (const candidate of await scanQrImage(source.dataUrl, undefined, 4194304)) {
-            if (candidates.has(candidate.secret.secret)) continue;
-            const rect = source.rect;
-            candidates.set(candidate.secret.secret, { ...candidate, rect: {
-              x: rect.x + candidate.rect.x * rect.width, y: rect.y + candidate.rect.y * rect.height,
-              width: candidate.rect.width * rect.width, height: candidate.rect.height * rect.height
-            } });
+          for (const candidate of await scanQrImage(source.dataUrl, deadline, undefined, 4194304)) {
+            const key = qrCandidateKey(candidate.input);
+            if (candidates.has(key)) continue;
+            candidates.set(key, placeQrCandidate(candidate, source.rect));
           }
         } catch { /* 单张图片损坏不影响其他图像及截图回退。 */ }
       }
-      if (candidates.size === 1) {
-        await acceptQrSecret([...candidates.values()][0].secret, tab);
-        return { success: true };
+      if (await openQrDraft([...candidates.values()], tab, openResultPopup)) {
+        return { success: true, pendingDraft: true };
       }
       if (candidates.size > 1) {
-        await sendToTab(tab, { action: 'showQrCandidates', candidates: [...candidates.values()] }, sourceFrameId);
+        await showQrCandidates(tab, [...candidates.values()], sourceFrameId);
         return { success: true };
       }
     }
-    // 原始图像没有识别结果时才扫描网页；已有框选始终只扫描该选区。
-    const candidates = await scanQrImage(screenshot ?? await captureTab(tab), crop);
-    if (candidates.length === 1) {
-      await acceptQrSecret(candidates[0].secret, tab);
+    if (crop && sourceFrameId !== 0) {
+      await sendToTab(tab, { action: 'startQrSelection', message: '请在网页上拖动框选嵌入区域里的二维码' });
       return { success: true };
+    }
+    // 原始图像没有识别结果时才扫描网页；已有框选始终只扫描该选区。
+    if (crop && tab.active === false) throw new Error('请回到选择二维码的标签页后重试');
+    const capture = await withQrTimeout(captureTab(tab), Math.min(1500, qrScanTimeLeft(deadline)), '获取网页选区超时，请回到二维码所在网页后重试');
+    const candidates = await scanQrImage(capture, deadline, crop, Number.POSITIVE_INFINITY, crop?.target);
+    if (await openQrDraft(candidates, tab, openResultPopup)) {
+      return { success: true, pendingDraft: true };
     }
 
     if (candidates.length > 1) {
-      await sendToTab(tab, { action: 'showQrCandidates', candidates });
+      await showQrCandidates(tab, candidates);
       return { success: true };
     }
 
     await sendToTab(tab, {
       action: 'startQrSelection',
-      message: crop ? '选区内未识别到 OTP 二维码，请重新框选' : '未自动识别到二维码，请框选二维码区域'
+      message: crop ? '未识别到验证码二维码，请重新点选或拖动框选' : '自动识别未找到二维码，请点选或拖动框选'
     });
     return { success: true };
   }
@@ -438,8 +543,7 @@ export default defineBackground(() => {
       secret.site = pageUrl;
     }
 
-    await requireSessionKey();
-    await chrome.storage.session.set({ pendingSecret: secret });
+    await chrome.storage.session.set({ pendingQrDraft: { secret, createdAt: Date.now(), sourceUrl: tab?.url || '' }, pendingOtpImport: null });
   }
 
   function showNotification(title: string, message: string) {
@@ -458,12 +562,18 @@ export default defineBackground(() => {
       sendResponse({ error: '该操作仅允许在 OpenPass 扩展页面执行' });
       return;
     }
-    if (request.action === 'migrateVaultForUnlock') {
+    if (request.action === 'migrateVaultForUnlock' || request.action === 'initializeVault') {
       void withVaultLock(async () => {
-        const state = await chrome.storage.local.get(['masterPasswordHash', 'masterPasswordSalt']);
-        if (typeof request.password !== 'string' || !await CryptoUtils.verifyMasterPassword(request.password,
-          String(state.masterPasswordHash), String(state.masterPasswordSalt))) throw new Error('主密码错误');
-        await migrateLegacyVault(request.password);
+        const password = request.password;
+        const initialize = request.action === 'initializeVault';
+        if (typeof password !== 'string' || !password || (initialize && password.length < 6)) throw new Error('主密码格式无效');
+        try {
+          const key = await migrateLegacyVault(password, initialize);
+          await publishVaultSession(password, key);
+        } catch (error) {
+          if (error instanceof VaultAuthenticationError) return { incorrectPassword: true, error: error.message };
+          throw error;
+        }
         return { success: true };
       }).then(sendResponse, (error) => sendResponse({ error: error.message }));
       return true;
@@ -473,13 +583,7 @@ export default defineBackground(() => {
         const key = await requireSessionKey();
         if (typeof request.enabled !== 'boolean') throw new Error('免密设置格式无效');
         const secrets = await readVault(key);
-        const { encryptedSecrets } = await chrome.storage.local.get<{ encryptedSecrets?: string }>(['encryptedSecrets']);
-        if (!encryptedSecrets) await writeVault(secrets, key, { deviceOtpEnabled: request.enabled });
-        else {
-          const state = await prepareDeviceOtpState(secrets, encryptedSecrets, request.enabled);
-          await assertSessionKey(key);
-          await chrome.storage.local.set(state);
-        }
+        await writeVault(secrets, key, { deviceOtpEnabled: request.enabled });
         await notifyVaultChanged();
         return { success: true };
       }).then(sendResponse, (error) => sendResponse({ error: error.message }));
@@ -488,36 +592,60 @@ export default defineBackground(() => {
     if (request.action === 'changeMasterPassword') {
       void withVaultLock(async () => {
         const key = await requireSessionKey();
-        const state = await chrome.storage.local.get(['masterPasswordHash', 'masterPasswordSalt',
-          'encryptedSecrets', 'encryptedBackupPassword', 'encryptedCloudBackupSecrets', 'encryptedPendingSecret', 'backupSnapshots']);
-        if (typeof request.currentPassword !== 'string' || typeof request.password !== 'string' || request.password.length < 6 ||
-          !await CryptoUtils.verifyMasterPassword(request.currentPassword, String(state.masterPasswordHash), String(state.masterPasswordSalt))) {
+        if (request.currentPassword !== key || typeof request.password !== 'string' || request.password.length < 6) {
           throw new Error('当前密码错误或新密码格式无效');
         }
-        const password = request.password as string;
-        const updates: Record<string, unknown> = {};
-        for (const field of ['encryptedSecrets', 'encryptedBackupPassword', 'encryptedCloudBackupSecrets', 'encryptedPendingSecret']) {
-          if (typeof state[field] === 'string') updates[field] = await CryptoUtils.encrypt(await CryptoUtils.decrypt(state[field] as string, key), password);
-        }
-        if (Array.isArray(state.backupSnapshots)) {
-          updates.backupSnapshots = await Promise.all(state.backupSnapshots.map(async (snapshot) => {
-            if (!snapshot.data?.encryptedData) return snapshot;
-            try {
-              const data = await CryptoUtils.decrypt(snapshot.data.encryptedData, key);
-              return { ...snapshot, data: { ...snapshot.data, encryptedData: await CryptoUtils.encrypt(data, password) } };
-            } catch { return snapshot; } // 独立密码或历史密码快照保持原样，可手动输入旧密码恢复。
-          }));
-        }
-        const verifier = await CryptoUtils.createMasterPasswordHash(password);
-        if (typeof updates.encryptedSecrets === 'string') {
-          Object.assign(updates, await prepareDeviceOtpState(await readVault(key), updates.encryptedSecrets));
+        const password: string = request.password;
+        const [state, secrets, oldKey, newKey] = await Promise.all([
+          chrome.storage.local.get(['encryptedSecretsForBackup', 'encryptedBackupPassword', 'encryptedCloudBackupSecrets', 'encryptedPendingSecret', 'backupSnapshots']),
+          readVault(key), getSessionVaultKey(key), CryptoUtils.deriveVaultKey(password)
+        ]);
+        const updates = await rekeyMasterData(state, key, newKey, oldKey);
+        const encryptedSecrets = await CryptoUtils.encryptVault(JSON.stringify(secrets), newKey);
+        const device = await prepareDeviceOtpState(secrets, encryptedSecrets);
+        const keptCiphertexts = [encryptedSecrets];
+        if (device.deviceOtpEnabled) {
+          const entries: Array<{ ciphertext: string; password: string; vaultKey?: VaultKey }> = [
+            { ciphertext: encryptedSecrets, password, vaultKey: newKey }
+          ];
+          if (typeof state.encryptedSecretsForBackup === 'string' && typeof state.encryptedBackupPassword === 'string') {
+            keptCiphertexts.push(state.encryptedSecretsForBackup);
+            if (!await hasDailyWriteKey(state.encryptedSecretsForBackup)) entries.push({ ciphertext: state.encryptedSecretsForBackup,
+              password: await decryptSessionData(state.encryptedBackupPassword, key) });
+          }
+          await prepareDailyWriteKeys(entries);
         }
         await assertSessionKey(key);
-        await chrome.storage.local.set({ ...updates, masterPasswordHash: verifier.hash, masterPasswordSalt: verifier.salt });
-        await chrome.storage.session.set({ sessionKey: password });
+        await chrome.storage.local.set({ ...updates, ...device, encryptedSecrets, masterPasswordHash: null, masterPasswordSalt: null,
+          isSetupComplete: true });
+        await publishVaultSession(password, newKey);
+        await retainDailyWriteKeys(device.deviceOtpEnabled ? keptCiphertexts : [])
+          .catch(error => console.warn('OpenPass: 清理旧免密添加能力失败', error));
         conflictReview = null;
         return { success: true };
       }).then(sendResponse, (error) => sendResponse({ error: error.message }));
+      return true;
+    }
+    if (request.action === 'setBackupPassword') {
+      void withVaultLock(async () => {
+        const key = await requireSessionKey();
+        if (typeof request.password !== 'string' || request.password.length < 6) throw new Error('备份密码至少需要 6 个字符');
+        const secrets = await readVault(key);
+        const verifier = await CryptoUtils.createMasterPasswordHash(request.password);
+        const encryptedBackupPassword = await encryptSessionData(request.password, key);
+        const encryptedSecretsForBackup = await CryptoUtils.encrypt(JSON.stringify(secrets), request.password);
+        const state = await chrome.storage.local.get(['deviceOtpEnabled', 'encryptedSecrets']);
+        if (state.deviceOtpEnabled !== false) {
+          await prepareDailyWriteKeys([{ ciphertext: encryptedSecretsForBackup, password: request.password }]);
+        }
+        await assertSessionKey(key);
+        await chrome.storage.local.set({ backupPasswordHash: verifier.hash, backupPasswordSalt: verifier.salt,
+          encryptedBackupPassword, encryptedSecretsForBackup });
+        await retainDailyWriteKeys(state.deviceOtpEnabled !== false && typeof state.encryptedSecrets === 'string'
+          ? [state.encryptedSecrets, encryptedSecretsForBackup] : [])
+          .catch(error => console.warn('OpenPass: 清理旧免密添加能力失败', error));
+        return { success: true };
+      }).then(sendResponse, error => sendResponse({ error: error.message }));
       return true;
     }
     if (request.action === 'prepareVaultClear' || request.action === 'clearVault' || request.action === 'prepareCloudVersionDelete' || request.action === 'deleteCloudBackupVersion' || request.action === 'resetLocalData') {
@@ -530,6 +658,7 @@ export default defineBackground(() => {
           await chrome.storage.local.set({ cloudBackupSettings: { enabled: false } });
           await chrome.alarms.clear(CLOUD_BACKUP_RETRY_ALARM_NAME);
           await chrome.storage.session.clear(); await chrome.storage.local.clear();
+          await retainDailyWriteKeys([]);
           clearReview = null; cloudDeleteReview = null; conflictReview = null;
           return { success: true };
         }
@@ -561,6 +690,54 @@ export default defineBackground(() => {
       }).then(sendResponse, (error) => sendResponse({ error: error.message }));
       return true;
     }
+    if (request.action === 'importOtpMigration' || request.action === 'importAuthenticatorAccounts') {
+      void withVaultLock(async () => {
+        const key = await requireSessionKey();
+        let accounts: unknown = request.accounts;
+        if (request.action === 'importOtpMigration') {
+          if (typeof request.links !== 'string') throw new Error('迁移数据格式无效');
+          const migration = parseOtpMigration(request.links);
+          if (migration.missingImages) throw new Error(`还缺少 ${migration.missingImages} 张迁移二维码`);
+          accounts = migration.accounts;
+        }
+        if (!Array.isArray(accounts) || !accounts.length || accounts.length > 10000) throw new Error('导入账户列表无效');
+        const timestamp = new Date().toISOString();
+        const records = normalizeVaultSecrets(accounts.map(account => {
+          if (!account || typeof account !== 'object') throw new Error('导入账户格式无效');
+          const { secret, site, name, group, favorite, type, algorithm, digits, period, counter } = account;
+          if (typeof name !== 'string' || (type !== 'totp' && type !== 'hotp')) throw new Error('导入账户格式无效');
+          return { id: globalThis.crypto.randomUUID(), secret, site, name, group, favorite, type, algorithm, digits, period, counter,
+            createdAt: timestamp, updatedAt: timestamp, importedAt: timestamp };
+        }));
+
+        const current = await readVault(key);
+        const identity = (account: OtpSettings & { secret: string }) => {
+          const { type, algorithm, digits, period } = normalizeOtpSettings(account);
+          return `${account.secret.replace(/=+$/, '')}:${type}:${algorithm}:${digits}:${type === 'totp' ? period : 0}`;
+        };
+        const existing = new Set(current.map(identity));
+        const additions: VaultSecret[] = [];
+        for (const account of records) {
+          const id = identity(account);
+          if (existing.has(id)) continue;
+          existing.add(id);
+          additions.push(account);
+        }
+        const skipped = records.length - additions.length;
+        if (!additions.length) return { success: true, imported: 0, skipped };
+
+        const secrets = await writeVault([...current, ...additions], key);
+        let warning: string | undefined;
+        try {
+          const settings = await getBackupEncryptionSettings();
+          const password = await resolveStoredBackupPassword(key, settings) || key;
+          await saveBackupSnapshot(await createBackupData(secrets, password));
+        } catch { warning = '账户已导入，本地快照未完成'; }
+        return { success: true, imported: additions.length, skipped, warning };
+      }).then(sendResponse, (error) => sendResponse({ error: error.message }));
+      return true;
+    }
+
     if (request.action === 'saveVault') {
       void withVaultLock(async () => {
         const key = await requireSessionKey();
@@ -595,8 +772,14 @@ export default defineBackground(() => {
       return true;
     }
 
+    if (request.action === 'startQrElementPicker') {
+      void startQrElementPicker().then(sendResponse, (error) => sendResponse({ error: getQrScanErrorMessage(error) }));
+      return true;
+    }
+
     if (request.action === 'startQrScan') {
-      void startQrScan(sender.tab, undefined, undefined, sender.frameId ?? 0).then(
+      const fromPopup = isTrustedPage(sender) && sender.url?.split('?')[0] === chrome.runtime.getURL('popup.html');
+      void startQrScan(sender.tab, undefined, sender.frameId ?? 0, !fromPopup).then(
         (result) => sendResponse(result),
         (error) => { reportQrScanFailure(error); sendResponse({ error: getQrScanErrorMessage(error) }); }
       );
@@ -604,18 +787,98 @@ export default defineBackground(() => {
     }
 
     if (request.action === 'scanQrSelection' && sender.tab) {
-      void startQrScan(sender.tab, request.rect as NormalizedRect).then(
+      const rect = request.rect as NormalizedRect | undefined;
+      if (!rect || ![rect.x, rect.y, rect.width, rect.height].every(Number.isFinite) ||
+          rect.width <= 0 || rect.height <= 0) {
+        sendResponse({ error: '二维码选区无效，请重新选择' });
+        return;
+      }
+      const dataUrl = typeof request.dataUrl === 'string' && request.dataUrl.length <= 8 * 1024 * 1024 &&
+        request.dataUrl.startsWith('data:image/png;base64,') ? request.dataUrl : undefined;
+      const point = request.target as NormalizedPoint | undefined;
+      const target = point && [point.x, point.y].every(value => Number.isFinite(value) && value >= 0 && value <= 1) ? point : undefined;
+      void startQrScan(sender.tab, { ...rect, dataUrl, target }, sender.frameId ?? 0).then(
         (result) => sendResponse(result),
         (error) => { reportQrScanFailure(error); sendResponse({ error: getQrScanErrorMessage(error) }); }
       );
       return true;
     }
 
-    if (request.action === 'selectQrCandidate' && sender.tab) {
-      void acceptQrSecret(request.secret as PendingSecret, sender.tab).then(
+    if (request.action === 'selectQrCandidate' && sender.tab && typeof sender.tab.id === 'number') {
+      const selection = visibleQrSelections.get(sender.tab.id);
+      const candidate = selection?.choices.get(request.id);
+      if (!selection || !candidate || selection.expiresAt <= Date.now() || selection.url !== sender.tab.url ||
+          selection.frameId !== (sender.frameId ?? 0)) {
+        sendResponse({ error: '二维码选择已失效，请重新扫描' });
+        return;
+      }
+      visibleQrSelections.delete(sender.tab.id);
+      void openQrDraft([candidate], sender.tab, true).then(
         () => sendResponse({ success: true }),
         (error) => sendResponse({ error: (error as Error).message })
       );
+      return true;
+    }
+
+    if (request.action === 'appendAccount') {
+      void withVaultLock(async () => {
+        const secrets = await appendVaultAccount(request.account);
+        const { encryptedSecrets } = await chrome.storage.local.get<{ encryptedSecrets: string }>(['encryptedSecrets']);
+        let warning: string | undefined;
+        try { await saveBackupSnapshot(await createMasterPasswordEncryptedBackup(encryptedSecrets, secrets.length)); }
+        catch { warning = '账户已保存，本地快照未完成，请在管理页面检查备份'; }
+        await chrome.storage.session.remove(['pendingSecret', 'pendingQrDraft']);
+        return { success: true, secrets: secrets.map(toOtpAccount), ...(warning ? { warning } : {}) };
+      }).then(sendResponse, error => sendResponse({ error: error.message }));
+      return true;
+    }
+
+    if (request.action === 'generateCode' && isTrustedPage(sender) && typeof request.secret === 'string') {
+      try {
+        // A fresh QR/manual draft is already known to this extension page. This
+        // endpoint cannot select, reveal, or change a stored account.
+        const [draft] = normalizeVaultSecrets([{ ...normalizeOtpSettings(request), id: 'preview', site: '', secret: request.secret }]);
+        sendResponse(generateOtp(draft.secret, draft));
+      } catch (error) { sendResponse({ error: error instanceof Error ? error.message : '验证码预览失败' }); }
+      return;
+    }
+
+    if (request.action === 'getPopupAccounts') {
+      // Snapshot reads validate their session or device state and can run while backups are in progress.
+      void (async () => {
+        const key = await getValidSessionKey();
+        const url = typeof request.url === 'string' ? request.url : '';
+        try {
+          if (key) {
+            const secrets = await readVault(key);
+            const codes = previewCodesForAccounts(matchSecrets(url, secrets));
+            await assertSessionKey(key);
+            return { locked: false, secrets, codes };
+          }
+          const { secrets } = await readDeviceOtpVault();
+          return { locked: true, otpAvailable: true, secrets: secrets.map(toOtpAccount),
+            codes: previewCodesForAccounts(matchSecrets(url, secrets)) };
+        } catch (error) {
+          const message = (error as Error).message;
+          if (key) return { locked: false, error: message };
+          return { locked: true, otpAvailable: false, message };
+        }
+      })().then(sendResponse, (error) => sendResponse({ error: error.message }));
+      return true;
+    }
+
+    if (request.action === 'previewAccountCodes') {
+      void withVaultLock(async () => {
+        if (!Array.isArray(request.ids) || request.ids.some((id: unknown) => typeof id !== 'string')) throw new Error('账户列表无效');
+        const ids = new Set(request.ids);
+        const key = await getValidSessionKey();
+        const device = key ? null : await readDeviceOtpVault();
+        const secrets = key ? await readVault(key) : device!.secrets;
+        const codes = previewCodesForAccounts(secrets.filter(account => ids.has(account.id)));
+        if (key) await assertSessionKey(key);
+        else await assertDeviceOtpAccess(device!.context);
+        return { codes };
+      }).then(sendResponse, (error) => sendResponse({ error: error.message }));
       return true;
     }
 
@@ -624,11 +887,7 @@ export default defineBackground(() => {
         const key = await getValidSessionKey();
         const device = key ? null : await readDeviceOtpVault();
         const secrets = key ? await readVault(key) : device!.secrets;
-        let secret = typeof request.id === 'string' ? secrets.find((entry) => entry.id === request.id) : undefined;
-        if (!secret && isTrustedPage(sender) && typeof request.secret === 'string' && request.action === 'generateCode') {
-          if (!key) throw new Error('编辑密钥需要先解锁 OpenPass');
-          secret = { ...normalizeOtpSettings(request), id: '', site: '', secret: request.secret };
-        }
+        const secret = typeof request.id === 'string' ? secrets.find((entry) => entry.id === request.id) : undefined;
         if (!secret) throw new Error('密钥不存在');
         if (!isTrustedPage(sender)) {
           const page = sender.url ? parseUrl(sender.url) : null;
@@ -818,11 +1077,14 @@ export default defineBackground(() => {
   });
 
   chrome.storage.onChanged.addListener((changes, namespace) => {
-    if ((namespace === 'local' && (changes.encryptedSecrets || changes.encryptedDeviceOtpSecrets || changes.deviceOtpEnabled || changes.sessionExpiresAt)) ||
+    if ((namespace === 'local' && (changes.encryptedSecrets || changes.encryptedDeviceOtpSecrets || changes.deviceOtpEnabled)) ||
         (namespace === 'session' && changes.sessionKey)) {
       void notifyVaultChanged().catch(console.error);
     }
     if ((namespace === 'local' || namespace === 'session') && changes.sessionExpiresAt) void syncSessionAlarm().catch(console.error);
+    if (namespace === 'session' && changes.sessionKey?.newValue && changes.sessionKey.newValue !== changes.sessionKey.oldValue) {
+      void synchronizeCloudState().catch(console.error);
+    }
 
     if (namespace === 'local' && (changes.secrets || changes.encryptedSecrets || changes.sitesList)) {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -1250,11 +1512,7 @@ export default defineBackground(() => {
       exportTime: new Date().toISOString(),
       exportPlatform: typeof navigator !== 'undefined' ? navigator.platform : undefined,
       count,
-      encrypted: true,
-      encryptedData: encryptedSecrets,
-      encryptionVersion: 1,
-      kdf: 'PBKDF2',
-      kdfIterations: 100000,
+      ...encryptedBackupFields(encryptedSecrets),
       sync: await getBackupSyncMetadata()
     };
   }
@@ -1270,11 +1528,7 @@ export default defineBackground(() => {
       exportTime: new Date().toISOString(),
       exportPlatform: typeof navigator !== 'undefined' ? navigator.platform : undefined,
       count,
-      encrypted: true,
-      encryptedData: encryptedSecretsForBackup,
-      encryptionVersion: 1,
-      kdf: 'PBKDF2',
-      kdfIterations: 100000,
+      ...encryptedBackupFields(encryptedSecretsForBackup),
       sync: await getBackupSyncMetadata()
     };
   }

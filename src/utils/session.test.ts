@@ -46,8 +46,18 @@ describe('session expiry authority', () => {
   });
   it('explicit logout removes the canonical session and pending imports', async () => {
     session.set('sessionKey', 'password'); session.set('sessionExpiresAt', Date.now() + 60000);
+    session.set('vaultSessionKey', { salt: 'fixture', value: 'fixture' });
     session.set('pendingSecret', { secret: 'fixture' }); local.set('sessionExpiresAt', Date.now() + 60000);
+    session.set('pendingQrDraft', { secret: 'new QR only' });
     await clearSessionStorage();
     expect(session.size).toBe(0); expect(local.size).toBe(0);
+  });
+  it('management expiry preserves a separate fresh daily QR draft for continuation', async () => {
+    session.set('sessionKey', 'expired'); session.set('sessionExpiresAt', Date.now() - 1);
+    const draft = { secret: 'fresh public fixture', createdAt: Date.now() };
+    session.set('pendingQrDraft', draft);
+    expect(await getValidSessionKey()).toBeNull();
+    expect(session.get('pendingQrDraft')).toEqual(draft);
+    expect(session.has('sessionKey')).toBe(false);
   });
 });

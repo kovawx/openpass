@@ -90,7 +90,7 @@ async function handleSubmit() {
         submitting.value = false;
         return;
       }
-      error.value = '主密码错误';
+      error.value = '主密码错误，或密钥库无法通过校验';
       password.value = '';
     }
   } catch (err) {

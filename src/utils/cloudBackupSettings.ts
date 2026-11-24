@@ -1,4 +1,4 @@
-import CryptoUtils from './crypto';
+import { decryptSessionData, encryptSessionData } from './session';
 
 export interface CloudBackupSettings {
   enabled: boolean;
@@ -151,7 +151,7 @@ export async function saveCloudBackupConfiguration(
       throw new Error('此云端位置已保存另一加密密码。请沿用已保存密码，或更换对象前缀建立新备份。');
     }
   }
-  const encryptedSecrets = await CryptoUtils.encrypt(JSON.stringify(resolvedSecrets), masterPassword);
+  const encryptedSecrets = await encryptSessionData(JSON.stringify(resolvedSecrets), masterPassword);
   const previousStatus = sameLocation ? await loadCloudBackupStatus() : DEFAULT_CLOUD_BACKUP_STATUS;
   await chrome.storage.local.set({
     cloudBackupSettings: normalized,
@@ -186,7 +186,7 @@ export async function loadCloudBackupSecrets(masterPassword: string): Promise<Cl
 
   try {
     const parsed = JSON.parse(
-      await CryptoUtils.decrypt(result.encryptedCloudBackupSecrets, masterPassword)
+      await decryptSessionData(result.encryptedCloudBackupSecrets, masterPassword)
     ) as Partial<CloudBackupSecrets>;
     if (!parsed.accessKeyId || !parsed.secretAccessKey || !parsed.cloudPassword) {
       throw new Error('missing fields');

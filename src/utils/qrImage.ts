@@ -1,9 +1,11 @@
-import type { NormalizedRect } from './qrScan';
+import { withQrTimeout, type NormalizedRect } from './qrScan';
 
 export interface QrImageSource {
   dataUrl?: string;
   rect: NormalizedRect;
 }
+
+export type QrImageElement = HTMLImageElement | HTMLCanvasElement | SVGSVGElement;
 
 /** 从已加载的图片读取固有像素，不包含 CSS 缩放、选中高亮和页面覆盖层。 */
 export async function readQrImageSource(srcUrl: string, root = document): Promise<QrImageSource | null> {
@@ -12,7 +14,7 @@ export async function readQrImageSource(srcUrl: string, root = document): Promis
   return readQrElementSource(image, root);
 }
 
-async function readQrElementSource(image: HTMLImageElement | HTMLCanvasElement, root: Document): Promise<QrImageSource | null> {
+export async function readQrElementSource(image: QrImageElement, root = image.ownerDocument): Promise<QrImageSource | null> {
   const bounds = image.getBoundingClientRect();
   const view = root.defaultView;
   if (!view || bounds.width <= 0 || bounds.height <= 0) return null;
@@ -21,10 +23,29 @@ async function readQrElementSource(image: HTMLImageElement | HTMLCanvasElement, 
     width: bounds.width / view.innerWidth, height: bounds.height / view.innerHeight
   } };
   try {
-    const isImage = image.tagName === 'IMG';
-    if (isImage && !(image as HTMLImageElement).complete) await (image as HTMLImageElement).decode();
-    const width = isImage ? (image as HTMLImageElement).naturalWidth : image.width;
-    const height = isImage ? (image as HTMLImageElement).naturalHeight : image.height;
+    let source: CanvasImageSource = image as HTMLImageElement | HTMLCanvasElement;
+    let width: number;
+    let height: number;
+    if (image instanceof HTMLImageElement) {
+      if (!image.complete) return result;
+      width = image.naturalWidth;
+      height = image.naturalHeight;
+    } else if (image instanceof HTMLCanvasElement) {
+      width = image.width;
+      height = image.height;
+    } else {
+      width = image.viewBox.baseVal.width || bounds.width;
+      height = image.viewBox.baseVal.height || bounds.height;
+      const svg = image.cloneNode(true) as SVGSVGElement;
+      Object.assign(svg.style, { position: 'static', inset: 'auto', margin: '0', transform: 'none',
+        translate: 'none', rotate: 'none', scale: 'none', width: `${width}px`, height: `${height}px` });
+      svg.setAttribute('width', String(width));
+      svg.setAttribute('height', String(height));
+      const svgImage = root.createElement('img');
+      svgImage.src = `data:image/svg+xml,${encodeURIComponent(new XMLSerializer().serializeToString(svg))}`;
+      await withQrTimeout(svgImage.decode(), 800);
+      source = svgImage;
+    }
     if (!width || !height || width * height > 16000000) return result;
     const scale = Math.min(4, Math.max(1, 512 / Math.min(width, height)), 2048 / Math.max(width, height));
     const canvas = root.createElement('canvas');
@@ -35,7 +56,7 @@ async function readQrElementSource(image: HTMLImageElement | HTMLCanvasElement, 
     context.fillStyle = '#fff';
     context.fillRect(0, 0, canvas.width, canvas.height);
     context.imageSmoothingEnabled = false;
-    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    context.drawImage(source, 0, 0, canvas.width, canvas.height);
     result.dataUrl = canvas.toDataURL('image/png');
   } catch { /* 跨域污染或图片失效时保留位置，让后台回退到该图片的截图区域。 */ }
   return result;

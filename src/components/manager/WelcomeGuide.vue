@@ -43,12 +43,13 @@ async function checkGuideStatus() {
   try {
     const result = await chrome.storage.local.get<{
       masterPasswordHash?: string;
-      secrets?: unknown[];
+      isSetupComplete?: boolean;
+      sitesList?: unknown[];
       enableAutoBackup?: boolean;
-    }>(['masterPasswordHash', 'secrets', 'enableAutoBackup']);
+    }>(['masterPasswordHash', 'isSetupComplete', 'sitesList', 'enableAutoBackup']);
 
-    steps.step1.completed = !!result.masterPasswordHash;
-    steps.step2.completed = Array.isArray(result.secrets) && result.secrets.length > 0;
+    steps.step1.completed = result.isSetupComplete === true || !!result.masterPasswordHash;
+    steps.step2.completed = Array.isArray(result.sitesList) && result.sitesList.length > 0;
     steps.step3.completed = !!result.enableAutoBackup;
 
     if (!steps.step1.completed) {
@@ -87,16 +88,7 @@ async function handleSetPassword() {
   passwordSubmitting.value = true;
 
   try {
-    const CryptoUtils = (await import('@/utils/crypto')).default;
-    const hashResult = await CryptoUtils.createMasterPasswordHash(welcomePassword.value);
-
-    await chrome.storage.local.set({
-      masterPasswordHash: hashResult.hash,
-      masterPasswordSalt: hashResult.salt,
-      isSetupComplete: true
-    });
-
-    await authStore.createSession(welcomePassword.value);
+    await authStore.initializeVault(welcomePassword.value);
 
     steps.step1.completed = true;
     expandedStep.value = 'step2';
